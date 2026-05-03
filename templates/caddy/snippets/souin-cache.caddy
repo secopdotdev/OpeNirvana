@@ -1,0 +1,9 @@
+# Per-route Souin cache policy. Use this inside a handle block to enable caching.
+# Default TTL 10m (set globally), override per-route if needed.
+(souin-cache) {
+    cache {
+        ttl 10m
+        stale 1h
+        default_cache_control public
+    }
+}

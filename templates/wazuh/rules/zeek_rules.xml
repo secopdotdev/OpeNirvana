@@ -1,0 +1,34 @@
+<group name="zeek,network,">
+  <rule id="100400" level="0">
+    <decoded_as>zeek-conn</decoded_as>
+    <description>Zeek conn.log event (base).</description>
+  </rule>
+
+  <rule id="100420" level="0">
+    <decoded_as>zeek-dns</decoded_as>
+    <description>Zeek dns.log event (base).</description>
+  </rule>
+
+  <rule id="100440" level="0">
+    <decoded_as>zeek-ssl</decoded_as>
+    <description>Zeek ssl.log event (base).</description>
+  </rule>
+
+  <rule id="100460" level="0">
+    <decoded_as>zeek-notice</decoded_as>
+    <description>Zeek notice.log event (base).</description>
+  </rule>
+
+  <rule id="100470" level="13">
+    <if_sid>100460</if_sid>
+    <field name="note">Intel::Notice</field>
+    <description>Zeek Intel framework matched a threat-intel indicator.</description>
+    <group>threat_intel,attack,</group>
+  </rule>
+
+  <rule id="100471" level="10">
+    <if_sid>100460</if_sid>
+    <field name="note">SSL::Invalid_Server_Cert</field>
+    <description>Zeek saw an invalid TLS server certificate.</description>
+  </rule>
+</group>

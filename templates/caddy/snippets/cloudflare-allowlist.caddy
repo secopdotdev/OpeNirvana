@@ -1,0 +1,9 @@
+# Allow traffic only from Cloudflare CIDRs (registered as the "cloudflare"
+# ip_source in the globals block via `trusted_proxies cloudflare`) plus the
+# operator-defined EXTRA_ALLOWED_IP (e.g., office uplink).
+(cloudflare-allowlist) {
+    @not_cloudflare not client_ip cloudflare {$EXTRA_ALLOWED_IP}
+    handle @not_cloudflare {
+        respond "Forbidden" 403
+    }
+}

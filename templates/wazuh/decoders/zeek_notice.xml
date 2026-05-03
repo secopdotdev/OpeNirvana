@@ -1,0 +1,5 @@
+<decoder name="zeek-notice">
+  <prematch>^\{"ts":.+"note":</prematch>
+  <use_own_name>true</use_own_name>
+  <plugin_decoder>JSON_Decoder</plugin_decoder>
+</decoder>

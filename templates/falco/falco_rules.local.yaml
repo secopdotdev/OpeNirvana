@@ -1,0 +1,64 @@
+# Custom rules layered on top of the Falco stock ruleset.
+# Rule IDs scoped in 100300–100399 (maps to Wazuh rule range).
+
+- rule: Unauthorized Docker API access
+  desc: >
+    A container talks to the Docker API through an unexpected socket-proxy.
+    Legitimate talkers are: homepage, autoheal, crowdsec, wazuh-manager.
+  condition: >
+    evt.type in (connect, socketcall)
+    and fd.name in ("/var/run/docker.sock","dockerproxy")
+    and not container.name in (autoheal, crowdsec, wazuh-manager, homepage, socket-proxy-ro, socket-proxy-rw)
+  output: >
+    Unauthorized container contacted Docker API
+    (container=%container.name image=%container.image.repository
+    fd=%fd.name proc=%proc.cmdline)
+  priority: CRITICAL
+  tags: [container, docker, mitre_privilege_escalation]
+
+- rule: Write below read-only filesystem
+  desc: Container writes to a path that should be read-only.
+  condition: >
+    (evt.type in (open,openat,openat2) and evt.is_open_write=true)
+    and container.id != host
+    and fd.name startswith /etc
+    and not proc.name in (authentik, postgres, redis-server, wazuh-manager)
+  output: >
+    Write to /etc by container
+    (container=%container.name proc=%proc.cmdline file=%fd.name)
+  priority: ERROR
+  tags: [filesystem, container]
+
+- rule: Reverse shell in container
+  desc: >
+    Detects patterns of interactive remote shells (bash -i, nc -e, etc.)
+    inside any container.
+  condition: >
+    spawned_process
+    and container.id != host
+    and (
+      (proc.name = bash and proc.cmdline contains "-i")
+      or (proc.name in (nc, ncat) and proc.cmdline contains "-e")
+      or (proc.name = socat and proc.cmdline contains "EXEC:")
+    )
+  output: >
+    Possible reverse shell
+    (container=%container.name proc=%proc.cmdline user=%user.name)
+  priority: CRITICAL
+  tags: [container, shell, mitre_execution]
+
+- rule: Sensitive mount by container
+  desc: Container mounts a sensitive host path.
+  condition: >
+    spawned_process
+    and container.id != host
+    and (
+      proc.cmdline contains "/proc/"
+      or proc.cmdline contains "/etc/shadow"
+      or proc.cmdline contains "/root/.ssh"
+    )
+  output: >
+    Container accessed sensitive host path
+    (container=%container.name proc=%proc.cmdline)
+  priority: WARNING
+  tags: [container, filesystem]

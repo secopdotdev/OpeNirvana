@@ -1,0 +1,8 @@
+github.com/caddy-dns/cloudflare
+github.com/WeidiDeng/caddy-cloudflare-ip
+github.com/hslatman/caddy-crowdsec-bouncer/crowdsec
+github.com/hslatman/caddy-crowdsec-bouncer/http
+github.com/mholt/caddy-l4
+github.com/corazawaf/coraza-caddy/v2
+github.com/caddyserver/cache-handler
+github.com/ueffel/caddy-brotli

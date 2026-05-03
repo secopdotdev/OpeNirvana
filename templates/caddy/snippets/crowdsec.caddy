@@ -1,0 +1,4 @@
+# Check every request against Crowdsec LAPI. Denied IPs get 403.
+(crowdsec) {
+    crowdsec
+}

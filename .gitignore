@@ -1,0 +1,18 @@
+# Secrets and runtime state
+.env
+.env.local
+
+# Runtime bind-mount directories (created by docker-host-config.sh on target host)
+/dock/
+
+# Local backups (if tester runs scripts on the repo host)
+/backups/
+*.sql.zst
+*.rdb
+
+# Caddy builder intermediate
+build/caddy/.xcaddy-cache/
+
+# OS cruft
+.DS_Store
+Thumbs.db

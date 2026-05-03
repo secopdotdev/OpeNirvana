@@ -1,0 +1,5 @@
+<decoder name="falco-json">
+  <prematch>^\{"output":</prematch>
+  <use_own_name>true</use_own_name>
+  <plugin_decoder>JSON_Decoder</plugin_decoder>
+</decoder>

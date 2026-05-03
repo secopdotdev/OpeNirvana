@@ -1,0 +1,6 @@
+type: file
+name: file_default
+log_level: info
+format: |
+  {"ts":"{{ .StartAt }}","source":"crowdsec","type":"{{ .Meta.service }}","scenario":"{{ .Scenario }}","message":"{{ .Message }}","events_count":{{ .EventsCount }},"capacity":{{ .Capacity }},"leaky_speed":"{{ .Leakspeed }}","decisions":[{{- range $i, $d := .Decisions }}{{ if $i }},{{ end }}{"value":"{{ $d.Value }}","scope":"{{ $d.Scope }}","type":"{{ $d.Type }}","duration":"{{ $d.Duration }}"}{{- end }}]}
+log_file_path: /etc/crowdsec/notifications/decisions.log

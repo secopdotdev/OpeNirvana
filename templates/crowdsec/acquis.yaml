@@ -1,0 +1,12 @@
+---
+filenames:
+  - /var/log/caddy/access.log
+labels:
+  type: caddy
+poll_without_inotify: false
+---
+listen_addr: 127.0.0.1
+listen_port: 7422
+source: syslog
+labels:
+  type: syslog

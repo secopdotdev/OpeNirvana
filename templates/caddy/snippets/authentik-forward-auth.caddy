@@ -1,0 +1,14 @@
+# Authentik SSO gate — applied globally via bare forward_auth directives in each
+# site block (see Caddyfile @requires-auth-pub / @requires-auth-ts matchers).
+# Bare forward_auth runs before handle blocks in Caddy's directive order.
+# This snippet is kept for reference only; do not import it inside backend snippets.
+(authentik-forward-auth) {
+    route /outpost.goauthentik.io/* {
+        reverse_proxy authentik-proxy:9000
+    }
+
+    forward_auth authentik-proxy:9000 {
+        uri /outpost.goauthentik.io/auth/caddy
+        copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid X-Authentik-Jwt X-Authentik-Meta-Jwks X-Authentik-Meta-Outpost X-Authentik-Meta-Provider X-Authentik-Meta-App X-Authentik-Meta-Version
+    }
+}

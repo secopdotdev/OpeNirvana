@@ -1,0 +1,15 @@
+# Coraza WAF with OWASP CRS. Config file bind-mounted to /etc/caddy/coraza/.
+# load_owasp_crs loads the embedded CRS bundle (rules + .data lookup files).
+# coraza.conf sets engine config. crs-init.conf initializes CRS variables
+# with unique IDs that avoid duplicate conflicts with embedded setup rules,
+# and adds minimal custom detection rules because the embedded CRS detection
+# rules do not accumulate anomaly scores in this build of coraza-caddy.
+(coraza) {
+    coraza_waf {
+        load_owasp_crs
+        directives `
+            Include /etc/caddy/coraza/coraza.conf
+            Include /etc/caddy/coraza/crs-init.conf
+        `
+    }
+}

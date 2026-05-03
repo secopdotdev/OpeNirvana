@@ -1,0 +1,520 @@
+{
+    admin 127.0.0.1:2019
+    email {$ADMIN_EMAIL}
+    # Unordered plugin handlers — pin to the standard pipeline so named
+    # snippets can import them outside of explicit route blocks.
+    order crowdsec first
+    order coraza_waf after crowdsec
+    log default {
+        output file /var/log/caddy/access.log {
+            roll_size 50mb
+            roll_keep 10
+            roll_keep_for 720h
+        }
+        format json
+        level {$CADDY_LOG_LEVEL}
+    }
+
+    metrics
+
+    servers {
+        protocols h1 h2 h3
+        trusted_proxies cloudflare {
+            interval 12h
+            timeout 15s
+        }
+    }
+
+    cache {
+        ttl 10m
+        api {
+            basepath /souin-api
+        }
+        redis {
+            url redis://:{$REDIS_PASSWORD}@redis:6379/{$REDIS_DB_CADDY_CACHE}
+        }
+    }
+
+    crowdsec {
+        api_url http://crowdsec:8080
+        api_key {$CROWDSEC_BOUNCER_KEY}
+        ticker_interval 15s
+    }
+}
+
+# Pull named-snippet definitions from individual files under snippets/.
+import snippets/*.caddy
+
+# ==============================================================
+# Backend snippets — one per routed service.
+#
+# Adding a service:
+#   1. Define (backend-myservice) here with the upstream only.
+#      Authentik auth is enforced by the bare forward_auth directive at the
+#      site level (runs before handle blocks). Do NOT add import
+#      authentik-forward-auth inside backend snippets.
+#   2. Add @myservice matcher + handle block in BOTH site blocks below.
+#   3. Add MYSERVICE_SUBDOMAIN=foo to .env and to caddy's environment
+#      block in docker-compose.yml.
+#   4. If the service is on a new network, ensure tailscale-ingress is
+#      also connected to that network (caddy shares tailscale-ingress's
+#      netns so it inherits its reachability).
+# ==============================================================
+
+# Authentik SSO — the identity provider itself; exempt from the global gate.
+(backend-authentik) {
+    reverse_proxy authentik-server:9000
+}
+
+# Wazuh dashboard — OpenSearch Dashboards with self-signed cert.
+(backend-wazuh) {
+    reverse_proxy https://wazuh-dashboard:5601 {
+        transport http {
+            tls_insecure_skip_verify
+        }
+    }
+}
+
+# Nextcloud — file sync + collaboration.
+# Well-known redirects are required by CalDAV/CardDAV clients.
+(backend-nextcloud) {
+    redir /.well-known/carddav /remote.php/dav 301
+    redir /.well-known/caldav  /remote.php/dav 301
+
+    reverse_proxy nextcloud:80
+}
+
+# ==============================================================
+# Media stack backends (profile: media).
+# *arr services share GlueTUN's netns — upstream is gluetun:<port>.
+# ==============================================================
+
+(backend-prowlarr) {
+    reverse_proxy gluetun:9696
+}
+
+(backend-radarr) {
+    reverse_proxy gluetun:7878
+}
+
+(backend-sonarr) {
+    reverse_proxy gluetun:8989
+}
+
+(backend-lidarr) {
+    reverse_proxy gluetun:8686
+}
+
+(backend-qbittorrent) {
+    reverse_proxy gluetun:8080
+}
+
+# Jellyfin — media server.
+(backend-jellyfin) {
+    reverse_proxy jellyfin:8096
+}
+
+# Jellyseerr — request management UI.
+(backend-jellyseerr) {
+    reverse_proxy jellyseerr:5055
+}
+
+# FlareSolverr — CAPTCHA solver (Gluetun netns).
+(backend-flaresolverr) {
+    reverse_proxy gluetun:8191
+}
+
+# CrowdSec local API console.
+(backend-crowdsec) {
+    reverse_proxy crowdsec:8080
+}
+
+# Falco Sidekick UI — real-time Falco security alert dashboard.
+(backend-falco) {
+    reverse_proxy falcosidekick-ui:2802
+}
+
+# Zeek log browser — filebrowser serving Zeek TSV logs read-only.
+(backend-zeek) {
+    reverse_proxy zeek-logs:80
+}
+
+# Dockhand — container monitoring dashboard.
+(backend-dockhand) {
+    reverse_proxy dockhand:3000
+}
+
+# Immich — photo/video library.
+(backend-immich) {
+    reverse_proxy immich-server:2283
+}
+
+# ==============================================================
+# Productivity stack backends (profile: apps).
+# ==============================================================
+
+# ntfy — push notifications.
+(backend-ntfy) {
+    reverse_proxy ntfy:80
+}
+
+# Tandoor — recipe manager.
+(backend-tandoor) {
+    reverse_proxy tandoor:80
+}
+
+# Vikunja — task management.
+(backend-vikunja) {
+    reverse_proxy vikunja:3456
+}
+
+# AFFiNE — collaborative workspace.
+(backend-affine) {
+    reverse_proxy affine:3010
+}
+
+# n8n — workflow automation.
+(backend-n8n) {
+    reverse_proxy n8n:5678
+}
+
+# ==============================================================
+# Reusable security policy blocks.
+# ==============================================================
+
+(public-policy) {
+    import crowdsec
+    import coraza
+    import security-headers
+}
+
+(tailnet-policy) {
+    import crowdsec
+    import coraza
+    import security-headers
+}
+
+# ==============================================================
+# Public ingress: *.{$PUBLIC_FQDN}   (e.g. *.secop.dev)
+# TLS via Cloudflare DNS-01 challenge — single wildcard cert.
+# All unmatched hosts abort (no default backend).
+# ==============================================================
+*.{$PUBLIC_FQDN} {
+    import public-policy
+
+    # Services that set their own richer CSP — strip ours so it doesn't
+    # override theirs. Must be at site level (after the import) so it
+    # runs after security-headers adds the header.
+    header @authentik    -Content-Security-Policy
+    header @nextcloud    -Content-Security-Policy
+    header @jellyfin-pub -Content-Security-Policy
+    header @affine-pub   -Content-Security-Policy
+    header @vikunja-pub  -Content-Security-Policy
+    header @tandoor-pub  -Content-Security-Policy
+    header @immich       -Content-Security-Policy
+    header @n8n-pub      -Content-Security-Policy
+
+    # Wazuh (OpenSearch Dashboards) bundles use Function() constructor.
+    @wazuh-pub host {$WAZUH_SUBDOMAIN}.{$PUBLIC_FQDN}
+    header @wazuh-pub -Content-Security-Policy
+
+    # Media *arr apps and qBittorrent use inline scripts/styles.
+    @media host {$PROWLARR_SUBDOMAIN}.{$PUBLIC_FQDN} {$RADARR_SUBDOMAIN}.{$PUBLIC_FQDN} {$SONARR_SUBDOMAIN}.{$PUBLIC_FQDN} {$LIDARR_SUBDOMAIN}.{$PUBLIC_FQDN} {$QBIT_SUBDOMAIN}.{$PUBLIC_FQDN}
+    header @media -Content-Security-Policy
+
+    tls {
+        dns cloudflare {$CLOUDFLARE_API_TOKEN}
+        resolvers 1.1.1.1
+    }
+
+    # ── Global Authentik gate ──────────────────────────────────────────────
+    # forward_auth is a directive-level handler that runs BEFORE handle blocks
+    # in Caddy's standard directive ordering. The combined matcher excludes:
+    #   (a) auth.secop.dev — the identity provider itself
+    #   (b) /outpost.goauthentik.io/* — OAuth callback/flow paths that must
+    #       reach authentik-proxy directly to complete the login sequence.
+    # A separate handle block routes outpost paths to authentik-proxy;
+    # it runs after forward_auth but forward_auth skips those paths via (b).
+    @outpost-pub {
+        not host {$AUTHENTIK_SUBDOMAIN}.{$PUBLIC_FQDN}
+        path /outpost.goauthentik.io/*
+    }
+    handle @outpost-pub {
+        reverse_proxy authentik-proxy:9000
+    }
+
+    @requires-auth-pub {
+        not host {$AUTHENTIK_SUBDOMAIN}.{$PUBLIC_FQDN}
+        not path /outpost.goauthentik.io/*
+    }
+    forward_auth @requires-auth-pub authentik-proxy:9000 {
+        uri /outpost.goauthentik.io/auth/caddy
+        copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid X-Authentik-Jwt X-Authentik-Meta-Jwks X-Authentik-Meta-Outpost X-Authentik-Meta-Provider X-Authentik-Meta-App X-Authentik-Meta-Version
+    }
+    # ──────────────────────────────────────────────────────────────────────
+
+    @authentik host {$AUTHENTIK_SUBDOMAIN}.{$PUBLIC_FQDN}
+    handle @authentik {
+        import backend-authentik
+    }
+
+    @wazuh host {$WAZUH_SUBDOMAIN}.{$PUBLIC_FQDN}
+    handle @wazuh {
+        import backend-wazuh
+    }
+
+    @nextcloud host {$NEXTCLOUD_SUBDOMAIN}.{$PUBLIC_FQDN}
+    handle @nextcloud {
+        import backend-nextcloud
+    }
+
+    @prowlarr host {$PROWLARR_SUBDOMAIN}.{$PUBLIC_FQDN}
+    handle @prowlarr {
+        import backend-prowlarr
+    }
+
+    @radarr host {$RADARR_SUBDOMAIN}.{$PUBLIC_FQDN}
+    handle @radarr {
+        import backend-radarr
+    }
+
+    @sonarr host {$SONARR_SUBDOMAIN}.{$PUBLIC_FQDN}
+    handle @sonarr {
+        import backend-sonarr
+    }
+
+    @lidarr host {$LIDARR_SUBDOMAIN}.{$PUBLIC_FQDN}
+    handle @lidarr {
+        import backend-lidarr
+    }
+
+    @qbittorrent host {$QBIT_SUBDOMAIN}.{$PUBLIC_FQDN}
+    handle @qbittorrent {
+        import backend-qbittorrent
+    }
+
+    @jellyfin-pub host {$JELLYFIN_SUBDOMAIN}.{$PUBLIC_FQDN}
+    handle @jellyfin-pub {
+        import backend-jellyfin
+    }
+
+    @jellyseerr host {$JELLYSEERR_SUBDOMAIN}.{$PUBLIC_FQDN}
+    handle @jellyseerr {
+        import backend-jellyseerr
+    }
+
+    @ntfy-pub host {$NTFY_SUBDOMAIN}.{$PUBLIC_FQDN}
+    handle @ntfy-pub {
+        import backend-ntfy
+    }
+
+    @tandoor-pub host {$TANDOOR_SUBDOMAIN}.{$PUBLIC_FQDN}
+    handle @tandoor-pub {
+        import backend-tandoor
+    }
+
+    @vikunja-pub host {$VIKUNJA_SUBDOMAIN}.{$PUBLIC_FQDN}
+    handle @vikunja-pub {
+        import backend-vikunja
+    }
+
+    @affine-pub host {$AFFINE_SUBDOMAIN}.{$PUBLIC_FQDN}
+    handle @affine-pub {
+        import backend-affine
+    }
+
+    @flaresolverr host {$FLARESOLVERR_SUBDOMAIN}.{$PUBLIC_FQDN}
+    handle @flaresolverr {
+        import backend-flaresolverr
+    }
+
+    @crowdsec host {$CROWDSEC_SUBDOMAIN}.{$PUBLIC_FQDN}
+    handle @crowdsec {
+        import backend-crowdsec
+    }
+
+    @dockhand host {$DOCKHAND_SUBDOMAIN}.{$PUBLIC_FQDN}
+    handle @dockhand {
+        import backend-dockhand
+    }
+
+    @immich host {$IMMICH_SUBDOMAIN}.{$PUBLIC_FQDN}
+    handle @immich {
+        import backend-immich
+    }
+
+    @falco host {$FALCO_SUBDOMAIN}.{$PUBLIC_FQDN}
+    handle @falco {
+        import backend-falco
+    }
+
+    @zeek host {$ZEEK_SUBDOMAIN}.{$PUBLIC_FQDN}
+    handle @zeek {
+        import backend-zeek
+    }
+
+    @n8n-pub host {$N8N_SUBDOMAIN}.{$PUBLIC_FQDN}
+    handle @n8n-pub {
+        import backend-n8n
+    }
+
+    # Catch-all: reject any subdomain not explicitly matched above.
+    handle {
+        abort
+    }
+}
+
+# ==============================================================
+# Tailnet ingress: *.{$TAILNET_FQDN}   (e.g. *.neon-lenok.ts.net)
+# http:// prefix — Tailscale Serve terminates TLS in front of Caddy;
+# Caddy listens on :80 inside the tailscale-ingress netns.
+# Without http://, Caddy's auto-HTTPS tries on-demand certs for every
+# tailnet subdomain and blocks startup in Caddy 2.11+.
+# ==============================================================
+http://*.{$TAILNET_FQDN} {
+    import tailnet-policy
+
+    header @authentik    -Content-Security-Policy
+    header @nextcloud    -Content-Security-Policy
+    header @jellyfin-ts  -Content-Security-Policy
+    header @affine-ts    -Content-Security-Policy
+    header @vikunja-ts   -Content-Security-Policy
+    header @tandoor-ts   -Content-Security-Policy
+    header @immich-ts    -Content-Security-Policy
+    header @n8n-ts       -Content-Security-Policy
+
+    @wazuh-ts host {$WAZUH_SUBDOMAIN}.{$TAILNET_FQDN}
+    header @wazuh-ts -Content-Security-Policy
+
+    @media host {$PROWLARR_SUBDOMAIN}.{$TAILNET_FQDN} {$RADARR_SUBDOMAIN}.{$TAILNET_FQDN} {$SONARR_SUBDOMAIN}.{$TAILNET_FQDN} {$LIDARR_SUBDOMAIN}.{$TAILNET_FQDN} {$QBIT_SUBDOMAIN}.{$TAILNET_FQDN}
+    header @media -Content-Security-Policy
+
+    # ── Global Authentik gate (Tailnet) ───────────────────────────────────
+    @outpost-ts {
+        not host {$AUTHENTIK_SUBDOMAIN}.{$TAILNET_FQDN}
+        path /outpost.goauthentik.io/*
+    }
+    handle @outpost-ts {
+        reverse_proxy authentik-proxy:9000
+    }
+
+    @requires-auth-ts {
+        not host {$AUTHENTIK_SUBDOMAIN}.{$TAILNET_FQDN}
+        not path /outpost.goauthentik.io/*
+    }
+    forward_auth @requires-auth-ts authentik-proxy:9000 {
+        uri /outpost.goauthentik.io/auth/caddy
+        copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid X-Authentik-Jwt X-Authentik-Meta-Jwks X-Authentik-Meta-Outpost X-Authentik-Meta-Provider X-Authentik-Meta-App X-Authentik-Meta-Version
+    }
+    # ──────────────────────────────────────────────────────────────────────
+
+    @authentik host {$AUTHENTIK_SUBDOMAIN}.{$TAILNET_FQDN}
+    handle @authentik {
+        import backend-authentik
+    }
+
+    @wazuh host {$WAZUH_SUBDOMAIN}.{$TAILNET_FQDN}
+    handle @wazuh {
+        import backend-wazuh
+    }
+
+    @nextcloud host {$NEXTCLOUD_SUBDOMAIN}.{$TAILNET_FQDN}
+    handle @nextcloud {
+        import backend-nextcloud
+    }
+
+    @prowlarr host {$PROWLARR_SUBDOMAIN}.{$TAILNET_FQDN}
+    handle @prowlarr {
+        import backend-prowlarr
+    }
+
+    @radarr host {$RADARR_SUBDOMAIN}.{$TAILNET_FQDN}
+    handle @radarr {
+        import backend-radarr
+    }
+
+    @sonarr host {$SONARR_SUBDOMAIN}.{$TAILNET_FQDN}
+    handle @sonarr {
+        import backend-sonarr
+    }
+
+    @lidarr host {$LIDARR_SUBDOMAIN}.{$TAILNET_FQDN}
+    handle @lidarr {
+        import backend-lidarr
+    }
+
+    @qbittorrent host {$QBIT_SUBDOMAIN}.{$TAILNET_FQDN}
+    handle @qbittorrent {
+        import backend-qbittorrent
+    }
+
+    @jellyfin-ts host {$JELLYFIN_SUBDOMAIN}.{$TAILNET_FQDN}
+    handle @jellyfin-ts {
+        import backend-jellyfin
+    }
+
+    @jellyseerr host {$JELLYSEERR_SUBDOMAIN}.{$TAILNET_FQDN}
+    handle @jellyseerr {
+        import backend-jellyseerr
+    }
+
+    @ntfy-ts host {$NTFY_SUBDOMAIN}.{$TAILNET_FQDN}
+    handle @ntfy-ts {
+        import backend-ntfy
+    }
+
+    @tandoor-ts host {$TANDOOR_SUBDOMAIN}.{$TAILNET_FQDN}
+    handle @tandoor-ts {
+        import backend-tandoor
+    }
+
+    @vikunja-ts host {$VIKUNJA_SUBDOMAIN}.{$TAILNET_FQDN}
+    handle @vikunja-ts {
+        import backend-vikunja
+    }
+
+    @affine-ts host {$AFFINE_SUBDOMAIN}.{$TAILNET_FQDN}
+    handle @affine-ts {
+        import backend-affine
+    }
+
+    @flaresolverr-ts host {$FLARESOLVERR_SUBDOMAIN}.{$TAILNET_FQDN}
+    handle @flaresolverr-ts {
+        import backend-flaresolverr
+    }
+
+    @crowdsec-ts host {$CROWDSEC_SUBDOMAIN}.{$TAILNET_FQDN}
+    handle @crowdsec-ts {
+        import backend-crowdsec
+    }
+
+    @dockhand-ts host {$DOCKHAND_SUBDOMAIN}.{$TAILNET_FQDN}
+    handle @dockhand-ts {
+        import backend-dockhand
+    }
+
+    @immich-ts host {$IMMICH_SUBDOMAIN}.{$TAILNET_FQDN}
+    handle @immich-ts {
+        import backend-immich
+    }
+
+    @falco-ts host {$FALCO_SUBDOMAIN}.{$TAILNET_FQDN}
+    handle @falco-ts {
+        import backend-falco
+    }
+
+    @zeek-ts host {$ZEEK_SUBDOMAIN}.{$TAILNET_FQDN}
+    handle @zeek-ts {
+        import backend-zeek
+    }
+
+    @n8n-ts host {$N8N_SUBDOMAIN}.{$TAILNET_FQDN}
+    handle @n8n-ts {
+        import backend-n8n
+    }
+
+    # Catch-all: reject any subdomain not explicitly matched above.
+    handle {
+        abort
+    }
+}

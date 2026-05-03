@@ -1,0 +1,1827 @@
+# Unified foundation stack. See docs/superpowers/specs/ for the full design.
+# All resource knobs come from .env; uncomment ONE tier block there.
+
+x-hardened: &hardened
+  read_only: true
+  tmpfs:
+    - /tmp
+    - /run
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  restart: unless-stopped
+  labels:
+    - autoheal=true
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+# Indexer cluster anchor — YAML anchor reused by the three indexer nodes.
+# Each node overrides container_name, environment.node.name, volumes, IP.
+x-wazuh-indexer: &wazuh-indexer
+  image: wazuh/wazuh-indexer:${WAZUH_VERSION}
+  depends_on:
+    wazuh-init:
+      condition: service_completed_successfully
+  ulimits:
+    memlock:
+      soft: -1
+      hard: -1
+    nofile:
+      soft: 65536
+      hard: 65536
+  mem_limit: ${WAZUH_INDEXER_MEM_LIMIT:-2g}
+  healthcheck:
+    # Unauthenticated probe — any HTTP response (including 401/503 before the
+    # security index is seeded) proves the REST port is up. Auth-based probes
+    # would deadlock with wazuh-security-init, which depends on this healthcheck.
+    test: ["CMD-SHELL", "curl -sk --max-time 3 -o /dev/null https://localhost:9200/"]
+    interval: 20s
+    timeout: 10s
+    retries: 15
+    start_period: 180s
+  restart: unless-stopped
+  labels:
+    - autoheal=true
+  logging: *default-logging
+
+networks:
+  ingress:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.0.10.0/24
+          gateway: 10.0.10.10
+  auth:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.0.11.0/24
+          gateway: 10.0.11.10
+  data:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.0.12.0/24
+          gateway: 10.0.12.10
+  observability:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.0.13.0/24
+          gateway: 10.0.13.10
+  apps:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.0.14.0/24
+          gateway: 10.0.14.10
+  productivity:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.0.15.0/24
+          gateway: 10.0.15.10
+
+services:
+  # ==========================================================
+  # Tailscale ingress sidecar — caddy shares this netns.
+  # ==========================================================
+  tailscale-ingress:
+    image: tailscale/tailscale:latest
+    container_name: tailscale-ingress
+    hostname: ${TAILSCALE_INGRESS_HOSTNAME}
+    environment:
+      TS_AUTHKEY: ${TAILSCALE_AUTHKEY}
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_USERSPACE: "false"
+      TS_ENABLE_HEALTH_CHECK: "true"
+      TS_LOCAL_ADDR_PORT: 127.0.0.1:41234
+      # false: leave Docker's embedded resolver (127.0.0.11) in resolv.conf.
+      # If true, Tailscale overwrites resolv.conf with 100.100.100.100 which
+      # has no knowledge of Docker container names — caddy (which shares this
+      # netns) can't resolve authentik-server, wazuh-dashboard, etc.
+      TS_ACCEPT_DNS: "false"
+      # Tags are applied at authkey-generation time in the Tailscale admin
+      # console (key must carry tag:ingress + tag:docker). Do NOT re-assert
+      # via --advertise-tags — that triggers a tagOwners ACL ownership check
+      # against the key's issuing user and fails even when the key already
+      # owns the tags.
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ${DOCK_TAIL}/ingress:/var/lib/tailscale
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    cap_add:
+      - NET_ADMIN
+    networks:
+      ingress:
+        ipv4_address: 10.0.10.200
+      auth:
+        ipv4_address: 10.0.11.200
+      observability:
+        ipv4_address: 10.0.13.200
+      apps:
+        ipv4_address: 10.0.14.200
+      productivity:
+        ipv4_address: 10.0.15.200
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:41234/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+    logging: *default-logging
+
+  caddy:
+    <<: *hardened
+    build:
+      context: ./build/caddy
+    container_name: caddy
+    depends_on:
+      tailscale-ingress:
+        condition: service_healthy
+      crowdsec:
+        condition: service_healthy
+      authentik-server:
+        condition: service_healthy
+    environment:
+      ADMIN_EMAIL: ${ADMIN_EMAIL}
+      PUBLIC_FQDN: ${PUBLIC_FQDN}
+      TAILNET_FQDN: ${TAILNET_FQDN}
+      EXTRA_ALLOWED_IP: ${EXTRA_ALLOWED_IP}
+      CADDY_LOG_LEVEL: ${CADDY_LOG_LEVEL}
+      CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN}
+      CROWDSEC_BOUNCER_KEY: ${CROWDSEC_BOUNCER_KEY}
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      REDIS_DB_CADDY_CACHE: ${REDIS_DB_CADDY_CACHE}
+      # Per-service subdomains — configure in .env.
+      # These become {sub}.PUBLIC_FQDN and {sub}.TAILNET_FQDN routes.
+      AUTHENTIK_SUBDOMAIN: ${AUTHENTIK_SUBDOMAIN}
+      WAZUH_SUBDOMAIN: ${WAZUH_SUBDOMAIN}
+      NEXTCLOUD_SUBDOMAIN: ${NEXTCLOUD_SUBDOMAIN}
+      # Media stack subdomains — referenced in Caddyfile even when profile is
+      # inactive; unresolvable subdomains just never match so no harm done.
+      PROWLARR_SUBDOMAIN: ${PROWLARR_SUBDOMAIN:-prowlarr}
+      RADARR_SUBDOMAIN: ${RADARR_SUBDOMAIN:-movie}
+      SONARR_SUBDOMAIN: ${SONARR_SUBDOMAIN:-tv}
+      LIDARR_SUBDOMAIN: ${LIDARR_SUBDOMAIN:-music}
+      QBIT_SUBDOMAIN: ${QBIT_SUBDOMAIN:-tor}
+      JELLYFIN_SUBDOMAIN: ${JELLYFIN_SUBDOMAIN:-stream}
+      JELLYSEERR_SUBDOMAIN: ${JELLYSEERR_SUBDOMAIN:-more}
+      # Productivity stack subdomains — inactive when profile not running.
+      NTFY_SUBDOMAIN: ${NTFY_SUBDOMAIN:-ntfy}
+      TANDOOR_SUBDOMAIN: ${TANDOOR_SUBDOMAIN:-food}
+      VIKUNJA_SUBDOMAIN: ${VIKUNJA_SUBDOMAIN:-todo}
+      AFFINE_SUBDOMAIN: ${AFFINE_SUBDOMAIN:-note}
+      FLARESOLVERR_SUBDOMAIN: ${FLARESOLVERR_SUBDOMAIN:-flare}
+      CROWDSEC_SUBDOMAIN: ${CROWDSEC_SUBDOMAIN:-crowd}
+      DOCKHAND_SUBDOMAIN: ${DOCKHAND_SUBDOMAIN:-dock}
+      IMMICH_SUBDOMAIN: ${IMMICH_SUBDOMAIN:-pic}
+      FALCO_SUBDOMAIN: ${FALCO_SUBDOMAIN:-sec}
+      ZEEK_SUBDOMAIN: ${ZEEK_SUBDOMAIN:-net}
+      N8N_SUBDOMAIN: ${N8N_SUBDOMAIN:-n8n}
+    volumes:
+      - ${DOCK_CONF}/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ${DOCK_CONF}/caddy/snippets:/etc/caddy/snippets:ro
+      - ${DOCK_CONF}/caddy/coraza:/etc/caddy/coraza:ro
+      - ${DOCK_CONF}/caddy/data:/data
+      - ${DOCK_CONF}/caddy/logs:/var/log/caddy
+      - ${DOCK_CONF}/caddy/souin:/var/cache/souin
+    network_mode: "service:tailscale-ingress"
+    mem_limit: ${CADDY_MEM_LIMIT:-2g}
+    cpus: ${CADDY_CPUS:-2}
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:2019/config/"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    logging: *default-logging
+    read_only: false  # Caddy's /data needs write access — socketed volume not enough
+    user: "1010:1010"  # match docktaetor:media on host — cap_drop:ALL strips
+                       # DAC_OVERRIDE, so root-in-container can't read 640
+                       # config files owned by docktaetor:media.
+    cap_add:
+      # The caddy binary has file cap cap_net_bind_service=ep so it can bind
+      # :80/:443 without root. no-new-privileges + cap_drop:ALL strips that at
+      # exec ("operation not permitted"), so we re-add it explicitly.
+      - NET_BIND_SERVICE
+
+  crowdsec:
+    <<: *hardened
+    image: crowdsecurity/crowdsec:latest
+    container_name: crowdsec
+    cap_add:
+      - DAC_OVERRIDE
+      - CHOWN
+      - FOWNER
+      - SETUID
+      - SETGID
+    environment:
+      GID: "1010"
+      DISABLE_ONLINE_API: "true"
+      COLLECTIONS: "crowdsecurity/caddy crowdsecurity/linux crowdsecurity/iptables"
+      PARSERS: "crowdsecurity/caddy-logs crowdsecurity/whitelists"
+    volumes:
+      # Bind whole /etc/crowdsec so image-seeded dirs (patterns, parsers,
+      # scenarios, collections, contexts, postoverflows) survive alongside
+      # our templated config files. Seeded from /staging on bootstrap.
+      - ${DOCK_CONF}/crowdsec:/etc/crowdsec
+      - ${DOCK_CONF}/crowdsec/db:/var/lib/crowdsec/data
+      - ${DOCK_CONF}/caddy/logs:/var/log/caddy:ro
+    networks:
+      observability:
+        ipv4_address: 10.0.13.20
+      ingress:
+        ipv4_address: 10.0.10.21
+    mem_limit: ${CROWDSEC_MEM_LIMIT:-1g}
+    healthcheck:
+      test: ["CMD", "cscli", "lapi", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    read_only: false
+    logging: *default-logging
+
+  socket-proxy-ro:
+    <<: *hardened
+    image: tecnativa/docker-socket-proxy:latest
+    container_name: socket-proxy-ro
+    environment:
+      CONTAINERS: "1"
+      SERVICES: "1"
+      TASKS: "1"
+      NETWORKS: "1"
+      IMAGES: "1"
+      INFO: "1"
+      EVENTS: "1"
+      VERSION: "1"
+      POST: "0"
+      ALLOW_START: "0"
+      ALLOW_STOP: "0"
+      ALLOW_RESTARTS: "0"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      observability:
+        ipv4_address: 10.0.13.21
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:2375/_ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    read_only: false
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+    logging: *default-logging
+
+  socket-proxy-rw:
+    <<: *hardened
+    image: tecnativa/docker-socket-proxy:latest
+    container_name: socket-proxy-rw
+    environment:
+      CONTAINERS: "1"
+      SERVICES: "1"
+      TASKS: "1"
+      NETWORKS: "1"
+      IMAGES: "1"
+      INFO: "1"
+      EVENTS: "1"
+      VERSION: "1"
+      POST: "1"
+      ALLOW_START: "1"
+      ALLOW_STOP: "1"
+      ALLOW_RESTARTS: "1"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      observability:
+        ipv4_address: 10.0.13.22
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:2375/_ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    read_only: false
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+    logging: *default-logging
+
+  autoheal:
+    <<: *hardened
+    image: willfarrell/autoheal:latest
+    container_name: autoheal
+    depends_on:
+      socket-proxy-rw:
+        condition: service_healthy
+    environment:
+      AUTOHEAL_CONTAINER_LABEL: autoheal
+      AUTOHEAL_INTERVAL: "30"
+      DOCKER_SOCK: "tcp://socket-proxy-rw:2375"
+      CURL_TIMEOUT: "30"
+    networks:
+      - observability
+    mem_limit: 256m
+    read_only: false  # container writes internal state
+    logging: *default-logging
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_SUPERUSER}
+      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD}
+      POSTGRES_DB: postgres
+      POSTGRES_INITDB_ARGS: ${POSTGRES_INITDB_ARGS}
+      # Per-app triples consumed by 00-create-app-dbs.sh
+      AUTHENTIK_DB_NAME: ${AUTHENTIK_DB_NAME}
+      AUTHENTIK_DB_USER: ${AUTHENTIK_DB_USER}
+      AUTHENTIK_DB_PASSWORD: ${AUTHENTIK_DB_PASSWORD}
+      NEXTCLOUD_DB_NAME: ${NEXTCLOUD_DB_NAME}
+      NEXTCLOUD_DB_USER: ${NEXTCLOUD_DB_USER}
+      NEXTCLOUD_DB_PASSWORD: ${NEXTCLOUD_DB_PASSWORD}
+      TANDOOR_DB_NAME: ${TANDOOR_DB_NAME}
+      TANDOOR_DB_USER: ${TANDOOR_DB_USER}
+      TANDOOR_DB_PASSWORD: ${TANDOOR_DB_PASSWORD}
+      VIKUNJA_DB_NAME: ${VIKUNJA_DB_NAME}
+      VIKUNJA_DB_USER: ${VIKUNJA_DB_USER}
+      VIKUNJA_DB_PASSWORD: ${VIKUNJA_DB_PASSWORD}
+      AFFINE_DB_NAME: ${AFFINE_DB_NAME}
+      AFFINE_DB_USER: ${AFFINE_DB_USER}
+      AFFINE_DB_PASSWORD: ${AFFINE_DB_PASSWORD}
+      IMMICH_DB_NAME: ${IMMICH_DB_NAME}
+      IMMICH_DB_USER: ${IMMICH_DB_USER}
+      IMMICH_DB_PASSWORD: ${IMMICH_DB_PASSWORD}
+      N8N_DB_NAME: ${N8N_DB_NAME}
+      N8N_DB_USER: ${N8N_DB_USER}
+      N8N_DB_PASSWORD: ${N8N_DB_PASSWORD}
+    volumes:
+      - ${DOCK_DB}/postgres/data:/var/lib/postgresql/data
+      - ${DOCK_DB}/postgres/init.d:/docker-entrypoint-initdb.d:ro
+    command:
+      - postgres
+      - -c
+      - shared_buffers=${POSTGRES_SHARED_BUFFERS:-1GB}
+      - -c
+      - effective_cache_size=${POSTGRES_EFFECTIVE_CACHE_SIZE:-3GB}
+      - -c
+      - work_mem=${POSTGRES_WORK_MEM:-16MB}
+      - -c
+      - max_connections=${POSTGRES_MAX_CONNECTIONS:-200}
+    networks:
+      data:
+        ipv4_address: 10.0.12.30
+    mem_limit: ${POSTGRES_MEM_LIMIT:-4g}
+    cpus: ${POSTGRES_CPUS:-2}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_SUPERUSER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+    labels:
+      - autoheal=true
+    user: "1010:1010"
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+      - DAC_OVERRIDE
+      - FOWNER
+    security_opt:
+      - no-new-privileges:true
+    logging: *default-logging
+
+  redis:
+    <<: *hardened
+    image: redis:7-alpine
+    container_name: redis
+    user: "1010:1010"
+    command:
+      - redis-server
+      - --requirepass
+      - ${REDIS_PASSWORD}
+      - --appendonly
+      - ${REDIS_APPENDONLY}
+      - --maxmemory
+      - ${REDIS_MAXMEMORY}
+      - --maxmemory-policy
+      - allkeys-lru
+      - --io-threads
+      - ${REDIS_IO_THREADS}
+      - --io-threads-do-reads
+      - "yes"
+      - --protected-mode
+      - "yes"
+    volumes:
+      - ${DOCK_DB}/redis:/data
+    networks:
+      data:
+        ipv4_address: 10.0.12.31
+    mem_limit: ${REDIS_MEM_LIMIT:-2g}
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    read_only: false
+    logging: *default-logging
+
+  wazuh-init:
+    # One-shot: generates internal TLS certs the first time the stack comes up.
+    # Subsequent runs detect admin.pem and exit 0. Generates each cert with both
+    # IP and DNS SANs so clients connecting via docker-compose service names
+    # (e.g. filebeat -> wazuh-indexer) pass hostname verification.
+    # DNs (C=US, L=California, O=Wazuh, OU=Wazuh, CN=<name>) match the admin_dn
+    # and nodes_dn entries in opensearch.yml.
+    image: alpine:3
+    container_name: wazuh-init
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        if [ -f /certs/admin.pem ]; then
+          echo "wazuh certs already present; skipping generation."
+          exit 0
+        fi
+        apk add --no-cache openssl
+        cd /tmp
+
+        SUBJ_BASE="/C=US/L=California/O=Wazuh/OU=Wazuh"
+
+        openssl genrsa -out root-ca.key 4096
+        openssl req -x509 -new -nodes -key root-ca.key -sha256 -days 3650 \
+          -out root-ca.pem -subj "$${SUBJ_BASE}/CN=root-ca"
+
+        gen_server_cert() {
+          n=$$1; dns=$$2; ip=$$3
+          openssl genrsa -out "$${n}-key.pem" 2048
+          cat > "$${n}.cnf" <<EOF
+        [req]
+        distinguished_name=dn
+        prompt=no
+        [dn]
+        C=US
+        L=California
+        O=Wazuh
+        OU=Wazuh
+        CN=$${n}
+        [v3]
+        basicConstraints=CA:FALSE
+        keyUsage=digitalSignature,keyEncipherment
+        extendedKeyUsage=serverAuth,clientAuth
+        subjectAltName=@san
+        [san]
+        DNS.1=$${dns}
+        IP.1=$${ip}
+        EOF
+          openssl req -new -key "$${n}-key.pem" -out "$${n}.csr" -config "$${n}.cnf"
+          openssl x509 -req -in "$${n}.csr" -CA root-ca.pem -CAkey root-ca.key \
+            -CAcreateserial -out "$${n}.pem" -days 3650 -sha256 \
+            -extfile "$${n}.cnf" -extensions v3
+        }
+
+        # Admin client cert (clientAuth only). CN=admin matches opensearch.yml admin_dn.
+        openssl genrsa -out admin-key-rsa.pem 2048
+        openssl req -new -key admin-key-rsa.pem -out admin.csr \
+          -subj "$${SUBJ_BASE}/CN=admin"
+        cat > admin-ext.cnf <<EOF
+        basicConstraints=CA:FALSE
+        keyUsage=digitalSignature,keyEncipherment
+        extendedKeyUsage=clientAuth
+        EOF
+        openssl x509 -req -in admin.csr -CA root-ca.pem -CAkey root-ca.key \
+          -CAcreateserial -out admin.pem -days 3650 -sha256 -extfile admin-ext.cnf
+        # OpenSearch security plugin expects admin key in PKCS#8.
+        openssl pkcs8 -topk8 -inform PEM -outform PEM -nocrypt \
+          -in admin-key-rsa.pem -out admin-key.pem
+
+        # Indexer cert is shared across all three nodes — one CN, three SANs.
+        openssl genrsa -out wazuh-indexer-key.pem 2048
+        cat > wazuh-indexer.cnf <<EOF
+        [req]
+        distinguished_name=dn
+        prompt=no
+        [dn]
+        C=US
+        L=California
+        O=Wazuh
+        OU=Wazuh
+        CN=wazuh-indexer
+        [v3]
+        basicConstraints=CA:FALSE
+        keyUsage=digitalSignature,keyEncipherment
+        extendedKeyUsage=serverAuth,clientAuth
+        subjectAltName=@san
+        [san]
+        DNS.1=wazuh-indexer-1
+        DNS.2=wazuh-indexer-2
+        DNS.3=wazuh-indexer-3
+        IP.1=10.0.13.31
+        IP.2=10.0.13.33
+        IP.3=10.0.13.34
+        EOF
+        openssl req -new -key wazuh-indexer-key.pem -out wazuh-indexer.csr -config wazuh-indexer.cnf
+        openssl x509 -req -in wazuh-indexer.csr -CA root-ca.pem -CAkey root-ca.key \
+          -CAcreateserial -out wazuh-indexer.pem -days 3650 -sha256 \
+          -extfile wazuh-indexer.cnf -extensions v3
+
+        gen_server_cert wazuh-manager   wazuh-manager   10.0.13.30
+        gen_server_cert wazuh-dashboard wazuh-dashboard 10.0.13.32
+
+        install -o 1000 -g 1000 -m 640 root-ca.pem        /certs/
+        install -o 1000 -g 1000 -m 640 admin.pem          /certs/
+        install -o 1000 -g 1000 -m 640 admin-key.pem      /certs/
+        install -o 1000 -g 1000 -m 640 wazuh-indexer.pem      /certs/indexer.pem
+        install -o 1000 -g 1000 -m 640 wazuh-indexer-key.pem  /certs/indexer-key.pem
+        install -o 1000 -g 1000 -m 640 wazuh-manager.pem      /certs/manager.pem
+        install -o 1000 -g 1000 -m 640 wazuh-manager-key.pem  /certs/manager-key.pem
+        install -o 1000 -g 1000 -m 640 wazuh-dashboard.pem    /certs/dashboard.pem
+        install -o 1000 -g 1000 -m 640 wazuh-dashboard-key.pem /certs/dashboard-key.pem
+        echo "wazuh certs generated."
+    volumes:
+      - ${DOCK_CONF}/wazuh/certs:/certs
+    networks:
+      observability:
+        ipv4_address: 10.0.13.29
+    restart: "no"
+    logging: *default-logging
+
+  wazuh-indexer-1:
+    <<: *wazuh-indexer
+    container_name: wazuh-indexer-1
+    environment:
+      - NODE_NAME=wazuh-indexer-1
+      - bootstrap.memory_lock=true
+      - OPENSEARCH_JAVA_OPTS=-Xms${WAZUH_INDEXER_JVM_HEAP:-1g} -Xmx${WAZUH_INDEXER_JVM_HEAP:-1g}
+      - INDEXER_PASSWORD=${WAZUH_INDEXER_ADMIN_PASSWORD}
+    volumes:
+      - ${DOCK_DATA}/wazuh/indexer-1:/var/lib/wazuh-indexer
+      - ${DOCK_CONF}/wazuh/indexer/opensearch.yml:/usr/share/wazuh-indexer/opensearch.yml:ro
+      - ${DOCK_CONF}/wazuh/certs:/usr/share/wazuh-indexer/certs:ro
+    networks:
+      observability:
+        ipv4_address: 10.0.13.31
+
+  wazuh-indexer-2:
+    <<: *wazuh-indexer
+    container_name: wazuh-indexer-2
+    environment:
+      - NODE_NAME=wazuh-indexer-2
+      - bootstrap.memory_lock=true
+      - OPENSEARCH_JAVA_OPTS=-Xms${WAZUH_INDEXER_JVM_HEAP:-1g} -Xmx${WAZUH_INDEXER_JVM_HEAP:-1g}
+      - INDEXER_PASSWORD=${WAZUH_INDEXER_ADMIN_PASSWORD}
+    volumes:
+      - ${DOCK_DATA}/wazuh/indexer-2:/var/lib/wazuh-indexer
+      - ${DOCK_CONF}/wazuh/indexer/opensearch.yml:/usr/share/wazuh-indexer/opensearch.yml:ro
+      - ${DOCK_CONF}/wazuh/certs:/usr/share/wazuh-indexer/certs:ro
+    networks:
+      observability:
+        ipv4_address: 10.0.13.33
+
+  wazuh-indexer-3:
+    <<: *wazuh-indexer
+    container_name: wazuh-indexer-3
+    environment:
+      - NODE_NAME=wazuh-indexer-3
+      - bootstrap.memory_lock=true
+      - OPENSEARCH_JAVA_OPTS=-Xms${WAZUH_INDEXER_JVM_HEAP:-1g} -Xmx${WAZUH_INDEXER_JVM_HEAP:-1g}
+      - INDEXER_PASSWORD=${WAZUH_INDEXER_ADMIN_PASSWORD}
+    volumes:
+      - ${DOCK_DATA}/wazuh/indexer-3:/var/lib/wazuh-indexer
+      - ${DOCK_CONF}/wazuh/indexer/opensearch.yml:/usr/share/wazuh-indexer/opensearch.yml:ro
+      - ${DOCK_CONF}/wazuh/certs:/usr/share/wazuh-indexer/certs:ro
+    networks:
+      observability:
+        ipv4_address: 10.0.13.34
+
+  wazuh-security-init:
+    # One-shot: seeds the OpenSearch security index with bcrypt hashes of the
+    # admin and kibanaserver passwords from the environment. Idempotent — a
+    # flag file on the shared certs volume records success.
+    image: wazuh/wazuh-indexer:${WAZUH_VERSION}
+    container_name: wazuh-security-init
+    depends_on:
+      wazuh-indexer-1:
+        condition: service_healthy
+      wazuh-indexer-2:
+        condition: service_healthy
+      wazuh-indexer-3:
+        condition: service_healthy
+    environment:
+      ADMIN_PASSWORD: ${WAZUH_INDEXER_ADMIN_PASSWORD}
+      KIBANASERVER_PASSWORD: ${WAZUH_INDEXER_KIBANASERVER_PASSWORD}
+      OPENSEARCH_JAVA_HOME: /usr/share/wazuh-indexer/jdk
+    user: "1000:1000"
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -eu
+        FLAG=/certs/.security-initialized
+        if [ -f "$${FLAG}" ]; then
+          echo "security already initialized; skipping."
+          exit 0
+        fi
+        HASH_TOOL=/usr/share/wazuh-indexer/plugins/opensearch-security/tools/hash.sh
+        SEC_TOOL=/usr/share/wazuh-indexer/plugins/opensearch-security/tools/securityadmin.sh
+        # Wait until the cluster has formed and the default .opendistro_security
+        # index is writable (securityadmin will otherwise 503 on first try).
+        until curl -sk --max-time 3 https://wazuh-indexer-1:9200/_cluster/health \
+            --cacert /certs/root-ca.pem \
+            --cert /certs/admin.pem --key /certs/admin-key.pem \
+            2>&1 | grep -qE 'green|yellow|Security not initialized'; do
+          echo "waiting for indexer cluster..."
+          sleep 5
+        done
+        ADMIN_HASH=$$(bash "$${HASH_TOOL}" -p "$${ADMIN_PASSWORD}" | tail -1)
+        KIB_HASH=$$(bash "$${HASH_TOOL}" -p "$${KIBANASERVER_PASSWORD}" | tail -1)
+        WORK=$$(mktemp -d)
+        cp /usr/share/wazuh-indexer/opensearch-security/*.yml "$${WORK}/"
+        sed -i "/^admin:/,/^[a-z]/ { s|hash: .*|hash: \"$${ADMIN_HASH}\"| }" "$${WORK}/internal_users.yml"
+        sed -i "/^kibanaserver:/,/^[a-z]/ { s|hash: .*|hash: \"$${KIB_HASH}\"| }" "$${WORK}/internal_users.yml"
+        bash "$${SEC_TOOL}" -cd "$${WORK}" -nhnv \
+          -cacert /certs/root-ca.pem \
+          -cert /certs/admin.pem \
+          -key /certs/admin-key.pem \
+          -p 9200 -icl -h wazuh-indexer-1
+        touch "$${FLAG}"
+        echo "wazuh security initialized."
+    volumes:
+      - ${DOCK_CONF}/wazuh/certs:/certs
+    networks:
+      observability:
+        ipv4_address: 10.0.13.35
+    restart: "no"
+    logging: *default-logging
+
+  wazuh-manager:
+    image: wazuh/wazuh-manager:${WAZUH_VERSION}
+    container_name: wazuh-manager
+    depends_on:
+      wazuh-security-init:
+        condition: service_completed_successfully
+      wazuh-indexer-1:
+        condition: service_healthy
+      wazuh-indexer-2:
+        condition: service_healthy
+      wazuh-indexer-3:
+        condition: service_healthy
+    environment:
+      # The filebeat cont-init uses the raw INDEXER_URL value as a single string
+      # inside a YAML flow list: hosts: ['$INDEXER_URL']. Embedding the closing
+      # quote + comma + next entry extends it into a valid three-host array.
+      INDEXER_URL: https://wazuh-indexer-1:9200','https://wazuh-indexer-2:9200','https://wazuh-indexer-3:9200
+      INDEXER_USERNAME: admin
+      INDEXER_PASSWORD: ${WAZUH_INDEXER_ADMIN_PASSWORD}
+      API_USERNAME: wazuh-wui
+      API_PASSWORD: ${WAZUH_API_PASSWORD}
+      # Filebeat trusts the internal root CA generated by wazuh-init.
+      SSL_CERTIFICATE_AUTHORITIES: /etc/ssl/wazuh/root-ca.pem
+      FILEBEAT_SSL_VERIFICATION_MODE: full
+    volumes:
+      - ${DOCK_DATA}/wazuh/manager:/var/ossec/data
+      - ${DOCK_CONF}/wazuh/certs:/etc/ssl/wazuh:ro
+      # Custom decoders/rules are copied in by post-start script rather than
+      # bind-mounted under /var/ossec/etc, because sub-mounts there shadow the
+      # cont-init config seeding that populates ossec.conf on first boot.
+    networks:
+      observability:
+        ipv4_address: 10.0.13.30
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    mem_limit: ${WAZUH_MANAGER_MEM_LIMIT:-2g}
+    cap_add:
+      - SYS_RESOURCE
+      - SYS_PTRACE
+    healthcheck:
+      # wazuh-control status exits non-zero when *any* optional daemon isn't
+      # running, so gate on the essential ones individually.
+      test: ["CMD-SHELL", "/var/ossec/bin/wazuh-control status | grep -E 'wazuh-(analysisd|remoted|modulesd|apid) is running' | wc -l | grep -q '^4$'"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+    restart: unless-stopped
+    labels:
+      - autoheal=true
+    logging: *default-logging
+
+  wazuh-dashboard:
+    image: wazuh/wazuh-dashboard:${WAZUH_VERSION}
+    container_name: wazuh-dashboard
+    depends_on:
+      wazuh-security-init:
+        condition: service_completed_successfully
+      wazuh-indexer-1:
+        condition: service_healthy
+      wazuh-indexer-2:
+        condition: service_healthy
+      wazuh-indexer-3:
+        condition: service_healthy
+      wazuh-manager:
+        condition: service_healthy
+    environment:
+      INDEXER_URL: https://wazuh-indexer-1:9200
+      INDEXER_USERNAME: kibanaserver
+      INDEXER_PASSWORD: ${WAZUH_INDEXER_KIBANASERVER_PASSWORD}
+      WAZUH_API_URL: https://wazuh-manager
+      DASHBOARD_USERNAME: kibanaserver
+      DASHBOARD_PASSWORD: ${WAZUH_INDEXER_KIBANASERVER_PASSWORD}
+    volumes:
+      # Mount only the single file — the image's /config dir also holds
+      # node.options + keystore; shadowing the whole dir breaks the keystore
+      # keystore init done by the entrypoint.
+      - ${DOCK_CONF}/wazuh/dashboard/opensearch_dashboards.yml:/usr/share/wazuh-dashboard/config/opensearch_dashboards.yml:ro
+      - ${DOCK_CONF}/wazuh/certs:/usr/share/wazuh-dashboard/certs:ro
+    networks:
+      observability:
+        ipv4_address: 10.0.13.32
+    mem_limit: ${WAZUH_DASHBOARD_MEM_LIMIT:-1g}
+    healthcheck:
+      # 401 from /status means the server is up — Wazuh requires auth to read it.
+      test: ["CMD-SHELL", "curl -kso /dev/null -w '%{http_code}' https://localhost:5601/status | grep -qE '^(200|302|401)$'"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      start_period: 90s
+    restart: unless-stopped
+    labels:
+      - autoheal=true
+    logging: *default-logging
+
+  falco:
+    image: falcosecurity/falco:latest
+    container_name: falco
+    privileged: true
+    pid: host
+    environment:
+      FALCO_BPF_PROBE: ""
+      FALCO_HOSTNAME: ${FALCO_HOSTNAME:-falco}
+    volumes:
+      - /var/run/docker.sock:/host/var/run/docker.sock:ro
+      - /dev:/host/dev:ro
+      - /proc:/host/proc:ro
+      - /boot:/host/boot:ro
+      - /lib/modules:/host/lib/modules:ro
+      - /usr:/host/usr:ro
+      - /etc:/host/etc:ro
+      - ${DOCK_CONF}/falco/falco.yaml:/etc/falco/falco.yaml:ro
+      - ${DOCK_CONF}/falco/falco_rules.local.yaml:/etc/falco/falco_rules.local.yaml:ro
+      - ${DOCK_CONF}/falco/rules.d:/etc/falco/rules.d:ro
+      - ${DOCK_CONF}/falco:/var/log/falco
+    networks:
+      observability:
+        ipv4_address: 10.0.13.24
+    mem_limit: ${FALCO_MEM_LIMIT:-512m}
+    healthcheck:
+      test: ["CMD-SHELL", "pidof falco >/dev/null"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+    labels:
+      - autoheal=true
+    logging: *default-logging
+
+  zeek:
+    image: zeek/zeek:latest
+    container_name: zeek
+    network_mode: host
+    environment:
+      ZEEK_WORKER_COUNT: ${ZEEK_WORKER_COUNT:-2}
+    volumes:
+      - ${DOCK_CONF}/zeek/local.zeek:/usr/local/zeek/share/zeek/site/local.zeek:ro
+      - ${DOCK_CONF}/zeek/node.cfg:/usr/local/zeek/etc/node.cfg:ro
+      - ${DOCK_CONF}/zeek/networks.cfg:/usr/local/zeek/etc/networks.cfg:ro
+      - ${DOCK_CONF}/zeek/intel:/usr/local/zeek/intel:ro
+      - ${DOCK_CONF}/zeek/logs:/usr/local/zeek/logs
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+      - SYS_NICE
+      - DAC_OVERRIDE
+    command:
+      - /bin/sh
+      - -c
+      - "zeekctl deploy && tail -f /usr/local/zeek/logs/current/stderr.log"
+    mem_limit: ${ZEEK_MEM_LIMIT:-1g}
+    healthcheck:
+      test: ["CMD-SHELL", "zeekctl status 2>/dev/null | grep -q running"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+    labels:
+      - autoheal=true
+    logging: *default-logging
+
+  authentik-migration:
+    image: ghcr.io/goauthentik/server:${AUTHENTIK_VERSION}
+    container_name: authentik-migration
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: migrate
+    environment:
+      AUTHENTIK_POSTGRESQL__HOST: postgres
+      AUTHENTIK_POSTGRESQL__USER: ${AUTHENTIK_DB_USER}
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${AUTHENTIK_DB_PASSWORD}
+      AUTHENTIK_POSTGRESQL__NAME: ${AUTHENTIK_DB_NAME}
+      AUTHENTIK_REDIS__HOST: redis
+      AUTHENTIK_REDIS__PASSWORD: ${REDIS_PASSWORD}
+      AUTHENTIK_REDIS__DB: ${AUTHENTIK_REDIS_DB}
+      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY}
+      AUTHENTIK_ERROR_REPORTING__ENABLED: "false"
+      AUTHENTIK_DISABLE_UPDATE_CHECK: "true"
+    networks:
+      - auth
+      - data
+    restart: "no"
+    logging: *default-logging
+
+  authentik-server:
+    image: ghcr.io/goauthentik/server:${AUTHENTIK_VERSION}
+    container_name: authentik-server
+    depends_on:
+      authentik-migration:
+        condition: service_completed_successfully
+    command: server
+    environment:
+      AUTHENTIK_POSTGRESQL__HOST: postgres
+      AUTHENTIK_POSTGRESQL__USER: ${AUTHENTIK_DB_USER}
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${AUTHENTIK_DB_PASSWORD}
+      AUTHENTIK_POSTGRESQL__NAME: ${AUTHENTIK_DB_NAME}
+      AUTHENTIK_REDIS__HOST: redis
+      AUTHENTIK_REDIS__PASSWORD: ${REDIS_PASSWORD}
+      AUTHENTIK_REDIS__DB: ${AUTHENTIK_REDIS_DB}
+      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY}
+      AUTHENTIK_BOOTSTRAP_EMAIL: ${ADMIN_EMAIL}
+      AUTHENTIK_BOOTSTRAP_PASSWORD: ${AUTHENTIK_BOOTSTRAP_PASSWORD}
+      AUTHENTIK_BOOTSTRAP_TOKEN: ${AUTHENTIK_BOOTSTRAP_TOKEN}
+      AUTHENTIK_ERROR_REPORTING__ENABLED: "false"
+      AUTHENTIK_DISABLE_UPDATE_CHECK: "true"
+    volumes:
+      - ${DOCK_CONF}/authentik/media:/media
+      - ${DOCK_CONF}/authentik/custom-templates:/templates:ro
+    networks:
+      auth:
+        ipv4_address: 10.0.11.20
+      data:
+    mem_limit: ${AUTHENTIK_SERVER_MEM_LIMIT:-2g}
+    healthcheck:
+      test: ["CMD", "ak", "healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+    restart: unless-stopped
+    labels:
+      - autoheal=true
+    logging: *default-logging
+
+  authentik-worker:
+    image: ghcr.io/goauthentik/server:${AUTHENTIK_VERSION}
+    container_name: authentik-worker
+    depends_on:
+      authentik-server:
+        condition: service_healthy
+    command: worker
+    environment:
+      AUTHENTIK_POSTGRESQL__HOST: postgres
+      AUTHENTIK_POSTGRESQL__USER: ${AUTHENTIK_DB_USER}
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${AUTHENTIK_DB_PASSWORD}
+      AUTHENTIK_POSTGRESQL__NAME: ${AUTHENTIK_DB_NAME}
+      AUTHENTIK_REDIS__HOST: redis
+      AUTHENTIK_REDIS__PASSWORD: ${REDIS_PASSWORD}
+      AUTHENTIK_REDIS__DB: ${AUTHENTIK_REDIS_DB}
+      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY}
+      AUTHENTIK_ERROR_REPORTING__ENABLED: "false"
+      AUTHENTIK_DISABLE_UPDATE_CHECK: "true"
+    volumes:
+      - ${DOCK_CONF}/authentik/media:/media
+      - ${DOCK_CONF}/authentik/custom-templates:/templates:ro
+    networks:
+      auth:
+        ipv4_address: 10.0.11.21
+      data:
+    mem_limit: ${AUTHENTIK_WORKER_MEM_LIMIT:-2g}
+    healthcheck:
+      test: ["CMD", "ak", "healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+    restart: unless-stopped
+    labels:
+      - autoheal=true
+    logging: *default-logging
+
+  # ==========================================================
+  # Authentik Proxy Outpost — serves /outpost.goauthentik.io/
+  # forward-auth requests that Caddy delegates via forward_auth.
+  # The embedded outpost does NOT handle forward-auth from
+  # external proxies; a dedicated container is required.
+  # ==========================================================
+  authentik-proxy:
+    image: ghcr.io/goauthentik/proxy:${AUTHENTIK_VERSION}
+    container_name: authentik-proxy
+    depends_on:
+      authentik-server:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      AUTHENTIK_HOST: http://authentik-server:9000
+      AUTHENTIK_INSECURE: "true"
+      AUTHENTIK_TOKEN: ${AUTHENTIK_OUTPOST_TOKEN}
+      AUTHENTIK_REDIS__HOST: redis
+      AUTHENTIK_REDIS__PASSWORD: ${REDIS_PASSWORD}
+      AUTHENTIK_REDIS__DB: ${REDIS_DB_AUTHENTIK}
+    networks:
+      auth:
+        ipv4_address: 10.0.11.22
+      data:
+    mem_limit: 256m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: unless-stopped
+    labels:
+      - autoheal=true
+    logging: *default-logging
+
+  # ==========================================================
+  # Nextcloud — file sync + collaboration. Phase 3 app.
+  # Gated by Authentik forward-auth. Shares Postgres + Redis.
+  # Runs as www-data (uid 33); /dock/data/nextcloud must be
+  # chown 33:33 on the host (docker-host-config.sh handles this).
+  # read_only omitted — Nextcloud writes PHP sessions + config
+  # into /var/www/html at runtime.
+  # ==========================================================
+  nextcloud:
+    image: nextcloud:${NEXTCLOUD_VERSION:-30}
+    container_name: nextcloud
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      NEXTCLOUD_TRUSTED_DOMAINS: >-
+        ${NEXTCLOUD_SUBDOMAIN}.${PUBLIC_FQDN}
+        ${NEXTCLOUD_SUBDOMAIN}.${TAILNET_FQDN}
+        nextcloud
+      NEXTCLOUD_ADMIN_USER: ${NEXTCLOUD_ADMIN_USER}
+      NEXTCLOUD_ADMIN_PASSWORD: ${NEXTCLOUD_ADMIN_PASSWORD}
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: ${NEXTCLOUD_DB_NAME}
+      POSTGRES_USER: ${NEXTCLOUD_DB_USER}
+      POSTGRES_PASSWORD: ${NEXTCLOUD_DB_PASSWORD}
+      REDIS_HOST: redis
+      REDIS_HOST_PASSWORD: ${REDIS_PASSWORD}
+      REDIS_HOST_PORT: 6379
+      REDIS_HOST_DB: ${REDIS_DB_NEXTCLOUD}
+      OVERWRITEPROTOCOL: https
+      OVERWRITECLIURL: https://${NEXTCLOUD_SUBDOMAIN}.${PUBLIC_FQDN}
+      PHP_MEMORY_LIMIT: 512M
+      PHP_UPLOAD_LIMIT: 10G
+    volumes:
+      - ${DOCK_DATA}/nextcloud:/var/www/html
+    networks:
+      apps:
+        ipv4_address: 10.0.14.20
+      data:
+    mem_limit: ${NEXTCLOUD_MEM_LIMIT:-2g}
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+      - DAC_OVERRIDE
+      - FOWNER
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "php", "/var/www/html/occ", "status", "--no-warnings"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+    restart: unless-stopped
+    labels:
+      - autoheal=true
+    logging: *default-logging
+
+  # ==========================================================
+  # coturn — TURN/STUN server for Nextcloud Talk WebRTC.
+  # Binds directly to host ports 3478 and 49152-49200 (UDP/TCP)
+  # — these bypass Cloudflare since CF does not proxy UDP.
+  # denied-peer-ip blocks relay to RFC-1918 ranges (SSRF guard).
+  # ==========================================================
+  coturn:
+    image: coturn/coturn:latest
+    container_name: coturn
+    network_mode: host
+    volumes:
+      - ${DOCK_CONF}/coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
+    mem_limit: ${COTURN_MEM_LIMIT:-256m}
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/3478"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    labels:
+      - autoheal=true
+    logging: *default-logging
+
+  # ==========================================================
+  # MEDIA STACK — optional, profile-gated.
+  # Enable:  docker compose --profile media up -d
+  # Disable: docker compose --profile media down
+  #
+  # All outbound requests from every media service pass through
+  # ProtonVPN WireGuard via GlueTUN. Services share GlueTUN's
+  # network namespace (network_mode: service:gluetun) — Caddy
+  # reaches them by name "gluetun:<port>" on the apps network.
+  # FlareSolverr is internal-only (Prowlarr → localhost:8191).
+  # ==========================================================
+
+  gluetun:
+    image: qmcgaw/gluetun:latest
+    container_name: gluetun
+    profiles: [media]
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      VPN_SERVICE_PROVIDER: protonvpn
+      VPN_TYPE: wireguard
+      WIREGUARD_PRIVATE_KEY: ${PROTONVPN_WIREGUARD_PRIVATE_KEY}
+      SERVER_COUNTRIES: ${PROTONVPN_SERVER_COUNTRIES:-Netherlands}
+      VPN_PORT_FORWARDING: ${PROTONVPN_PORT_FORWARDING:-off}
+      # When a port is forwarded, wait 60 s for qBittorrent to be ready then
+      # push the new listen port to its API. {{FORWARDED_PORT}} is substituted
+      # by Gluetun before sh runs — no shell variable needed. Local auth bypass
+      # must be enabled in qBittorrent.conf (seeded by docker-host-config.sh).
+      VPN_PORT_FORWARDING_UP_COMMAND: >-
+        sleep 60 &&
+        wget -q -T5 -O/dev/null
+        --post-data=json=%7B%22listen_port%22:{{FORWARDED_PORT}}%7D
+        http://localhost:${QBIT_WEBUI_PORT:-8080}/api/v2/app/setPreferences
+      UPDATER_PERIOD: 24h
+      # DOT off: keep Docker's embedded resolver so container names resolve.
+      DOT: "off"
+      # Allow direct traffic to Docker subnets without going through VPN.
+      FIREWALL_OUTBOUND_SUBNETS: 10.0.0.0/8
+    networks:
+      apps:
+        ipv4_address: 10.0.14.30
+    mem_limit: ${GLUETUN_MEM_LIMIT:-256m}
+    security_opt:
+      - no-new-privileges:true
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=1
+    healthcheck:
+      test: ["CMD", "/gluetun-entrypoint", "healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    labels:
+      - autoheal=true
+    logging: *default-logging
+
+  prowlarr:
+    image: lscr.io/linuxserver/prowlarr:latest
+    container_name: prowlarr
+    profiles: [media]
+    network_mode: "service:gluetun"
+    depends_on:
+      gluetun:
+        condition: service_healthy
+    environment:
+      PUID: ${PUID}
+      PGID: ${PGID}
+      TZ: ${TZ}
+    volumes:
+      - ${DOCK_CONF}/prowlarr:/config
+    mem_limit: ${PROWLARR_MEM_LIMIT:-512m}
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "curl -so /dev/null -w '%{http_code}' http://localhost:9696/ | grep -qvE '^(000|5[0-9]{2})$'"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    labels:
+      - autoheal=true
+    logging: *default-logging
+
+  radarr:
+    image: lscr.io/linuxserver/radarr:latest
+    container_name: radarr
+    profiles: [media]
+    network_mode: "service:gluetun"
+    depends_on:
+      gluetun:
+        condition: service_healthy
+    environment:
+      PUID: ${PUID}
+      PGID: ${PGID}
+      TZ: ${TZ}
+    volumes:
+      - ${DOCK_CONF}/radarr:/config
+      - ${MEDIA_PATH}:/media
+      - ${DOWNLOADS_PATH}:/downloads
+    mem_limit: ${RADARR_MEM_LIMIT:-512m}
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "curl -so /dev/null -w '%{http_code}' http://localhost:7878/ | grep -qvE '^(000|5[0-9]{2})$'"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    labels:
+      - autoheal=true
+    logging: *default-logging
+
+  sonarr:
+    image: lscr.io/linuxserver/sonarr:latest
+    container_name: sonarr
+    profiles: [media]
+    network_mode: "service:gluetun"
+    depends_on:
+      gluetun:
+        condition: service_healthy
+    environment:
+      PUID: ${PUID}
+      PGID: ${PGID}
+      TZ: ${TZ}
+    volumes:
+      - ${DOCK_CONF}/sonarr:/config
+      - ${MEDIA_PATH}:/media
+      - ${DOWNLOADS_PATH}:/downloads
+    mem_limit: ${SONARR_MEM_LIMIT:-512m}
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "curl -so /dev/null -w '%{http_code}' http://localhost:8989/ | grep -qvE '^(000|5[0-9]{2})$'"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    labels:
+      - autoheal=true
+    logging: *default-logging
+
+  lidarr:
+    image: lscr.io/linuxserver/lidarr:latest
+    container_name: lidarr
+    profiles: [media]
+    network_mode: "service:gluetun"
+    depends_on:
+      gluetun:
+        condition: service_healthy
+    environment:
+      PUID: ${PUID}
+      PGID: ${PGID}
+      TZ: ${TZ}
+    volumes:
+      - ${DOCK_CONF}/lidarr:/config
+      - ${MEDIA_PATH}:/media
+      - ${DOWNLOADS_PATH}:/downloads
+    mem_limit: ${LIDARR_MEM_LIMIT:-512m}
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "curl -so /dev/null -w '%{http_code}' http://localhost:8686/ | grep -qvE '^(000|5[0-9]{2})$'"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    labels:
+      - autoheal=true
+    logging: *default-logging
+
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: flaresolverr
+    profiles: [media]
+    network_mode: "service:gluetun"
+    depends_on:
+      gluetun:
+        condition: service_healthy
+    environment:
+      LOG_LEVEL: info
+      LOG_HTML: "false"
+      CAPTCHA_SOLVER: none
+      TZ: ${TZ}
+    mem_limit: ${FLARESOLVERR_MEM_LIMIT:-512m}
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8191/health | grep -q '\"ok\"'"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+    labels:
+      - autoheal=true
+    logging: *default-logging
+
+  qbittorrent:
+    image: lscr.io/linuxserver/qbittorrent:latest
+    container_name: qbittorrent
+    profiles: [media]
+    network_mode: "service:gluetun"
+    depends_on:
+      gluetun:
+        condition: service_healthy
+    environment:
+      PUID: ${PUID}
+      PGID: ${PGID}
+      TZ: ${TZ}
+      WEBUI_PORT: ${QBIT_WEBUI_PORT:-8080}
+    volumes:
+      - ${DOCK_CONF}/qbittorrent:/config
+      - ${DOWNLOADS_PATH}:/downloads
+    mem_limit: ${QBIT_MEM_LIMIT:-1g}
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "curl -so /dev/null -w '%{http_code}' http://localhost:${QBIT_WEBUI_PORT:-8080}/ | grep -qvE '^(000|5[0-9]{2})$'"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+    labels:
+      - autoheal=true
+    logging: *default-logging
+
+  # ==========================================================
+  # Jellyfin — media server. Profile: media.
+  # GPU transcoding via /dev/dri. Not behind VPN — accessed
+  # directly by LAN/Tailnet clients.
+  # ==========================================================
+  jellyfin:
+    image: lscr.io/linuxserver/jellyfin:${JELLYFIN_VERSION:-latest}
+    container_name: jellyfin
+    profiles: [media]
+    environment:
+      PUID: ${PUID}
+      PGID: ${PGID}
+      TZ: ${TZ}
+      JELLYFIN_PublishedServerUrl: https://${JELLYFIN_SUBDOMAIN:-jellyfin}.${PUBLIC_FQDN}
+    volumes:
+      - ${DOCK_CONF}/jellyfin:/config
+      - ${MEDIA_PATH}:/media:ro
+    devices:
+      - /dev/dri:/dev/dri
+    networks:
+      apps:
+        ipv4_address: 10.0.14.21
+    mem_limit: ${JELLYFIN_MEM_LIMIT:-4g}
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8096/health | grep -q Healthy"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+    labels:
+      - autoheal=true
+    logging: *default-logging
+
+  # ==========================================================
+  # Jellyseerr — media request management for Jellyfin.
+  # Profile: media. Talks to Sonarr/Radarr via gluetun netns.
+  # ==========================================================
+  jellyseerr:
+    image: fallenbagel/jellyseerr:${JELLYSEERR_VERSION:-latest}
+    container_name: jellyseerr
+    profiles: [media]
+    depends_on:
+      jellyfin:
+        condition: service_healthy
+    environment:
+      TZ: ${TZ}
+      LOG_LEVEL: info
+    volumes:
+      - ${DOCK_CONF}/jellyseerr:/app/config
+    networks:
+      apps:
+        ipv4_address: 10.0.14.22
+    mem_limit: ${JELLYSEERR_MEM_LIMIT:-512m}
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:5055/api/v1/status | grep -q version"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    labels:
+      - autoheal=true
+    logging: *default-logging
+
+  # ==========================================================
+  # PRODUCTIVITY STACK — optional, profile-gated.
+  # Enable:  docker compose --profile apps up -d
+  # Disable: docker compose --profile apps down
+  #
+  # Services: ntfy (push notifications), Tandoor (recipes),
+  # Vikunja (task management), AFFiNE (collaborative workspace).
+  # ntfy and Vikunja skip forward-auth (API clients / mobile app).
+  # ==========================================================
+
+  ntfy:
+    image: binwiederhier/ntfy:${NTFY_VERSION:-latest}
+    container_name: ntfy
+    profiles: [apps]
+    command: serve
+    environment:
+      TZ: ${TZ}
+      NTFY_BASE_URL: https://${NTFY_SUBDOMAIN:-ping}.${PUBLIC_FQDN}
+      NTFY_BEHIND_PROXY: "true"
+      NTFY_CACHE_FILE: /var/cache/ntfy/cache.db
+      NTFY_AUTH_FILE: /var/lib/ntfy/user.db
+      NTFY_AUTH_DEFAULT_ACCESS: deny-all
+      NTFY_LOG_LEVEL: info
+    volumes:
+      - ${DOCK_CONF}/ntfy:/etc/ntfy
+      - ${DOCK_DATA}/ntfy/cache:/var/cache/ntfy
+      - ${DOCK_DATA}/ntfy/data:/var/lib/ntfy
+    networks:
+      productivity:
+        ipv4_address: 10.0.15.20
+    mem_limit: ${NTFY_MEM_LIMIT:-256m}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:80/v1/health | grep -q healthy"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+    labels:
+      - autoheal=true
+    logging: *default-logging
+
+  # ==========================================================
+  # Tandoor — recipe management. Needs SECRET_KEY (gen-secrets).
+  # Runs as uid 1000. Database migrations run on startup.
+  # ==========================================================
+  tandoor:
+    image: vabene1111/recipes:${TANDOOR_VERSION:-latest}
+    container_name: tandoor
+    profiles: [apps]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB_ENGINE: django.db.backends.postgresql
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${TANDOOR_DB_NAME}
+      POSTGRES_USER: ${TANDOOR_DB_USER}
+      POSTGRES_PASSWORD: ${TANDOOR_DB_PASSWORD}
+      SECRET_KEY: ${TANDOOR_SECRET_KEY}
+      ALLOWED_HOSTS: ${TANDOOR_SUBDOMAIN:-recipes}.${PUBLIC_FQDN},${TANDOOR_SUBDOMAIN:-recipes}.${TAILNET_FQDN},tandoor
+      GUNICORN_MEDIA: "0"
+      FRACTION_PREF_DEFAULT: "0"
+      COMMENT_PREF_DEFAULT: "1"
+      SHOPPING_MIN_AUTOSYNC_INTERVAL: "5"
+      TZ: ${TZ}
+    volumes:
+      - ${DOCK_DATA}/tandoor/media:/opt/recipes/mediafiles
+      - ${DOCK_DATA}/tandoor/static:/opt/recipes/staticfiles
+    networks:
+      productivity:
+        ipv4_address: 10.0.15.21
+      data:
+    mem_limit: ${TANDOOR_MEM_LIMIT:-512m}
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+      - DAC_OVERRIDE
+      - FOWNER
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- --header='Host: tandoor' http://localhost/ | grep -qi tandoor"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+    restart: unless-stopped
+    labels:
+      - autoheal=true
+    logging: *default-logging
+
+  # ==========================================================
+  # Vikunja — task/project management (Todoist alternative).
+  # JWT_SECRET generated by gen-secrets.sh.
+  # Mobile apps use JWT directly — Caddy does not apply
+  # forward-auth to API paths (/api/v1/).
+  # ==========================================================
+  vikunja:
+    image: vikunja/vikunja:${VIKUNJA_VERSION:-latest}
+    container_name: vikunja
+    profiles: [apps]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      VIKUNJA_DATABASE_TYPE: postgres
+      VIKUNJA_DATABASE_HOST: postgres
+      VIKUNJA_DATABASE_DATABASE: ${VIKUNJA_DB_NAME}
+      VIKUNJA_DATABASE_USER: ${VIKUNJA_DB_USER}
+      VIKUNJA_DATABASE_PASSWORD: ${VIKUNJA_DB_PASSWORD}
+      VIKUNJA_SERVICE_JWTSECRET: ${VIKUNJA_JWT_SECRET}
+      VIKUNJA_SERVICE_PUBLICURL: https://${VIKUNJA_SUBDOMAIN:-tasks}.${PUBLIC_FQDN}/
+      VIKUNJA_SERVICE_TIMEZONE: ${TZ}
+      VIKUNJA_LOG_LEVEL: info
+    volumes:
+      - ${DOCK_DATA}/vikunja:/app/vikunja/files
+    networks:
+      productivity:
+        ipv4_address: 10.0.15.22
+      data:
+    mem_limit: ${VIKUNJA_MEM_LIMIT:-512m}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "/app/vikunja/vikunja", "version"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    labels:
+      - autoheal=true
+    logging: *default-logging
+
+  # ==========================================================
+  # AFFiNE — collaborative workspace (Notion alternative).
+  # Requires Postgres + Redis. AFFINE_SERVER_EXTERNAL_URL must
+  # match the public URL or CORS/WebSocket connections will fail.
+  # ==========================================================
+  affine:
+    image: ghcr.io/toeverything/affine:${AFFINE_VERSION:-stable}
+    container_name: affine
+    profiles: [apps]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${AFFINE_DB_USER}:${AFFINE_DB_PASSWORD}@postgres:5432/${AFFINE_DB_NAME}
+      REDIS_SERVER_HOST: redis
+      REDIS_SERVER_PORT: "6379"
+      REDIS_SERVER_PASSWORD: ${REDIS_PASSWORD}
+      REDIS_SERVER_DATABASE: ${REDIS_DB_AFFINE:-2}
+      AFFINE_SERVER_EXTERNAL_URL: https://${AFFINE_SUBDOMAIN:-affine}.${PUBLIC_FQDN}
+      AFFINE_SERVER_HOST: "0.0.0.0"
+      AFFINE_SERVER_PORT: "3010"
+      NODE_ENV: production
+    volumes:
+      - ${DOCK_DATA}/affine/config:/root/.affine/config
+      - ${DOCK_DATA}/affine/storage:/root/.affine/storage
+    networks:
+      productivity:
+        ipv4_address: 10.0.15.23
+      data:
+    mem_limit: ${AFFINE_MEM_LIMIT:-2g}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3010',r=>{process.exit(r.statusCode<500?0:1)}).on('error',()=>process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+    labels:
+      - autoheal=true
+    logging: *default-logging
+
+  # ==========================================================
+  # Dockhand — container monitoring + management dashboard.
+  # Gated by Authentik forward-auth.
+  # Uses socket-proxy-rw for full container management.
+  # ==========================================================
+  dockhand:
+    image: fnsys/dockhand:latest
+    container_name: dockhand
+    depends_on:
+      socket-proxy-rw:
+        condition: service_healthy
+    environment:
+      DOCKER_HOST: tcp://socket-proxy-rw:2375
+      DATA_DIR: /app/data
+      ENCRYPTION_KEY: ${DOCKHAND_ENCRYPTION_KEY}
+    volumes:
+      - ${DOCK_DATA}/dockhand:/app/data
+    networks:
+      observability:
+        ipv4_address: 10.0.13.23
+    mem_limit: ${DOCKHAND_MEM_LIMIT:-256m}
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:3000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    labels:
+      - autoheal=true
+    logging: *default-logging
+
+  # ==========================================================
+  # Falco Sidekick — receives Falco security events via HTTP and
+  # forwards them to the UI dashboard. Falco must have http_output
+  # pointing to http://falcosidekick:2801/ in falco.yaml.
+  # Gates on Authentik forward-auth at sec.{PUBLIC_FQDN}.
+  # ==========================================================
+  falcosidekick:
+    image: falcosecurity/falcosidekick:latest
+    container_name: falcosidekick
+    depends_on:
+      - falco
+    environment:
+      WEBUI_URL: https://${FALCO_SUBDOMAIN:-sec}.${PUBLIC_FQDN}
+    networks:
+      observability:
+        ipv4_address: 10.0.13.25
+    mem_limit: 256m
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:2801/healthz | grep -q ok"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    labels:
+      - autoheal=true
+    logging: *default-logging
+
+  redis-falco:
+    image: redis/redis-stack-server:latest
+    container_name: redis-falco
+    volumes:
+      - ${DOCK_DATA}/redis-falco:/data
+    networks:
+      observability:
+        ipv4_address: 10.0.13.28
+    mem_limit: 128m
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+    logging: *default-logging
+
+  falcosidekick-ui:
+    image: falcosecurity/falcosidekick-ui:latest
+    container_name: falcosidekick-ui
+    depends_on:
+      falcosidekick:
+        condition: service_started
+      redis-falco:
+        condition: service_healthy
+    environment:
+      SIDEKICK_URL: http://falcosidekick:2801
+      FALCOSIDEKICK_UI_REDIS_URL: redis-falco:6379
+      FALCOSIDEKICK_UI_DISABLEAUTH: "true"
+    networks:
+      observability:
+        ipv4_address: 10.0.13.26
+    mem_limit: 256m
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:2802/ | grep -q html"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    labels:
+      - autoheal=true
+    logging: *default-logging
+
+  # ==========================================================
+  # Zeek log browser — filebrowser serving Zeek TSV log files
+  # at net.{PUBLIC_FQDN}. Auth disabled (Authentik gates it).
+  # Mounts Zeek's log directory read-only.
+  # ==========================================================
+  zeek-logs:
+    image: filebrowser/filebrowser:latest
+    container_name: zeek-logs
+    command: ["--noauth", "--root", "/srv", "--port", "80"]
+    volumes:
+      - ${DOCK_CONF}/zeek/logs:/srv:ro
+    networks:
+      observability:
+        ipv4_address: 10.0.13.27
+    mem_limit: 128m
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:80/ | grep -q html"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+    labels:
+      - autoheal=true
+    logging: *default-logging
+
+  # ==========================================================
+  # Immich — self-hosted photo + video library.
+  # No forward-auth: mobile apps (iOS/Android) authenticate via
+  # Immich's own API key — forward-auth would break them.
+  # immich-server: main API + web UI (port 2283)
+  # immich-machine-learning: face recognition + CLIP search
+  # ==========================================================
+  immich-server:
+    image: ghcr.io/immich-app/immich-server:${IMMICH_VERSION:-release}
+    container_name: immich-server
+    profiles: [apps]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DB_HOSTNAME: postgres
+      DB_PORT: "5432"
+      DB_USERNAME: ${IMMICH_DB_USER}
+      DB_PASSWORD: ${IMMICH_DB_PASSWORD}
+      DB_DATABASE_NAME: ${IMMICH_DB_NAME}
+      REDIS_HOSTNAME: redis
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      REDIS_PORT: "6379"
+      REDIS_DBINDEX: ${REDIS_DB_IMMICH:-4}
+      IMMICH_MACHINE_LEARNING_URL: http://immich-machine-learning:3003
+    volumes:
+      - ${DOCK_DATA}/immich/upload:/usr/src/app/upload
+      - /etc/localtime:/etc/localtime:ro
+    networks:
+      productivity:
+        ipv4_address: 10.0.15.24
+      data:
+    mem_limit: ${IMMICH_SERVER_MEM_LIMIT:-2g}
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:2283/api/server/ping | grep -q pong"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+    labels:
+      - autoheal=true
+    logging: *default-logging
+
+  immich-machine-learning:
+    image: ghcr.io/immich-app/immich-machine-learning:${IMMICH_VERSION:-release}
+    container_name: immich-machine-learning
+    profiles: [apps]
+    volumes:
+      - ${DOCK_DATA}/immich/model-cache:/cache
+    networks:
+      - productivity
+    mem_limit: ${IMMICH_ML_MEM_LIMIT:-2g}
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:3003/ping | grep -q pong"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+    restart: unless-stopped
+    labels:
+      - autoheal=true
+    logging: *default-logging
+
+  # ==========================================================
+  # n8n — workflow automation. Profile: apps.
+  # Gated by Authentik forward-auth. Uses Postgres only.
+  # N8N_ENCRYPTION_KEY is immutable after first run — changing it
+  # breaks all stored credentials. gen-secrets.sh never overwrites it.
+  # ==========================================================
+  n8n:
+    image: docker.n8n.io/n8nio/n8n:latest
+    container_name: n8n
+    profiles: [apps]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PORT: "5432"
+      DB_POSTGRESDB_DATABASE: ${N8N_DB_NAME}
+      DB_POSTGRESDB_USER: ${N8N_DB_USER}
+      DB_POSTGRESDB_PASSWORD: ${N8N_DB_PASSWORD}
+      N8N_HOST: ${N8N_SUBDOMAIN:-n8n}.${PUBLIC_FQDN}
+      N8N_PORT: "5678"
+      N8N_PROTOCOL: https
+      WEBHOOK_URL: https://${N8N_SUBDOMAIN:-n8n}.${PUBLIC_FQDN}/
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      GENERIC_TIMEZONE: ${TZ}
+      N8N_RUNNERS_ENABLED: "true"
+    volumes:
+      - ${DOCK_DATA}/n8n:/home/node/.n8n
+    networks:
+      productivity:
+        ipv4_address: 10.0.15.25
+      data:
+    mem_limit: ${N8N_MEM_LIMIT:-1g}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:5678/healthz | grep -q ok"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+    labels:
+      - autoheal=true
+    logging: *default-logging

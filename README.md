@@ -1,15 +1,13 @@
-# OpeNirvana
-Unified, secure, automated. Production-ready application stack for security-cognizant self-hosters. 
-
-**Work-in-progress, coming to a repo near you!**
-
 # Unified Stack
 
-Single-command self-hosted foundation: one `docker compose up` brings up Caddy (custom build with Crowdsec, Coraza WAF, forward-auth, Souin cache, Brotli, L4 proxy), a Tailscale ingress sidecar, shared Postgres + Redis, Wazuh SIEM, Crowdsec LAPI, Falco runtime-security monitoring, Zeek network-security monitoring, Authentik SSO, and Nextcloud — all accessible on both `*.secop.dev` (public, via Cloudflare) and `*.neon-lenok.ts.net` (Tailnet).
+Single-command self-hosted foundation: one `docker compose up` brings up Caddy (custom build with Crowdsec, Coraza WAF, forward-auth, Souin cache, Brotli, L4 proxy), a Tailscale ingress sidecar, shared Postgres + Redis, Wazuh SIEM, Crowdsec LAPI, Falco runtime-security monitoring, Zeek network-security monitoring, Authentik SSO, Nextcloud, and optional media + productivity stacks — all accessible on both `*.secop.dev` (public, via Cloudflare) and `*.neon-lenok.ts.net` (Tailnet).
 
 **Priority order:** Functionality > Security > Efficiency > Stability.
 
-**Current apps:** Authentik (SSO), Nextcloud (file sync). Later phases add Affine, media (Jellyfin + *arr), smart-home (HASS), and productivity (Coder, n8n) on top of this foundation.
+**Profiles:**
+- *(no profile)* — Core stack: Authentik, Nextcloud, Wazuh, Falco, Zeek, Crowdsec, Caddy
+- `--profile media` — Jellyfin, Jellyseerr, Prowlarr, Radarr, Sonarr, Lidarr, qBittorrent, FlareSolverr (all via ProtonVPN)
+- `--profile apps` — ntfy, Tandoor, Vikunja, AFFiNE
 
 ---
 
@@ -25,10 +23,9 @@ flowchart TB
     end
     subgraph host["Docker host (Ubuntu)"]
         subgraph ingress["ingress 10.0.10.0/24"]
-            TS[tailscale-ingress<br/>10.0.10.200]
+            TS[tailscale-ingress<br/>10.0.10.200 ★multi-homed]
             CADDY[caddy<br/>shares netns]
-            SPRO1[socket-proxy-ro<br/>10.0.10.21]
-            CS1[crowdsec<br/>10.0.10.21 alias]
+            CS1[crowdsec alias<br/>10.0.10.21]
         end
         subgraph auth["auth 10.0.11.0/24"]
             AUTH_S[authentik-server<br/>.20]
@@ -51,7 +48,15 @@ flowchart TB
         end
         subgraph apps["apps 10.0.14.0/24"]
             NC[nextcloud<br/>.20]
-            GT[gluetun<br/>.30 — ProtonVPN WG]
+            JF[jellyfin<br/>.21 media]
+            JS[jellyseerr<br/>.22 media]
+            GT[gluetun<br/>.30 ProtonVPN WG]
+        end
+        subgraph prod["productivity 10.0.15.0/24"]
+            NT[ntfy<br/>.20 apps]
+            TD[tandoor<br/>.21 apps]
+            VK[vikunja<br/>.22 apps]
+            AF[affine<br/>.23 apps]
         end
         ZK[zeek<br/>host netns]
         CT[coturn<br/>host netns]
@@ -59,28 +64,24 @@ flowchart TB
     CF --> TS
     TN --> TS
     TS --- CADDY
-    CADDY --> AUTH_P
+    CADDY --> AUTH_P & WD & NC & JF & JS
+    CADDY --> NT & TD & VK & AF
+    CADDY --> GT
     AUTH_P --> AUTH_S
-    CADDY --> WD
-    CADDY --> NC
-    AUTH_S --> PG
-    AUTH_S --> RD
-    AUTH_W --> PG
-    AUTH_W --> RD
+    AUTH_S --> PG & RD
+    AUTH_W --> PG & RD
     AUTH_P --> RD
-    NC --> PG
-    NC --> RD
+    NC --> PG & RD
+    TD --> PG
+    VK --> PG
+    AF --> PG & RD
     CADDY --> CS1
-    CS1 -.same process as.- CS2
+    CS1 -.same process.- CS2
     FL -.docker API.-> SPRO2
     AH --> SPRW
-    ZK -.taps.-> ingress
-    ZK -.taps.-> auth
-    ZK -.taps.-> data
-    ZK -.taps.-> obs
+    ZK -.taps all networks.-> host
     CT -.TURN/STUN 3478.-> Internet
     GT -.WireGuard tunnel.-> Internet
-    CADDY --> GT
 ```
 
 ### Request flow (public)
@@ -154,11 +155,20 @@ flowchart LR
 │   ├── authentik/{media/, custom-templates/, certs/}
 │   ├── wazuh/{manager/, indexer/, dashboard/, certs/, decoders/, rules/}
 │   ├── falco/{falco.yaml, rules.d/, events.log}
-│   └── zeek/{local.zeek, node.cfg, networks.cfg, intel/, logs/current/}
+│   ├── zeek/{local.zeek, node.cfg, networks.cfg, intel/, logs/current/}
+│   ├── jellyfin/            # (profile: media)
+│   ├── jellyseerr/          # (profile: media)
+│   ├── qbittorrent/qBittorrent/qBittorrent.conf   # pre-seeds LocalHostAuth=false
+│   └── ntfy/                # (profile: apps)
 ├── data/                    # application data (non-DB)
 │   ├── authentik/
 │   ├── nextcloud/               # owned 33:33 (www-data inside container)
-│   └── wazuh/{indexer/, manager/}
+│   ├── wazuh/{indexer/, manager/}
+│   ├── jellyfin/            # (profile: media)
+│   ├── ntfy/{cache/, data/} # (profile: apps)
+│   ├── tandoor/{media/, static/}  # owned 1000:1000 (profile: apps)
+│   ├── vikunja/             # owned 1000:1000 (profile: apps)
+│   └── affine/{config/, storage/}   # (profile: apps)
 ├── db/                      # databases
 │   ├── postgres/{data/, init.d/}
 │   └── redis/
@@ -269,16 +279,28 @@ Parallel observation: Falco (runtime) + Zeek (network)
 
 **Boot persistence:** `sudo systemctl enable --now compose-stack.service`
 
-**Media stack** (optional — Prowlarr, Radarr, Sonarr, Lidarr, FlareSolverr, qBittorrent via ProtonVPN):
+**Media stack** (optional — Jellyfin, Jellyseerr, Prowlarr, Radarr, Sonarr, Lidarr, FlareSolverr, qBittorrent via ProtonVPN):
 ```bash
 # 1. Add PROTONVPN_WIREGUARD_PRIVATE_KEY to .env (from ProtonVPN dashboard → WireGuard config).
-# 2. Add DNS CNAMEs: prowlarr/radarr/sonarr/lidarr/qbit → caddy.<PUBLIC_FQDN> (Cloudflare-proxied).
-# 3. Start the media profile:
+# 2. Ensure MEDIA_PATH and DOWNLOADS_PATH exist on the host with storage mounted.
+# 3. Add DNS CNAMEs in Cloudflare: media/requests/prowlarr/radarr/sonarr/lidarr/qbit → @ (proxied).
+# 4. Start the media profile:
 sudo docker compose --profile media up -d
 ```
-All *arr and qBittorrent outbound traffic (indexer requests, torrent peers) is tunneled through
-ProtonVPN. Inbound access is via Caddy (public HTTPS) and Tailscale — both gate on Authentik
-forward-auth. FlareSolverr is internal-only; configure it in Prowlarr as `http://localhost:8191`.
+Jellyfin serves media directly (no VPN — accessed by users). All *arr and qBittorrent outbound
+traffic (indexer requests, torrent peers) is tunneled through ProtonVPN. FlareSolverr is
+internal-only; configure it in Prowlarr as `http://localhost:8191`. Jellyfin and Jellyseerr use
+their own auth — no Authentik forward-auth gate (media player API clients need direct access).
+
+**Productivity stack** (optional — ntfy, Tandoor, Vikunja, AFFiNE):
+```bash
+# 1. Verify productivity DB vars are set in .env (gen-secrets.sh fills them).
+# 2. Add DNS CNAMEs in Cloudflare: ntfy/recipes/tasks/affine → @ (proxied).
+# 3. Start the apps profile:
+sudo docker compose --profile apps up -d
+```
+Tandoor and AFFiNE gate on Authentik forward-auth. ntfy and Vikunja use their own auth
+(API/mobile clients need direct token access).
 
 > **First-run notes:**
 > - `docker-host-config.sh` creates `/dock/data/nextcloud` owned `33:33`
@@ -322,13 +344,19 @@ forward-auth. FlareSolverr is internal-only; configure it in Prowlarr as `http:/
 | host-net | zeek | Network security monitoring |
 | host-net | coturn | TURN/STUN server for Nextcloud Talk WebRTC |
 | apps | nextcloud | File sync + collaboration |
-| apps | gluetun | ProtonVPN WireGuard gateway for media stack *(profile: media)* |
+| apps | gluetun | ProtonVPN WireGuard gateway *(profile: media)* |
 | apps (via gluetun) | prowlarr | Indexer manager *(profile: media)* |
 | apps (via gluetun) | radarr | Movie management *(profile: media)* |
 | apps (via gluetun) | sonarr | TV show management *(profile: media)* |
 | apps (via gluetun) | lidarr | Music management *(profile: media)* |
 | apps (via gluetun) | flaresolverr | Cloudflare bypass for indexers — internal only *(profile: media)* |
 | apps (via gluetun) | qbittorrent | BitTorrent client *(profile: media)* |
+| apps | jellyfin | Media server — GPU transcoding *(profile: media)* |
+| apps | jellyseerr | Media request management *(profile: media)* |
+| productivity | ntfy | Push notification server *(profile: apps)* |
+| productivity | tandoor | Recipe manager *(profile: apps)* |
+| productivity | vikunja | Task/project management *(profile: apps)* |
+| productivity | affine | Collaborative workspace *(profile: apps)* |
 
 ---
 
@@ -343,6 +371,11 @@ forward-auth. FlareSolverr is internal-only; configure it in Prowlarr as `http:/
 - **GlueTUN not connecting**: check `docker logs gluetun`; verify `PROTONVPN_WIREGUARD_PRIVATE_KEY` is the raw base64 key (not a config file path). If connecting but leaking: confirm `FIREWALL_OUTBOUND_SUBNETS=10.0.0.0/8` is set.
 - **\*arr can't reach indexers / qBittorrent not seeding**: VPN tunnel may be down. Run `docker exec gluetun wget -qO- https://ifconfig.io` — if it returns your ISP's IP instead of the VPN IP, GlueTUN needs to reconnect.
 - **Nextcloud Talk TURN test fails**: confirm 3478/UDP+TCP and 49152–49200/UDP are port-forwarded at the router to the host IP. Check `docker logs coturn` for authentication errors. Verify `COTURN_SECRET` in `.env` matches the secret entered in Talk admin settings.
+- **Jellyfin no GPU transcoding**: ensure the host has `/dev/dri` (Intel: `intel-media-va-driver`, AMD: `mesa-va-drivers`). Check `docker logs jellyfin` for permission errors on `/dev/dri/renderD128`.
+- **Tandoor 500 on startup**: `docker logs tandoor` — usually a missing `SECRET_KEY` or DB not yet provisioned. Run `gen-secrets.sh` and verify `TANDOOR_DB_NAME/USER/PASSWORD` are set.
+- **Vikunja "JWT secret must be set"**: `VIKUNJA_JWT_SECRET` is empty. Run `bash scripts/gen-secrets.sh .env` to fill it.
+- **AFFiNE WebSocket disconnects / CORS errors**: `AFFINE_SERVER_EXTERNAL_URL` must exactly match the URL in the browser (scheme + hostname, no trailing slash). Update `.env` and restart affine.
+- **ntfy push not delivered**: check `docker logs ntfy`. Ensure `NTFY_BASE_URL` matches the public URL. Confirm the topic's subscriber is connected and `NTFY_AUTH_DEFAULT_ACCESS=deny-all` is working with the correct token.
 
 ---
 

@@ -1,0 +1,26 @@
+# janus-gateway — main configuration.
+# Rendered from templates/ by docker-host-config.sh configure_hpb().
+# Edit templates/janus/janus.jcfg, then re-run docker-host-config.sh.
+
+general: {
+	log_to_stdout = true
+	server_name = "janus"
+
+	# Token-based API auth — must match server.conf [janus] token in spreed-signaling.
+	token_auth = true
+	token_auth_secret = "${JANUS_API_SECRET}"
+
+	# Admin secret — for the admin REST API exposed at gate.secop.dev via Caddy.
+	admin_secret = "${JANUS_ADMIN_SECRET}"
+}
+
+media: {
+	# RTP port range — must match ports published in docker-compose.yml.
+	rtp_port_range = "20000-20100"
+}
+
+nat: {
+	# Advertise the host public IP in ICE candidates so WebRTC peers can reach us.
+	# Required when Janus runs behind NAT (e.g. inside Docker with bridge networking).
+	nat_1_1_mapping = "${HOST_PUBLIC_IP}"
+}

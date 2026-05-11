@@ -120,6 +120,9 @@ create_dock_tree() {
         /dock/conf/jellyseerr
         # Productivity stack
         /dock/conf/ntfy
+        # HPB: Nextcloud Talk High-Performance Backend
+        /dock/conf/spreed-signaling
+        /dock/conf/janus
         /dock/data/authentik
         /dock/data/nextcloud
         /dock/data/wazuh/{indexer-1,indexer-2,indexer-3,manager}
@@ -229,6 +232,72 @@ copy_templates() {
     fi
 }
 
+configure_hpb() {
+    step "Configuring HPB (nextcloud-spreed-signaling + janus-gateway)..."
+
+    # Warn if public IP is not configured — required for Janus NAT mapping.
+    local pub_ip
+    pub_ip=$(grep -E '^HOST_PUBLIC_IP=' "$ENV_FILE" | cut -d= -f2- | tr -d '[:space:]\r' || true)
+    if [ -z "$pub_ip" ]; then
+        c_red "WARNING: HOST_PUBLIC_IP is not set in $ENV_FILE"
+        c_red "  Set it to this server's public IP address before deploying janus-gateway."
+        c_red "  janus.jcfg will be rendered with an empty nat_1_1_mapping — WebRTC will NOT work."
+    fi
+
+    local tmpl_dir="$REPO_DIR/templates"
+
+    # --- nextcloud-spreed-signaling/server.conf ---
+    local ss_conf=/dock/conf/spreed-signaling/server.conf
+    if [ -f "$ss_conf" ] && ! grep -qE '\$\{NC_HPB_' "$ss_conf"; then
+        c_grn "spreed-signaling/server.conf already rendered."
+    else
+        local hash_key block_key shared_secret janus_api_secret
+        hash_key=$(grep    -E '^NC_HPB_HASH_KEY='      "$ENV_FILE" | cut -d= -f2- | tr -d '[:space:]\r' || true)
+        block_key=$(grep   -E '^NC_HPB_BLOCK_KEY='     "$ENV_FILE" | cut -d= -f2- | tr -d '[:space:]\r' || true)
+        shared_secret=$(grep -E '^NC_HPB_SHARED_SECRET=' "$ENV_FILE" | cut -d= -f2- | tr -d '[:space:]\r' || true)
+        janus_api_secret=$(grep -E '^JANUS_API_SECRET=' "$ENV_FILE" | cut -d= -f2- | tr -d '[:space:]\r' || true)
+        # shellcheck disable=SC2016
+        NC_HPB_HASH_KEY="$hash_key" NC_HPB_BLOCK_KEY="$block_key" \
+        NC_HPB_SHARED_SECRET="$shared_secret" JANUS_API_SECRET="$janus_api_secret" \
+            envsubst '${NC_HPB_HASH_KEY} ${NC_HPB_BLOCK_KEY} ${NC_HPB_SHARED_SECRET} ${JANUS_API_SECRET}' \
+            < "$tmpl_dir/spreed-signaling/server.conf" > "$ss_conf.new"
+        install -o 1010 -g 1010 -m 640 "$ss_conf.new" "$ss_conf"
+        rm -f "$ss_conf.new"
+        c_grn "Rendered spreed-signaling/server.conf"
+    fi
+
+    # --- janus-gateway/janus.jcfg ---
+    local janus_jcfg=/dock/conf/janus/janus.jcfg
+    # Re-render if: file is absent, still has placeholders, or nat_1_1_mapping is empty
+    # (happens when a previous run had no HOST_PUBLIC_IP — now that it's resolved, re-render).
+    if [ -f "$janus_jcfg" ] && ! grep -qE '\$\{' "$janus_jcfg" \
+       && grep -qE 'nat_1_1_mapping\s*=\s*"[0-9]' "$janus_jcfg"; then
+        c_grn "janus/janus.jcfg already rendered."
+    else
+        local janus_admin_secret
+        janus_api_secret=$(grep   -E '^JANUS_API_SECRET='   "$ENV_FILE" | cut -d= -f2- | tr -d '[:space:]\r' || true)
+        janus_admin_secret=$(grep -E '^JANUS_ADMIN_SECRET=' "$ENV_FILE" | cut -d= -f2- | tr -d '[:space:]\r' || true)
+        # shellcheck disable=SC2016
+        JANUS_API_SECRET="$janus_api_secret" JANUS_ADMIN_SECRET="$janus_admin_secret" \
+        HOST_PUBLIC_IP="$pub_ip" \
+            envsubst '${JANUS_API_SECRET} ${JANUS_ADMIN_SECRET} ${HOST_PUBLIC_IP}' \
+            < "$tmpl_dir/janus/janus.jcfg" > "$janus_jcfg.new"
+        install -o 1010 -g 1010 -m 640 "$janus_jcfg.new" "$janus_jcfg"
+        rm -f "$janus_jcfg.new"
+        c_grn "Rendered janus/janus.jcfg (nat_1_1_mapping=${pub_ip:-UNSET})"
+    fi
+
+    # --- janus-gateway/janus.transport.http.jcfg (no template vars) ---
+    local janus_http=/dock/conf/janus/janus.transport.http.jcfg
+    if [ ! -f "$janus_http" ]; then
+        install -o 1010 -g 1010 -m 640 \
+            "$tmpl_dir/janus/janus.transport.http.jcfg" "$janus_http"
+        c_grn "Installed janus/janus.transport.http.jcfg"
+    else
+        c_grn "janus/janus.transport.http.jcfg already present."
+    fi
+}
+
 fetch_wazuh_certs_tool() {
     step "Fetching wazuh-certs-tool.sh..."
     local target=/dock/conf/wazuh/cert-tool/wazuh-certs-tool.sh
@@ -282,6 +351,54 @@ ensure_env_file() {
         install -D -o 1010 -g 1010 -m 600 "$REPO_DIR/.env.example" "$ENV_FILE"
         c_grn "Created $ENV_FILE from .env.example"
     fi
+}
+
+resolve_public_ip() {
+    step "Resolving host public IP..."
+
+    # Skip if already set to a non-empty value.
+    local current
+    current=$(grep -E '^HOST_PUBLIC_IP=' "$ENV_FILE" | cut -d= -f2- | tr -d '[:space:]\r' || true)
+    if [ -n "$current" ]; then
+        c_grn "HOST_PUBLIC_IP already set: $current"
+        return
+    fi
+
+    local ip=""
+    for url in \
+        "https://api.ipify.org" \
+        "https://checkip.amazonaws.com" \
+        "https://icanhazip.com"; do
+        ip=$(curl -fsSL --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]') || true
+        if echo "$ip" | grep -qE '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$'; then
+            break
+        fi
+        ip=""
+    done
+
+    if [ -z "$ip" ]; then
+        c_red "WARNING: Could not resolve public IP — set HOST_PUBLIC_IP in $ENV_FILE manually."
+        return
+    fi
+
+    python3 - "$ENV_FILE" "HOST_PUBLIC_IP" "$ip" <<'PYEOF'
+import sys, re
+path, key, val = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(path, 'r') as f:
+    content = f.read()
+new_content = re.sub(
+    rf'^({re.escape(key)}=)\s*$',
+    lambda m: f'{m.group(1)}{val}',
+    content,
+    flags=re.MULTILINE
+)
+if new_content == content:
+    # Line absent (or has trailing comment) — append it.
+    new_content = content.rstrip('\n') + f'\n{key}={val}\n'
+with open(path, 'w') as f:
+    f.write(new_content)
+PYEOF
+    c_grn "HOST_PUBLIC_IP resolved and set: $ip"
 }
 
 generate_missing_secrets() {
@@ -409,6 +526,8 @@ harden_ufw() {
     ufw allow 3478/tcp
     ufw allow 3478/udp
     ufw allow 49152:49200/udp
+    # Janus Gateway — WebRTC media ports for Nextcloud Talk HPB.
+    ufw allow 20000:20100/udp
     ufw allow in on tailscale0
     ufw --force enable
 }
@@ -473,7 +592,7 @@ IMPORTANT: Before starting the stack, complete these steps:
 After ~2-3 min for healthchecks:
   Core:         https://auth.${pub_fqdn}    (Authentik SSO)
                 https://wazuh.${pub_fqdn}   (Wazuh SIEM, gated by Authentik)
-                https://cloud.${pub_fqdn}   (Nextcloud, gated by Authentik)
+                https://cloud.${pub_fqdn}   (Nextcloud, OIDC login via Authentik)
   Tailnet:      https://auth.${tailnet_fqdn}
 
 After Authentik first-run (set MFA, create users), retrieve the outpost token:
@@ -481,6 +600,38 @@ After Authentik first-run (set MFA, create users), retrieve the outpost token:
   >>> from authentik.core.models import Token
   >>> print(Token.objects.get(identifier__startswith='ak-outpost').key)
   Set AUTHENTIK_OUTPOST_TOKEN in ${ENV_FILE}, then restart authentik-proxy.
+
+OIDC setup — Nextcloud, Tandoor, and AFFiNE (run after Authentik is healthy):
+  python3 scripts/setup-oidc.py ${ENV_FILE}
+
+  The script:
+    • Provisions OAuth2/OIDC providers and applications in Authentik via API
+    • Writes CLIENT_ID, CLIENT_SECRET, and discovery URLs back into ${ENV_FILE}
+    • Restarts running containers automatically
+    • Writes remaining manual steps to oidc-setup-output.txt
+
+  Remaining manual steps (shown in detail in oidc-setup-output.txt):
+    Nextcloud — install the user_oidc app in Nextcloud admin → Apps, then run:
+      docker exec --user www-data nextcloud sh -c '
+        php occ user_oidc:provider "\$NEXTCLOUD_OIDC_PROVIDER_NAME" \\
+          --clientid="\$NEXTCLOUD_OIDC_CLIENT_ID" \\
+          --clientsecret="\$NEXTCLOUD_OIDC_CLIENT_SECRET" \\
+          --discoveryuri="\$NEXTCLOUD_OIDC_DISCOVERY_URL" \\
+          --check-bearer'
+    AFFiNE — go to Admin Panel → Settings → OAuth → OIDC provider config and
+      paste the JSON from oidc-setup-output.txt (contains live client credentials)
+
+HPB (Nextcloud Talk High-Performance Backend):
+  talk.${pub_fqdn}   — nextcloud-spreed-signaling (WebSocket, no Authentik)
+  gate.${pub_fqdn}   — janus-gateway admin API (Authentik-gated)
+  UDP 20000-20100    — WebRTC media ports (direct to host, UFW allowed)
+
+  Post-deploy: configure Nextcloud Talk → "High-performance backend":
+    Signaling server URL:   https://talk.${pub_fqdn}/
+    Shared secret:          value of NC_HPB_SHARED_SECRET in ${ENV_FILE}
+  Then configure Talk → TURN/STUN:
+    docker exec --user www-data nextcloud php occ talk:turn:add \\
+      --secret \$COTURN_SECRET turn \$HOST_PUBLIC_IP:3478 udp,tcp
 
 Boot persistence: systemctl status compose-stack.service
 Logs:           docker compose logs -f --tail=50
@@ -497,11 +648,13 @@ main() {
     create_user_and_groups
     create_dock_tree
     ensure_env_file
+    resolve_public_ip
     copy_templates
     fetch_wazuh_certs_tool
     seed_crowdsec_defaults
     fetch_owasp_crs
     generate_missing_secrets
+    configure_hpb
     install_wazuh_agent
     install_cron_jobs
     install_systemd_units

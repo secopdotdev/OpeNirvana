@@ -1,0 +1,18 @@
+# janus-gateway — HTTP transport configuration.
+# Rendered from templates/ by docker-host-config.sh configure_hpb().
+# Edit templates/janus/janus.transport.http.jcfg, then re-run docker-host-config.sh.
+
+general: {
+	# API endpoint (used by spreed-signaling internally: http://janus:8088/janus).
+	base_path = "/janus"
+	http = true
+	port = 8088
+	# Admin endpoint — routed via Caddy at gate.secop.dev, gated by Authentik.
+	admin_http = true
+	admin_port = 8188
+	admin_base_path = "/admin"
+}
+
+cors: {
+	allow_origin = "*"
+}

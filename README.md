@@ -72,9 +72,13 @@ flowchart TB
     AUTH_W --> PG & RD
     AUTH_P --> RD
     NC --> PG & RD
+    NC --> AUTH_S
     TD --> PG
+    TD --> AUTH_S
     VK --> PG
+    VK --> AUTH_S
     AF --> PG & RD
+    AF --> AUTH_S
     CADDY --> CS1
     CS1 -.same process.- CS2
     FL -.docker API.-> SPRO2
@@ -111,6 +115,46 @@ sequenceDiagram
     APP-->>CAD: response
     CAD-->>C: HTTPS response
 ```
+
+> **OIDC exception:** Nextcloud, Vikunja, and AFFiNE skip step 8. Caddy proxies the
+> request directly to the app; if the user has no session the app itself redirects to
+> Authentik (`auth.secop.dev`) for OIDC login, then back to the original URL.
+
+### Authentik integration modes
+
+Each service uses one of two auth models. `setup-oidc.py` provisions **all** OIDC services automatically; the chart notes where a manual step is still needed after the script runs.
+
+```mermaid
+flowchart TD
+    subgraph optional["Optional · setup-entra.py"]
+        direction TB
+        EntraID["Microsoft Entra ID<br/>(exclusive upstream IdP)"]
+    end
+
+    subgraph auth["Authentik (setup-oidc.py)"]
+        direction TB
+        A["Authentik"]
+    end
+
+    subgraph forward-auth["Forward-auth (Caddy)"]
+        Wazuh["Wazuh"]
+    end
+
+    subgraph native-oidc["Native OIDC"]
+        NC["Nextcloud ✓"]
+        TD["Tandoor ✓"]
+        VK["Vikunja ✓"]
+        JF["Jellyfin ⚙"]
+        IM["Immich ⚙"]
+        AF["AFFiNE ⚙"]
+    end
+
+    EntraID -. "entra-id source<br/>(OIDC federation)" .-> A
+    A --> Wazuh
+    A --> NC & TD & VK & JF & IM & AF
+```
+
+> **Legend:**  `✓` = `setup-oidc.py` completes configuration end-to-end.  `⚙` = script provisions the Authentik provider/app and writes credentials to `.env`; one in-app step remains.
 
 ### Bootstrap order
 
@@ -190,7 +234,8 @@ All paths owned `docktaetor:media (1010:1010)`, mode `770` (DB dirs `700`).
 ```
 Internet → Cloudflare → Host UFW → Caddy (via Tailscale netns)
        → @cloudflare matcher → Crowdsec bouncer → Coraza WAF
-       → Authentik forward-auth → App container
+       → Authentik forward-auth → App container          (Wazuh, *arr, qBittorrent, …)
+       → App container (native OIDC redirect to Authentik)  (Nextcloud, Tandoor, Vikunja, AFFiNE)
 Parallel observation: Falco (runtime) + Zeek (network)
 ```
 
@@ -274,10 +319,93 @@ Parallel observation: Falco (runtime) + Zeek (network)
 
 5. Visit (replace `secop.dev` with your `PUBLIC_FQDN`):
    - `https://auth.secop.dev` — Authentik (first run: set MFA, create users)
-   - `https://wazuh.secop.dev` — Wazuh (gated by Authentik)
-   - `https://cloud.secop.dev` — Nextcloud (gated by Authentik)
+   - `https://wazuh.secop.dev` — Wazuh (gated by Authentik forward-auth)
+   - `https://cloud.secop.dev` — Nextcloud (OIDC login via Authentik — see step 6)
 
 **Boot persistence:** `sudo systemctl enable --now compose-stack.service`
+
+6. **Post-deploy SSO configuration** (after Authentik is reachable and users are created):
+
+   **Authentik outpost token** — required for services that use Caddy forward-auth (Wazuh, etc.):
+   ```bash
+   docker exec authentik-server ak shell
+   # In the shell:
+   >>> from authentik.core.models import Token
+   >>> print(Token.objects.get(identifier__startswith='ak-outpost').key)
+   ```
+   Set `AUTHENTIK_OUTPOST_TOKEN` in `.env`, then restart the outpost:
+   ```bash
+   docker compose up -d --no-deps --force-recreate authentik-proxy
+   ```
+
+   **OIDC setup** (`scripts/setup-oidc.py`) — provisions Authentik OAuth2/OIDC providers for Nextcloud, Tandoor, AFFiNE, Jellyfin, Immich, and Vikunja; writes all credentials into `.env`; restarts running containers; and outputs `/dock/conf/oidc-setup-output.txt` with any remaining manual steps.
+
+   **Before running:**
+
+   | Requirement | How to satisfy |
+   |---|---|
+   | Authentik running and healthy | `docker compose up -d` — wait for healthcheck green |
+   | At least one Authentik user created | `auth.secop.dev` → Admin → Users → Create |
+   | Jellyfin SSO plugin installed | Jellyfin admin → Plugins → Catalog → **SSO Authentication** → Install, then restart Jellyfin |
+   | `JELLYFIN_API_KEY` in `.env` | Jellyfin admin → Dashboard → API Keys → New Key — paste into `.env` |
+   | `IMMICH_API_KEY` in `.env` | Immich → Account Settings → API Keys → New Key — paste into `.env` |
+
+   The last two are optional — the script prompts `[y/N]` and skips auto-config for the affected service if either key is absent. Re-run the script any time after adding missing keys.
+
+   ```bash
+   sudo python3 scripts/setup-oidc.py
+   ```
+
+   **After running:**
+
+   | Service | Automated? | Remaining manual step |
+   |---|---|---|
+   | Nextcloud | Provider + app provisioned, credentials in `.env` | Install the **OpenID Connect user backend** (`user_oidc`) app in Nextcloud admin → Apps, then run the `occ` command from `oidc-setup-output.txt` |
+   | Tandoor | **Fully automatic** | None — credentials written, container restarted |
+   | Vikunja | **Fully automatic** | None — credentials written, container restarted |
+   | Jellyfin | **Automatic** if `JELLYFIN_API_KEY` was set | If key was missing: install SSO plugin, add key to `.env`, re-run script; or follow the `curl` command in `oidc-setup-output.txt` |
+   | Immich | **Automatic** if `IMMICH_API_KEY` was set | If key was missing: add key to `.env`, re-run script; or follow the `curl` command in `oidc-setup-output.txt` |
+   | AFFiNE | Provider + app provisioned, credentials in `.env` | Paste the JSON block from `oidc-setup-output.txt` into **AFFiNE Admin Panel → Settings → OAuth → OIDC OAuth provider config** |
+
+   The output file contains exact commands and credentials for every manual step and is safe to re-generate at any time.
+
+### Step 7 (optional) — Entra ID federation
+
+Gates every service behind a Microsoft Entra ID group. Skip entirely if you want Authentik local accounts only.
+
+**Prerequisites:**
+
+| Requirement | Notes |
+|-------------|-------|
+| `ENTRA_TENANT_ID` in `.env` | Azure portal → Entra ID → Overview → Tenant ID |
+| Microsoft account with **Global Admin** or **Application Administrator** role | Needed during `--setup` only; used interactively via device-code, never stored |
+| `pip install msal` | Only third-party dependency |
+| Authentik running with break-glass local admin account active | Verified automatically by the script |
+
+**Setup:**
+
+```bash
+# Set your tenant ID in .env first:
+# ENTRA_TENANT_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+
+pip install msal
+python3 scripts/setup-entra.py --setup /dock/conf/.env
+# Follow the device-code prompt to sign in with a Global Admin account
+```
+
+**After setup:** All services require an Entra account in the configured access group (`openirvana-homies` by default). Local Authentik logins are disabled for end users; the break-glass superuser account remains active via `/if/admin/`.
+
+**Sync group members (run on cron or manually):**
+
+```bash
+python3 scripts/setup-entra.py --sync /dock/conf/.env
+```
+
+**Restore local logins (recovery):**
+
+```bash
+python3 scripts/undo-entra.py /dock/conf/.env
+```
 
 **Media stack** (optional — Jellyfin, Jellyseerr, Prowlarr, Radarr, Sonarr, Lidarr, FlareSolverr, qBittorrent via ProtonVPN):
 ```bash
@@ -295,12 +423,12 @@ their own auth — no Authentik forward-auth gate (media player API clients need
 **Productivity stack** (optional — ntfy, Tandoor, Vikunja, AFFiNE):
 ```bash
 # 1. Verify productivity DB vars are set in .env (gen-secrets.sh fills them).
-# 2. Add DNS CNAMEs in Cloudflare: ntfy/recipes/tasks/affine → @ (proxied).
+# 2. Add DNS CNAMEs in Cloudflare: ntfy/recipes/tasks/note → @ (proxied).
 # 3. Start the apps profile:
 sudo docker compose --profile apps up -d
 ```
-Tandoor and AFFiNE gate on Authentik forward-auth. ntfy and Vikunja use their own auth
-(API/mobile clients need direct token access).
+Tandoor, Vikunja, and AFFiNE use native Authentik OIDC (see step 6 above for setup).
+ntfy uses its own token auth.
 
 > **First-run notes:**
 > - `docker-host-config.sh` creates `/dock/data/nextcloud` owned `33:33`
@@ -309,9 +437,11 @@ Tandoor and AFFiNE gate on Authentik forward-auth. ntfy and Vikunja use their ow
 >   `sudo chown 33:33 /dock/data/nextcloud`
 > - Nextcloud installs on first request (~60 s). The admin account is set by
 >   `NEXTCLOUD_ADMIN_USER` / `NEXTCLOUD_ADMIN_PASSWORD` in `.env`.
-> - Authentik forward-auth gates all services at the proxy layer. Nextcloud app
->   passwords work for desktop/mobile sync clients without re-authenticating through
->   the Authentik browser flow.
+> - **Auth model:** Authentik forward-auth gates services that have no native auth
+>   (Wazuh, observability dashboards). Nextcloud, Tandoor, Vikunja, and AFFiNE own
+>   their own login page and authenticate users via Authentik OIDC — see step 6 above.
+>   Nextcloud app passwords (for desktop/mobile sync) work without going through the
+>   OIDC browser flow.
 > - Wazuh requires configuring the API connection inside the dashboard UI on first login.
 > - **Nextcloud Talk / TURN:** After first login, go to
 >   `Admin → Talk → TURN servers` (`/settings/admin/talk`) and add:
@@ -365,7 +495,7 @@ Tandoor and AFFiNE gate on Authentik forward-auth. ntfy and Vikunja use their ow
 - **Caddy stuck on ACME**: check `docker logs caddy`; verify Cloudflare token has `Zone:read + DNS:edit` on the zone.
 - **Wazuh indexer OOM**: check tier block; MED/LOW tiers halve JVM heap; or add swap.
 - **Falco eBPF driver fails to load**: set `FALCO_DRIVER=ebpf` in `.env` (legacy probe) and restart falco.
-- **Authentik admin lockout**: `docker exec -it authentik-server ak shell` → `from authentik.core.models import User; u = User.objects.get(username='akadmin'); u.set_password('newpass'); u.save()`.
+- **Authentik admin lockout**: `docker exec -it authentik-server ak shell` → `from authentik.core.models import User; u = User.objects.get(username='akadmin'); u.set_password('newpass'); u.save()`. If locked out via Entra ID (not local password), run `python3 scripts/undo-entra.py /dock/conf/.env` to restore the password login form without touching Entra or synced users.
 - **Postgres backup failed alert**: check `/var/log/pg-backup.log`; pruning is paused until next success.
 - **Zeek not logging**: `docker exec zeek zeekctl status`; if `crashed`, check `/dock/conf/zeek/logs/current/stderr.log`.
 - **GlueTUN not connecting**: check `docker logs gluetun`; verify `PROTONVPN_WIREGUARD_PRIVATE_KEY` is the raw base64 key (not a config file path). If connecting but leaking: confirm `FIREWALL_OUTBOUND_SUBNETS=10.0.0.0/8` is set.
@@ -377,19 +507,47 @@ Tandoor and AFFiNE gate on Authentik forward-auth. ntfy and Vikunja use their ow
 - **AFFiNE WebSocket disconnects / CORS errors**: `AFFINE_SERVER_EXTERNAL_URL` must exactly match the URL in the browser (scheme + hostname, no trailing slash). Update `.env` and restart affine.
 - **ntfy push not delivered**: check `docker logs ntfy`. Ensure `NTFY_BASE_URL` matches the public URL. Confirm the topic's subscriber is connected and `NTFY_AUTH_DEFAULT_ACCESS=deny-all` is working with the correct token.
 
+#### Entra ID lockout (can't sign in via Microsoft)
+
+If Entra ID is unavailable or misconfigured after running `setup-entra.py --setup`, restore local logins without touching Entra:
+
+```bash
+python3 scripts/undo-entra.py /dock/conf/.env
+```
+
+This disables the `entra-id` Authentik source and restores the password login form. Synced users are preserved; the App Registration in Entra is untouched. Re-run `setup-entra.py --setup` to re-enable federation.
+
 ---
 
 ## Adding a new app (Phase 3+)
 
 1. Add a new section in `.env` with `<APP>_DB_NAME`, `<APP>_DB_USER`, `<APP>_DB_PASSWORD` (leave password empty — `docker-host-config.sh` fills it on next run).
-2. Add a new handle block in `templates/caddy/Caddyfile` for both stanzas:
+2. Add a new handle block in `templates/caddy/Caddyfile` for both site stanzas. Choose
+   the auth model that fits the app:
+
+   **Caddy forward-auth** (app has no auth of its own — e.g. Wazuh):
    ```caddyfile
    @newapp host newapp.{$PUBLIC_FQDN}
    handle @newapp {
-       import authentik-forward-auth
        reverse_proxy newapp:<port>
    }
    ```
-3. Add the app's service in `docker-compose.yml`. Join its own layer (create one if needed: `10.0.14.0/24` for media, `10.0.15.0/24` for productivity, etc.) + `data` for Postgres/Redis access.
+   The global `forward_auth` directive already gates everything that isn't listed in the
+   `@requires-auth-pub` / `@requires-auth-ts` exclusion blocks — no extra import needed.
+
+   **Native OIDC** (app handles its own login — e.g. Nextcloud, Vikunja, AFFiNE):
+   ```caddyfile
+   @newapp host newapp.{$PUBLIC_FQDN}
+   handle @newapp {
+       reverse_proxy newapp:<port>
+   }
+   ```
+   Then add `not host {$NEWAPP_SUBDOMAIN}.{$PUBLIC_FQDN}` to the `@requires-auth-pub`
+   and `@requires-auth-ts` matchers, and configure OIDC inside the app itself.
+
+3. Add the app's service in `docker-compose.yml`. Join its own layer (create one if needed:
+   `10.0.14.0/24` for media, `10.0.15.0/24` for productivity, etc.) + `data` for
+   Postgres/Redis access. For native-OIDC apps also add the `auth` network so the app
+   can reach `authentik-server` directly for token validation.
 4. Add tailscale-ingress multi-home: add the new layer to its `networks:` list.
 5. Restart: `docker compose up -d --build`.

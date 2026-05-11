@@ -178,6 +178,18 @@ import snippets/*.caddy
     reverse_proxy n8n:5678
 }
 
+# nextcloud-spreed-signaling — HPB WebSocket signaling server.
+# Not behind Authentik: Nextcloud Talk clients connect directly via WebSocket.
+(backend-spreed-signaling) {
+    reverse_proxy spreed-signaling:8080
+}
+
+# Janus Gateway — WebRTC media server admin API.
+# Gated by Authentik. Janus API (8088) is internal-only; this exposes admin (8188).
+(backend-janus) {
+    reverse_proxy janus:8188
+}
+
 # ==============================================================
 # Reusable security policy blocks.
 # ==============================================================
@@ -213,6 +225,7 @@ import snippets/*.caddy
     header @tandoor-pub  -Content-Security-Policy
     header @immich       -Content-Security-Policy
     header @n8n-pub      -Content-Security-Policy
+    header @janus-pub    -Content-Security-Policy
 
     # Wazuh (OpenSearch Dashboards) bundles use Function() constructor.
     @wazuh-pub host {$WAZUH_SUBDOMAIN}.{$PUBLIC_FQDN}
@@ -245,6 +258,15 @@ import snippets/*.caddy
 
     @requires-auth-pub {
         not host {$AUTHENTIK_SUBDOMAIN}.{$PUBLIC_FQDN}
+        not host {$NEXTCLOUD_SUBDOMAIN}.{$PUBLIC_FQDN}
+        not host {$VIKUNJA_SUBDOMAIN}.{$PUBLIC_FQDN}
+        not host {$AFFINE_SUBDOMAIN}.{$PUBLIC_FQDN}
+        not host {$TANDOOR_SUBDOMAIN}.{$PUBLIC_FQDN}
+        not host {$TALK_SUBDOMAIN}.{$PUBLIC_FQDN}
+        # Native OIDC + mobile/API clients — app owns its own login page.
+        not host {$JELLYFIN_SUBDOMAIN}.{$PUBLIC_FQDN}
+        not host {$IMMICH_SUBDOMAIN}.{$PUBLIC_FQDN}
+        not host {$NTFY_SUBDOMAIN}.{$PUBLIC_FQDN}
         not path /outpost.goauthentik.io/*
     }
     forward_auth @requires-auth-pub authentik-proxy:9000 {
@@ -310,6 +332,13 @@ import snippets/*.caddy
 
     @tandoor-pub host {$TANDOOR_SUBDOMAIN}.{$PUBLIC_FQDN}
     handle @tandoor-pub {
+        # /setup/ is Tandoor's first-run superuser wizard — gate it even though
+        # the rest of Tandoor uses native OIDC and skips forward_auth.
+        @tandoor-setup path /setup/ /setup
+        forward_auth @tandoor-setup authentik-proxy:9000 {
+            uri /outpost.goauthentik.io/auth/caddy
+            copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid
+        }
         import backend-tandoor
     }
 
@@ -358,6 +387,16 @@ import snippets/*.caddy
         import backend-n8n
     }
 
+    @spreed-pub host {$TALK_SUBDOMAIN}.{$PUBLIC_FQDN}
+    handle @spreed-pub {
+        import backend-spreed-signaling
+    }
+
+    @janus-pub host {$JANUS_SUBDOMAIN}.{$PUBLIC_FQDN}
+    handle @janus-pub {
+        import backend-janus
+    }
+
     # Catch-all: reject any subdomain not explicitly matched above.
     handle {
         abort
@@ -400,6 +439,15 @@ http://*.{$TAILNET_FQDN} {
 
     @requires-auth-ts {
         not host {$AUTHENTIK_SUBDOMAIN}.{$TAILNET_FQDN}
+        not host {$NEXTCLOUD_SUBDOMAIN}.{$TAILNET_FQDN}
+        not host {$VIKUNJA_SUBDOMAIN}.{$TAILNET_FQDN}
+        not host {$AFFINE_SUBDOMAIN}.{$TAILNET_FQDN}
+        not host {$TANDOOR_SUBDOMAIN}.{$TAILNET_FQDN}
+        not host {$TALK_SUBDOMAIN}.{$TAILNET_FQDN}
+        # Native OIDC + mobile/API clients — app owns its own login page.
+        not host {$JELLYFIN_SUBDOMAIN}.{$TAILNET_FQDN}
+        not host {$IMMICH_SUBDOMAIN}.{$TAILNET_FQDN}
+        not host {$NTFY_SUBDOMAIN}.{$TAILNET_FQDN}
         not path /outpost.goauthentik.io/*
     }
     forward_auth @requires-auth-ts authentik-proxy:9000 {
@@ -465,6 +513,11 @@ http://*.{$TAILNET_FQDN} {
 
     @tandoor-ts host {$TANDOOR_SUBDOMAIN}.{$TAILNET_FQDN}
     handle @tandoor-ts {
+        @tandoor-setup path /setup/ /setup
+        forward_auth @tandoor-setup authentik-proxy:9000 {
+            uri /outpost.goauthentik.io/auth/caddy
+            copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid
+        }
         import backend-tandoor
     }
 
@@ -511,6 +564,17 @@ http://*.{$TAILNET_FQDN} {
     @n8n-ts host {$N8N_SUBDOMAIN}.{$TAILNET_FQDN}
     handle @n8n-ts {
         import backend-n8n
+    }
+
+    @spreed-ts host {$TALK_SUBDOMAIN}.{$TAILNET_FQDN}
+    handle @spreed-ts {
+        import backend-spreed-signaling
+    }
+
+    @janus-ts host {$JANUS_SUBDOMAIN}.{$TAILNET_FQDN}
+    handle @janus-ts {
+        header -Content-Security-Policy
+        import backend-janus
     }
 
     # Catch-all: reject any subdomain not explicitly matched above.

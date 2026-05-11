@@ -40,6 +40,12 @@ gen_secret() {
     LC_ALL=C tr -dc 'A-Za-z0-9_-' < /dev/urandom | head -c "$len"
 }
 
+# Generate a cryptographically secure hex string of the given length (in chars).
+gen_hex() {
+    local len="${1:-64}"
+    LC_ALL=C tr -dc 'A-Fa-f0-9' < /dev/urandom | head -c "$len"
+}
+
 # Set KEY=VALUE in the env file only if the current value is empty.
 set_if_empty() {
     local key="$1"
@@ -100,6 +106,16 @@ set_if_empty NEXTCLOUD_ADMIN_PASSWORD "$(gen_secret 30)"
 
 # --- Coturn ---
 set_if_empty COTURN_SECRET "$(gen_secret 30)"
+
+# --- HPB (Nextcloud Talk High-Performance Backend) ---
+# NC_HPB_SHARED_SECRET must not change after configuring Nextcloud Talk — it
+# is entered manually in the Talk admin settings and cannot be auto-updated.
+set_if_empty NC_HPB_SHARED_SECRET "$(gen_secret 30)"
+# Hash/block keys are hex — must be 64 chars (32 bytes) each.
+set_if_empty NC_HPB_HASH_KEY      "$(gen_hex 64)"
+set_if_empty NC_HPB_BLOCK_KEY     "$(gen_hex 64)"
+set_if_empty JANUS_API_SECRET     "$(gen_secret 30)"
+set_if_empty JANUS_ADMIN_SECRET   "$(gen_secret 30)"
 
 # --- Tandoor ---
 # SECRET_KEY must not change after first run (encrypts sessions).

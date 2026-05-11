@@ -56,7 +56,7 @@ networks:
       config:
         - subnet: 10.0.10.0/24
           gateway: 10.0.10.10
-  auth:
+  auth-internal:
     driver: bridge
     ipam:
       config:
@@ -68,24 +68,36 @@ networks:
       config:
         - subnet: 10.0.12.0/24
           gateway: 10.0.12.10
-  observability:
+  security:
     driver: bridge
     ipam:
       config:
         - subnet: 10.0.13.0/24
           gateway: 10.0.13.10
-  apps:
+  media:
     driver: bridge
     ipam:
       config:
         - subnet: 10.0.14.0/24
           gateway: 10.0.14.10
-  productivity:
+  apps:
     driver: bridge
     ipam:
       config:
         - subnet: 10.0.15.0/24
           gateway: 10.0.15.10
+  cloud:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.0.16.0/24
+          gateway: 10.0.16.10
+  oidc-clients:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.0.17.0/24
+          gateway: 10.0.17.10
 
 services:
   # ==========================================================
@@ -124,14 +136,16 @@ services:
     networks:
       ingress:
         ipv4_address: 10.0.10.200
-      auth:
-        ipv4_address: 10.0.11.200
-      observability:
+      data:
+        ipv4_address: 10.0.12.200
+      security:
         ipv4_address: 10.0.13.200
-      apps:
+      media:
         ipv4_address: 10.0.14.200
-      productivity:
+      apps:
         ipv4_address: 10.0.15.200
+      cloud:
+        ipv4_address: 10.0.16.200
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:41234/healthz"]
       interval: 10s
@@ -188,7 +202,9 @@ services:
       IMMICH_SUBDOMAIN: ${IMMICH_SUBDOMAIN:-pic}
       FALCO_SUBDOMAIN: ${FALCO_SUBDOMAIN:-sec}
       ZEEK_SUBDOMAIN: ${ZEEK_SUBDOMAIN:-net}
-      N8N_SUBDOMAIN: ${N8N_SUBDOMAIN:-n8n}
+      N8N_SUBDOMAIN: ${N8N_SUBDOMAIN:-soar}
+      TALK_SUBDOMAIN: ${TALK_SUBDOMAIN:-talk}
+      JANUS_SUBDOMAIN: ${JANUS_SUBDOMAIN:-gate}
     volumes:
       - ${DOCK_CONF}/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
       - ${DOCK_CONF}/caddy/snippets:/etc/caddy/snippets:ro
@@ -239,7 +255,7 @@ services:
       - ${DOCK_CONF}/crowdsec/db:/var/lib/crowdsec/data
       - ${DOCK_CONF}/caddy/logs:/var/log/caddy:ro
     networks:
-      observability:
+      security:
         ipv4_address: 10.0.13.20
       ingress:
         ipv4_address: 10.0.10.21
@@ -273,7 +289,7 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     networks:
-      observability:
+      security:
         ipv4_address: 10.0.13.21
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:2375/_ping"]
@@ -309,7 +325,7 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     networks:
-      observability:
+      security:
         ipv4_address: 10.0.13.22
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:2375/_ping"]
@@ -338,7 +354,7 @@ services:
       DOCKER_SOCK: "tcp://socket-proxy-rw:2375"
       CURL_TIMEOUT: "30"
     networks:
-      - observability
+      - security
     mem_limit: 256m
     read_only: false  # container writes internal state
     logging: *default-logging
@@ -565,7 +581,7 @@ services:
     volumes:
       - ${DOCK_CONF}/wazuh/certs:/certs
     networks:
-      observability:
+      security:
         ipv4_address: 10.0.13.29
     restart: "no"
     logging: *default-logging
@@ -583,7 +599,7 @@ services:
       - ${DOCK_CONF}/wazuh/indexer/opensearch.yml:/usr/share/wazuh-indexer/opensearch.yml:ro
       - ${DOCK_CONF}/wazuh/certs:/usr/share/wazuh-indexer/certs:ro
     networks:
-      observability:
+      security:
         ipv4_address: 10.0.13.31
 
   wazuh-indexer-2:
@@ -599,7 +615,7 @@ services:
       - ${DOCK_CONF}/wazuh/indexer/opensearch.yml:/usr/share/wazuh-indexer/opensearch.yml:ro
       - ${DOCK_CONF}/wazuh/certs:/usr/share/wazuh-indexer/certs:ro
     networks:
-      observability:
+      security:
         ipv4_address: 10.0.13.33
 
   wazuh-indexer-3:
@@ -615,7 +631,7 @@ services:
       - ${DOCK_CONF}/wazuh/indexer/opensearch.yml:/usr/share/wazuh-indexer/opensearch.yml:ro
       - ${DOCK_CONF}/wazuh/certs:/usr/share/wazuh-indexer/certs:ro
     networks:
-      observability:
+      security:
         ipv4_address: 10.0.13.34
 
   wazuh-security-init:
@@ -672,7 +688,7 @@ services:
     volumes:
       - ${DOCK_CONF}/wazuh/certs:/certs
     networks:
-      observability:
+      security:
         ipv4_address: 10.0.13.35
     restart: "no"
     logging: *default-logging
@@ -708,7 +724,7 @@ services:
       # bind-mounted under /var/ossec/etc, because sub-mounts there shadow the
       # cont-init config seeding that populates ossec.conf on first boot.
     networks:
-      observability:
+      security:
         ipv4_address: 10.0.13.30
     ulimits:
       nofile:
@@ -759,7 +775,7 @@ services:
       - ${DOCK_CONF}/wazuh/dashboard/opensearch_dashboards.yml:/usr/share/wazuh-dashboard/config/opensearch_dashboards.yml:ro
       - ${DOCK_CONF}/wazuh/certs:/usr/share/wazuh-dashboard/certs:ro
     networks:
-      observability:
+      security:
         ipv4_address: 10.0.13.32
     mem_limit: ${WAZUH_DASHBOARD_MEM_LIMIT:-1g}
     healthcheck:
@@ -795,7 +811,7 @@ services:
       - ${DOCK_CONF}/falco/rules.d:/etc/falco/rules.d:ro
       - ${DOCK_CONF}/falco:/var/log/falco
     networks:
-      observability:
+      security:
         ipv4_address: 10.0.13.24
     mem_limit: ${FALCO_MEM_LIMIT:-512m}
     healthcheck:
@@ -865,7 +881,6 @@ services:
       AUTHENTIK_ERROR_REPORTING__ENABLED: "false"
       AUTHENTIK_DISABLE_UPDATE_CHECK: "true"
     networks:
-      - auth
       - data
     restart: "no"
     logging: *default-logging
@@ -895,9 +910,13 @@ services:
       - ${DOCK_CONF}/authentik/media:/media
       - ${DOCK_CONF}/authentik/custom-templates:/templates:ro
     networks:
-      auth:
+      auth-internal:
         ipv4_address: 10.0.11.20
+      ingress:
+        ipv4_address: 10.0.10.50
       data:
+      oidc-clients:
+        ipv4_address: 10.0.17.10
     mem_limit: ${AUTHENTIK_SERVER_MEM_LIMIT:-2g}
     healthcheck:
       test: ["CMD", "ak", "healthcheck"]
@@ -932,7 +951,7 @@ services:
       - ${DOCK_CONF}/authentik/media:/media
       - ${DOCK_CONF}/authentik/custom-templates:/templates:ro
     networks:
-      auth:
+      auth-internal:
         ipv4_address: 10.0.11.21
       data:
     mem_limit: ${AUTHENTIK_WORKER_MEM_LIMIT:-2g}
@@ -969,8 +988,8 @@ services:
       AUTHENTIK_REDIS__PASSWORD: ${REDIS_PASSWORD}
       AUTHENTIK_REDIS__DB: ${REDIS_DB_AUTHENTIK}
     networks:
-      auth:
-        ipv4_address: 10.0.11.22
+      ingress:
+        ipv4_address: 10.0.10.22
       data:
     mem_limit: 256m
     security_opt:
@@ -984,14 +1003,16 @@ services:
 
   # ==========================================================
   # Nextcloud — file sync + collaboration. Phase 3 app.
-  # Gated by Authentik forward-auth. Shares Postgres + Redis.
+  # Auth: Nextcloud-native OIDC via Authentik (user_oidc app).
+  # Caddy does NOT apply forward-auth to cloud.*; Nextcloud owns
+  # its own login page and OIDC callback. Shares Postgres + Redis.
   # Runs as www-data (uid 33); /dock/data/nextcloud must be
   # chown 33:33 on the host (docker-host-config.sh handles this).
   # read_only omitted — Nextcloud writes PHP sessions + config
   # into /var/www/html at runtime.
   # ==========================================================
   nextcloud:
-    image: nextcloud:${NEXTCLOUD_VERSION:-30}
+    image: nextcloud:${NEXTCLOUD_VERSION:-33}
     container_name: nextcloud
     depends_on:
       postgres:
@@ -1017,12 +1038,23 @@ services:
       OVERWRITECLIURL: https://${NEXTCLOUD_SUBDOMAIN}.${PUBLIC_FQDN}
       PHP_MEMORY_LIMIT: 512M
       PHP_UPLOAD_LIMIT: 10G
+      # OIDC — read by the occ user_oidc:provider command (see .env.example).
+      # These are not consumed by the Nextcloud image directly; they are available
+      # in the container environment so the occ command can reference them via $VAR.
+      NEXTCLOUD_OIDC_PROVIDER_NAME: ${NEXTCLOUD_OIDC_PROVIDER_NAME:-Authentik}
+      NEXTCLOUD_OIDC_CLIENT_ID: ${NEXTCLOUD_OIDC_CLIENT_ID:-}
+      NEXTCLOUD_OIDC_CLIENT_SECRET: ${NEXTCLOUD_OIDC_CLIENT_SECRET:-}
+      NEXTCLOUD_OIDC_DISCOVERY_URL: ${NEXTCLOUD_OIDC_DISCOVERY_URL:-}
     volumes:
       - ${DOCK_DATA}/nextcloud:/var/www/html
     networks:
       apps:
-        ipv4_address: 10.0.14.20
+        ipv4_address: 10.0.15.26
+      cloud:
+        ipv4_address: 10.0.16.20
       data:
+      oidc-clients:
+        ipv4_address: 10.0.17.20
     mem_limit: ${NEXTCLOUD_MEM_LIMIT:-2g}
     cap_drop:
       - ALL
@@ -1072,6 +1104,78 @@ services:
     logging: *default-logging
 
   # ==========================================================
+  # nextcloud-spreed-signaling — Nextcloud Talk High-Performance Backend.
+  # WebSocket signaling server; NOT behind Authentik (Talk clients connect
+  # directly — browser-mediated auth would break the WebSocket handshake).
+  # Talks to janus over the talk network for WebRTC media coordination.
+  # Validates Nextcloud tokens by calling http://nextcloud/ on the talk network.
+  # ==========================================================
+  spreed-signaling:
+    image: strukturag/nextcloud-spreed-signaling:${SPREED_SIGNALING_VERSION:-latest}
+    container_name: spreed-signaling
+    depends_on:
+      nextcloud:
+        condition: service_healthy
+      janus:
+        condition: service_healthy
+    volumes:
+      - ${DOCK_CONF}/spreed-signaling/server.conf:/config/server.conf:ro
+    networks:
+      cloud:
+        ipv4_address: 10.0.16.30
+    mem_limit: ${SPREED_SIGNALING_MEM_LIMIT:-256m}
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/ | grep -qi spreed"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+    labels:
+      - autoheal=true
+    logging: *default-logging
+
+  # ==========================================================
+  # janus — WebRTC media server for Nextcloud Talk HPB.
+  # Service name "janus" must match the URL in server.conf [janus].
+  # RTP media ports 20000-20100/udp published to host so WebRTC
+  # peers can reach them directly (Cloudflare does not proxy UDP).
+  # Admin API on 8188 is routed via Caddy at gate.secop.dev,
+  # gated by Authentik. Internal API on 8088 is talk-network only.
+  # nat_1_1_mapping in janus.jcfg must be set to the host public IP.
+  # ==========================================================
+  janus:
+    image: ${JANUS_IMAGE:-meetecho/janus-gateway:latest}
+    container_name: janus-gateway
+    volumes:
+      - ${DOCK_CONF}/janus/janus.jcfg:/etc/janus/janus.jcfg:ro
+      - ${DOCK_CONF}/janus/janus.transport.http.jcfg:/etc/janus/janus.transport.http.jcfg:ro
+    ports:
+      - "20000-20100:20000-20100/udp"
+    networks:
+      cloud:
+        ipv4_address: 10.0.16.31
+    mem_limit: ${JANUS_MEM_LIMIT:-512m}
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8088/janus/info | grep -q janus"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+    labels:
+      - autoheal=true
+    logging: *default-logging
+
+  # ==========================================================
   # MEDIA STACK — optional, profile-gated.
   # Enable:  docker compose --profile media up -d
   # Disable: docker compose --profile media down
@@ -1112,7 +1216,7 @@ services:
       # Allow direct traffic to Docker subnets without going through VPN.
       FIREWALL_OUTBOUND_SUBNETS: 10.0.0.0/8
     networks:
-      apps:
+      media:
         ipv4_address: 10.0.14.30
     mem_limit: ${GLUETUN_MEM_LIMIT:-256m}
     security_opt:
@@ -1325,8 +1429,10 @@ services:
     devices:
       - /dev/dri:/dev/dri
     networks:
-      apps:
+      media:
         ipv4_address: 10.0.14.21
+      oidc-clients:
+        ipv4_address: 10.0.17.25
     mem_limit: ${JELLYFIN_MEM_LIMIT:-4g}
     security_opt:
       - no-new-privileges:true
@@ -1422,6 +1528,9 @@ services:
 
   # ==========================================================
   # Tandoor — recipe management. Needs SECRET_KEY (gen-secrets).
+  # Auth: native OIDC via Authentik — Django allauth reads
+  # SOCIAL_PROVIDERS + SOCIALACCOUNT_PROVIDERS at startup.
+  # No Caddy forward-auth; Tandoor owns its own login page.
   # Runs as uid 1000. Database migrations run on startup.
   # ==========================================================
   tandoor:
@@ -1439,18 +1548,25 @@ services:
       POSTGRES_USER: ${TANDOOR_DB_USER}
       POSTGRES_PASSWORD: ${TANDOOR_DB_PASSWORD}
       SECRET_KEY: ${TANDOOR_SECRET_KEY}
-      ALLOWED_HOSTS: ${TANDOOR_SUBDOMAIN:-recipes}.${PUBLIC_FQDN},${TANDOOR_SUBDOMAIN:-recipes}.${TAILNET_FQDN},tandoor
+      ALLOWED_HOSTS: ${TANDOOR_SUBDOMAIN:-food}.${PUBLIC_FQDN},${TANDOOR_SUBDOMAIN:-food}.${TAILNET_FQDN},tandoor
       GUNICORN_MEDIA: "0"
       FRACTION_PREF_DEFAULT: "0"
       COMMENT_PREF_DEFAULT: "1"
       SHOPPING_MIN_AUTOSYNC_INTERVAL: "5"
       TZ: ${TZ}
+      # OIDC — Django allauth reads these natively at startup.
+      # The provider id "authentik" fixes the callback path to
+      # /accounts/oidc/authentik/login/callback/ — match this in Authentik.
+      SOCIAL_PROVIDERS: allauth.socialaccount.providers.openid_connect
+      SOCIALACCOUNT_PROVIDERS: >-
+        {"openid_connect":{"SERVERS":[{"id":"authentik","name":"${TANDOOR_OIDC_PROVIDER_NAME:-authentik}","server_url":"${TANDOOR_OIDC_DISCOVERY_URL:-}","APP":{"client_id":"${TANDOOR_OIDC_CLIENT_ID:-}","secret":"${TANDOOR_OIDC_CLIENT_SECRET:-}"}}]}}
     volumes:
       - ${DOCK_DATA}/tandoor/media:/opt/recipes/mediafiles
       - ${DOCK_DATA}/tandoor/static:/opt/recipes/staticfiles
     networks:
       productivity:
         ipv4_address: 10.0.15.21
+      auth:
       data:
     mem_limit: ${TANDOOR_MEM_LIMIT:-512m}
     cap_drop:
@@ -1476,9 +1592,9 @@ services:
 
   # ==========================================================
   # Vikunja — task/project management (Todoist alternative).
+  # Auth: native OIDC via Authentik — env vars below wire it up
+  # at startup. No Caddy forward-auth; Vikunja owns its login.
   # JWT_SECRET generated by gen-secrets.sh.
-  # Mobile apps use JWT directly — Caddy does not apply
-  # forward-auth to API paths (/api/v1/).
   # ==========================================================
   vikunja:
     image: vikunja/vikunja:${VIKUNJA_VERSION:-latest}
@@ -1497,11 +1613,21 @@ services:
       VIKUNJA_SERVICE_PUBLICURL: https://${VIKUNJA_SUBDOMAIN:-tasks}.${PUBLIC_FQDN}/
       VIKUNJA_SERVICE_TIMEZONE: ${TZ}
       VIKUNJA_LOG_LEVEL: info
+      # OIDC — Vikunja reads these natively at startup. The provider key
+      # "AUTHENTIK" determines the redirect URI path segment (/auth/openid/authentik).
+      VIKUNJA_AUTH_OPENID_ENABLED: "true"
+      VIKUNJA_AUTH_OPENID_PROVIDERS_AUTHENTIK_NAME: ${VIKUNJA_OIDC_PROVIDER_NAME:-authentik Login}
+      VIKUNJA_AUTH_OPENID_PROVIDERS_AUTHENTIK_AUTHURL: ${VIKUNJA_OIDC_AUTH_URL:-}
+      VIKUNJA_AUTH_OPENID_PROVIDERS_AUTHENTIK_CLIENTID: ${VIKUNJA_OIDC_CLIENT_ID:-}
+      VIKUNJA_AUTH_OPENID_PROVIDERS_AUTHENTIK_CLIENTSECRET: ${VIKUNJA_OIDC_CLIENT_SECRET:-}
+      VIKUNJA_AUTH_OPENID_PROVIDERS_AUTHENTIK_SCOPE: openid email profile
+      # VIKUNJA_AUTH_LOCAL_ENABLED: "false"  # uncomment to disable password login
     volumes:
       - ${DOCK_DATA}/vikunja:/app/vikunja/files
     networks:
       productivity:
         ipv4_address: 10.0.15.22
+      auth:
       data:
     mem_limit: ${VIKUNJA_MEM_LIMIT:-512m}
     security_opt:
@@ -1521,8 +1647,10 @@ services:
 
   # ==========================================================
   # AFFiNE — collaborative workspace (Notion alternative).
-  # Requires Postgres + Redis. AFFINE_SERVER_EXTERNAL_URL must
-  # match the public URL or CORS/WebSocket connections will fail.
+  # Auth: OIDC via Authentik configured in the AFFiNE admin panel
+  # (Admin Panel → Settings → OAuth). No Caddy forward-auth.
+  # AFFINE_SERVER_EXTERNAL_URL must match the public URL or
+  # CORS/WebSocket connections will fail (editor won't load).
   # ==========================================================
   affine:
     image: ghcr.io/toeverything/affine:${AFFINE_VERSION:-stable}
@@ -1543,12 +1671,18 @@ services:
       AFFINE_SERVER_HOST: "0.0.0.0"
       AFFINE_SERVER_PORT: "3010"
       NODE_ENV: production
+      # OIDC — not consumed natively by AFFiNE; available as reference for the
+      # JSON config entered in Admin Panel → Settings → OAuth → OIDC provider.
+      AFFINE_OIDC_ISSUER: ${AFFINE_OIDC_ISSUER:-}
+      AFFINE_OIDC_CLIENT_ID: ${AFFINE_OIDC_CLIENT_ID:-}
+      AFFINE_OIDC_CLIENT_SECRET: ${AFFINE_OIDC_CLIENT_SECRET:-}
     volumes:
       - ${DOCK_DATA}/affine/config:/root/.affine/config
       - ${DOCK_DATA}/affine/storage:/root/.affine/storage
     networks:
       productivity:
         ipv4_address: 10.0.15.23
+      auth:
       data:
     mem_limit: ${AFFINE_MEM_LIMIT:-2g}
     security_opt:
@@ -1584,7 +1718,7 @@ services:
     volumes:
       - ${DOCK_DATA}/dockhand:/app/data
     networks:
-      observability:
+      security:
         ipv4_address: 10.0.13.23
     mem_limit: ${DOCKHAND_MEM_LIMIT:-256m}
     security_opt:
@@ -1614,7 +1748,7 @@ services:
     environment:
       WEBUI_URL: https://${FALCO_SUBDOMAIN:-sec}.${PUBLIC_FQDN}
     networks:
-      observability:
+      security:
         ipv4_address: 10.0.13.25
     mem_limit: 256m
     security_opt:
@@ -1636,7 +1770,7 @@ services:
     volumes:
       - ${DOCK_DATA}/redis-falco:/data
     networks:
-      observability:
+      security:
         ipv4_address: 10.0.13.28
     mem_limit: 128m
     security_opt:
@@ -1663,7 +1797,7 @@ services:
       FALCOSIDEKICK_UI_REDIS_URL: redis-falco:6379
       FALCOSIDEKICK_UI_DISABLEAUTH: "true"
     networks:
-      observability:
+      security:
         ipv4_address: 10.0.13.26
     mem_limit: 256m
     security_opt:
@@ -1691,7 +1825,7 @@ services:
     volumes:
       - ${DOCK_CONF}/zeek/logs:/srv:ro
     networks:
-      observability:
+      security:
         ipv4_address: 10.0.13.27
     mem_limit: 128m
     security_opt:
@@ -1797,10 +1931,10 @@ services:
       DB_POSTGRESDB_DATABASE: ${N8N_DB_NAME}
       DB_POSTGRESDB_USER: ${N8N_DB_USER}
       DB_POSTGRESDB_PASSWORD: ${N8N_DB_PASSWORD}
-      N8N_HOST: ${N8N_SUBDOMAIN:-n8n}.${PUBLIC_FQDN}
+      N8N_HOST: ${N8N_SUBDOMAIN:-soar}.${PUBLIC_FQDN}
       N8N_PORT: "5678"
       N8N_PROTOCOL: https
-      WEBHOOK_URL: https://${N8N_SUBDOMAIN:-n8n}.${PUBLIC_FQDN}/
+      WEBHOOK_URL: https://${N8N_SUBDOMAIN:-soar}.${PUBLIC_FQDN}/
       N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
       GENERIC_TIMEZONE: ${TZ}
       N8N_RUNNERS_ENABLED: "true"

@@ -187,34 +187,27 @@ def apply_secrets(env_path: Path) -> None:
         pg_pass = val("POSTGRES_SUPERUSER_PASSWORD")
 
         def alter_role(role: str, password: str) -> None:
-            if not password:
+            if not role or not password:
                 return
-            sql = (
-                f"DO $$ BEGIN "
-                f"IF EXISTS (SELECT FROM pg_roles WHERE rolname = '{role}') THEN "
-                f"ALTER USER {role} PASSWORD '{password}'; "
-                f"END IF; END $$;"
-            )
             subprocess.run(
-                ["docker", "exec", "postgres", "psql", "-U", pg_user, "-c", sql],
+                ["docker", "exec", "postgres", "psql", "-U", pg_user,
+                 "-v", f"ar={role}", "-v", f"apw={password}",
+                 "-c", ("DO $body$ BEGIN "
+                        "IF EXISTS (SELECT FROM pg_roles WHERE rolname = :'ar') THEN "
+                        "EXECUTE format('ALTER USER %I PASSWORD %L', :'ar', :'apw'); "
+                        "END IF; END $body$;")],
                 capture_output=True,
             )
 
         subprocess.run(
             ["docker", "exec", "postgres", "psql", "-U", pg_user,
-             "-c", f"ALTER USER {pg_user} PASSWORD '{pg_pass}';"],
+             "-v", f"su={pg_user}", "-v", f"spw={pg_pass}",
+             "-c", 'ALTER USER :"su" PASSWORD :\'spw\';'],
             capture_output=True,
         )
-        for role, env_key in [
-            ("authentik", "AUTHENTIK_DB_PASSWORD"),
-            ("nextcloud", "NEXTCLOUD_DB_PASSWORD"),
-            ("tandoor",   "TANDOOR_DB_PASSWORD"),
-            ("vikunja",   "VIKUNJA_DB_PASSWORD"),
-            ("affine",    "AFFINE_DB_PASSWORD"),
-            ("immich",    "IMMICH_DB_PASSWORD"),
-            ("n8n",       "N8N_DB_PASSWORD"),
-        ]:
-            alter_role(role, val(env_key))
+        # Auto-discover app roles from *_DB_USER vars in .env
+        for m in re.finditer(r'^([A-Z][A-Z0-9_]*)_DB_USER=(\S+)', content, re.MULTILINE):
+            alter_role(m.group(2).strip(), val(f"{m.group(1)}_DB_PASSWORD"))
         print("  APPLIED  Postgres user passwords")
     else:
         print("  SKIP     Postgres not running — start stack first, then re-run with --apply")

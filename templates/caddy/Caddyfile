@@ -134,6 +134,11 @@ import snippets/*.caddy
     reverse_proxy falcosidekick-ui:2802
 }
 
+# Redpanda Console — Kafka topic inspector for Falco security events.
+(backend-redpanda-console) {
+    reverse_proxy redpanda-console:8080
+}
+
 # Zeek log browser — filebrowser serving Zeek TSV logs read-only.
 (backend-zeek) {
     reverse_proxy zeek-logs:80
@@ -397,6 +402,11 @@ import snippets/*.caddy
         import backend-janus
     }
 
+    @redpanda-console host {$REDPANDA_CONSOLE_SUBDOMAIN}.{$PUBLIC_FQDN}
+    handle @redpanda-console {
+        import backend-redpanda-console
+    }
+
     # Catch-all: reject any subdomain not explicitly matched above.
     handle {
         abort
@@ -575,6 +585,11 @@ http://*.{$TAILNET_FQDN} {
     handle @janus-ts {
         header -Content-Security-Policy
         import backend-janus
+    }
+
+    @redpanda-console-ts host {$REDPANDA_CONSOLE_SUBDOMAIN}.{$TAILNET_FQDN}
+    handle @redpanda-console-ts {
+        import backend-redpanda-console
     }
 
     # Catch-all: reject any subdomain not explicitly matched above.

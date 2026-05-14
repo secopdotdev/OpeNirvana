@@ -14,82 +14,10 @@ Usage:
     python3 scripts/undo-entra.py [path/to/.env]
 """
 
-import json
-import re
 import sys
-import urllib.error
-import urllib.parse
-import urllib.request
 from pathlib import Path
-from typing import Optional
 
-
-def _c(code: str, msg: str) -> str:
-    return f"\033[{code}m{msg}\033[0m"
-
-def red(msg: str)    -> None: print(_c("31", msg), file=sys.stderr)
-def green(msg: str)  -> None: print(_c("32", msg))
-def yellow(msg: str) -> None: print(_c("33", msg))
-def step(msg: str)   -> None: print(_c("36", f"\n==> {msg}"))
-
-
-class EnvFile:
-    _INLINE_COMMENT = re.compile(r"\s*#.*$")
-
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self._text = path.read_text()
-
-    def get(self, key: str) -> str:
-        for line in self._text.splitlines():
-            if line.startswith(f"{key}="):
-                val = line[len(key) + 1:]
-                return self._INLINE_COMMENT.sub("", val).strip()
-        return ""
-
-    def force_set(self, key: str, value: str) -> None:
-        pattern = rf"^({re.escape(key)}=).*$"
-        new, count = re.subn(
-            pattern, lambda m: f"{m.group(1)}{value}", self._text, flags=re.MULTILINE,
-        )
-        if count:
-            self._text = new
-            self.path.write_text(new)
-        else:
-            self._text = self._text.rstrip("\n") + f"\n{key}={value}\n"
-            self.path.write_text(self._text)
-
-
-class AuthentikClient:
-    def __init__(self, base_url: str, token: str) -> None:
-        self.base_url = base_url.rstrip("/")
-        self.token = token
-
-    def _request(self, method: str, path: str, body: Optional[dict] = None) -> dict:
-        url = f"{self.base_url}/api/v3/{path.lstrip('/')}"
-        data = json.dumps(body).encode() if body is not None else None
-        req = urllib.request.Request(
-            url, data=data, method=method,
-            headers={"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"},
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                raw = resp.read()
-                return json.loads(raw) if raw else {}
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode(errors="replace")
-            raise RuntimeError(f"HTTP {exc.code} {method} {url}: {detail}") from exc
-
-    def get(self, path: str, **params: str) -> dict:
-        if params:
-            path += "?" + urllib.parse.urlencode(params)
-        return self._request("GET", path)
-
-    def patch(self, path: str, body: dict) -> dict:
-        return self._request("PATCH", path, body)
-
-    def delete(self, path: str) -> None:
-        self._request("DELETE", path)
+from utils import EnvFile, AuthentikClient, red, green, yellow, step, container_state
 
 
 def main() -> int:

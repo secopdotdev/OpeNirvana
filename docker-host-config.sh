@@ -66,7 +66,7 @@ install_base_packages() {
         bash-completion \
         libxml2-utils \
         openssl \
-        python3 \
+        python3 python3-pip \
         libpam-google-authenticator
 }
 
@@ -103,6 +103,27 @@ install_tailscale() {
     apt-get update -qq
     apt-get install -y -qq tailscale
     systemctl enable --now tailscaled
+}
+
+install_python_packages() {
+    step "Installing Python packages for scripts..."
+    # --break-system-packages is required on Ubuntu 23+ (PEP 668); absent on 22.04's pip.
+    local pip_flags=()
+    pip3 install --help 2>&1 | grep -q '\-\-break-system-packages' \
+        && pip_flags=(--break-system-packages)
+
+    _pip_install() {
+        local pkg="$1" desc="$2"
+        if pip3 show "$pkg" >/dev/null 2>&1; then
+            c_grn "  $pkg already installed"
+        else
+            pip3 install --quiet "${pip_flags[@]}" "$pkg"
+            c_grn "  installed $pkg ($desc)"
+        fi
+    }
+
+    _pip_install msal  "setup-entra.py — Microsoft Entra ID federation"
+    _pip_install dtop  "Docker container monitoring TUI"
 }
 
 create_user_and_groups() {
@@ -743,6 +764,7 @@ main() {
     detect_ubuntu
     apt_upgrade
     install_base_packages
+    install_python_packages
     install_docker
     install_tailscale
     create_user_and_groups

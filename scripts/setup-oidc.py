@@ -20,147 +20,19 @@ Prerequisites:
 Idempotent: any service whose CLIENT_ID var is already non-empty is skipped.
 """
 
+import argparse
 import json
 import os
-import re
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Optional
 
-
-# ── ANSI output helpers ────────────────────────────────────────────────────────
-
-def _c(code: str, msg: str) -> str:
-    return f"\033[{code}m{msg}\033[0m"
-
-def red(msg: str)    -> None: print(_c("31", msg), file=sys.stderr)
-def green(msg: str)  -> None: print(_c("32", msg))
-def yellow(msg: str) -> None: print(_c("33", msg))
-def step(msg: str)   -> None: print(_c("36", f"\n==> {msg}"))
-
-
-# ── .env reader / writer ───────────────────────────────────────────────────────
-
-class EnvFile:
-    """Read and selectively update a bash-style .env file."""
-
-    _INLINE_COMMENT = re.compile(r"\s*#.*$")
-
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self._text = path.read_text()
-
-    def get(self, key: str) -> str:
-        """Return the value for KEY, stripping inline comments and whitespace."""
-        for line in self._text.splitlines():
-            if line.startswith(f"{key}="):
-                val = line[len(key) + 1:]
-                return self._INLINE_COMMENT.sub("", val).strip()
-        return ""
-
-    def force_set(self, key: str, value: str) -> None:
-        """Write KEY=value unconditionally, replacing any existing value or appending."""
-        pattern = rf"^({re.escape(key)}=).*$"
-        new, count = re.subn(
-            pattern,
-            lambda m: f"{m.group(1)}{value}",
-            self._text,
-            flags=re.MULTILINE,
-        )
-        if count:
-            self._text = new
-            self.path.write_text(new)
-            print(f"  updated {key}")
-        else:
-            self._text = self._text.rstrip("\n") + f"\n{key}={value}\n"
-            self.path.write_text(self._text)
-            print(f"  wrote  {key} (appended)")
-
-    def set_if_blank(self, key: str, value: str) -> None:
-        """
-        Write KEY=value when:
-          - the key exists with a blank value (or blank + inline comment) → replace in-place
-          - the key is absent entirely → append to end of file
-        Skip when the key exists and already has a non-blank value.
-        """
-        # Check whether the key exists at all and whether it has a value.
-        key_prefix = f"{key}="
-        for line in self._text.splitlines():
-            if line.startswith(key_prefix):
-                existing_val = self._INLINE_COMMENT.sub("", line[len(key_prefix):]).strip()
-                if existing_val:
-                    print(f"  skip   {key} (already set)")
-                    return
-                break  # key present but blank — fall through to in-place replace
-
-        # Try in-place replacement of blank key line.
-        pattern = rf"^({re.escape(key)}=)\s*(#[^\n]*)?\s*$"
-        new, count = re.subn(
-            pattern,
-            lambda m: f"{m.group(1)}{value}",
-            self._text,
-            flags=re.MULTILINE,
-        )
-        if count:
-            self._text = new
-            self.path.write_text(new)
-            print(f"  wrote  {key}")
-        else:
-            # Key is absent — append it.
-            self._text = self._text.rstrip("\n") + f"\n{key}={value}\n"
-            self.path.write_text(self._text)
-            print(f"  wrote  {key} (appended)")
-
-
-# ── Authentik API client ───────────────────────────────────────────────────────
-
-class AuthentikClient:
-    def __init__(self, base_url: str, token: str) -> None:
-        self.base_url = base_url.rstrip("/")
-        self.token = token
-
-    def _request(self, method: str, path: str, body: Optional[dict] = None) -> dict:
-        url = f"{self.base_url}/api/v3/{path.lstrip('/')}"
-        data = json.dumps(body).encode() if body is not None else None
-        req = urllib.request.Request(
-            url, data=data, method=method,
-            headers={
-                "Authorization": f"Bearer {self.token}",
-                "Content-Type": "application/json",
-            },
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                return json.loads(resp.read())
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode(errors="replace")
-            raise RuntimeError(f"HTTP {exc.code} {method} {url}: {detail}") from exc
-
-    def get(self, path: str, **params: str) -> dict:
-        if params:
-            qs = "&".join(f"{k}={v}" for k, v in params.items())
-            path = f"{path}?{qs}"
-        return self._request("GET", path)
-
-    def post(self, path: str, body: dict) -> dict:
-        return self._request("POST", path, body)
-
-
-# ── Docker helpers ─────────────────────────────────────────────────────────────
-
-def container_running(name: str) -> bool:
-    try:
-        result = subprocess.run(
-            ["docker", "inspect", name, "--format", "{{.State.Status}}"],
-            capture_output=True, text=True, timeout=10,
-        )
-        return result.stdout.strip() == "running"
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        return False
+from utils import EnvFile, AuthentikClient, red, green, yellow, step, container_state
 
 
 def get_token_from_container() -> Optional[str]:
@@ -217,6 +89,234 @@ def restart_service(env_path: Path, svc: str) -> None:
         yellow(f"  {svc} restart failed — restart manually")
 
 
+# ── Application pk lookup ──────────────────────────────────────────────────────
+
+def _get_app_pk(ak: AuthentikClient, slug: str) -> Optional[str]:
+    """Return the Authentik application pk for the given slug, or None if absent."""
+    apps = ak.get("core/applications/", slug=slug).get("results", [])
+    return apps[0]["pk"] if apps else None
+
+
+# ── Microsoft Graph API client ─────────────────────────────────────────────────
+
+class GraphClient:
+    """Stdlib-only Microsoft Graph API client using client-credentials flow."""
+
+    _GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+    _TOKEN_URL  = "https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
+
+    def __init__(self, tenant_id: str, client_id: str, client_secret: str) -> None:
+        self._tenant_id     = tenant_id
+        self._client_id     = client_id
+        self._client_secret = client_secret
+        self._token: Optional[str] = None
+
+    def _acquire_token(self) -> str:
+        url  = self._TOKEN_URL.format(tenant_id=self._tenant_id)
+        body = urllib.parse.urlencode({
+            "grant_type":    "client_credentials",
+            "client_id":     self._client_id,
+            "client_secret": self._client_secret,
+            "scope":         "https://graph.microsoft.com/.default",
+        }).encode()
+        try:
+            with urllib.request.urlopen(
+                urllib.request.Request(url, data=body, method="POST"), timeout=20
+            ) as resp:
+                data = json.loads(resp.read())
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode(errors="replace")
+            raise RuntimeError(f"Graph token HTTP {exc.code}: {detail}") from exc
+        if "access_token" not in data:
+            raise RuntimeError(
+                f"Graph token error: {data.get('error_description', data)}"
+            )
+        return data["access_token"]
+
+    def _auth_headers(self) -> dict:
+        if self._token is None:
+            self._token = self._acquire_token()
+        return {
+            "Authorization": f"Bearer {self._token}",
+            "Content-Type":  "application/json",
+        }
+
+    def _request(self, method: str, url: str, body: Optional[dict] = None) -> dict:
+        data = json.dumps(body).encode() if body is not None else None
+        for attempt in range(2):
+            req = urllib.request.Request(url, data=data, method=method,
+                                         headers=self._auth_headers())
+            try:
+                with urllib.request.urlopen(req, timeout=20) as resp:
+                    raw = resp.read()
+                    return json.loads(raw) if raw else {}
+            except urllib.error.HTTPError as exc:
+                if exc.code == 429 and attempt == 0:
+                    try:
+                        retry_after = int(exc.headers.get("Retry-After", "10"))
+                    except ValueError:
+                        retry_after = 10
+                    time.sleep(retry_after)
+                    continue
+                detail = exc.read().decode(errors="replace")
+                raise RuntimeError(
+                    f"Graph HTTP {exc.code} {method} {url}: {detail}"
+                ) from exc
+        raise RuntimeError(f"Graph HTTP {method} {url}: max retries exceeded")
+
+    def get(self, path: str, **params: str) -> dict:
+        url = f"{self._GRAPH_BASE}/{path.lstrip('/')}"
+        if params:
+            url = f"{url}?{urllib.parse.urlencode(params)}"
+        return self._request("GET", url)
+
+    def get_url(self, url: str) -> dict:
+        """Call a full URL directly (used for @odata.nextLink pagination)."""
+        return self._request("GET", url)
+
+    def post(self, path: str, body: dict) -> dict:
+        url = f"{self._GRAPH_BASE}/{path.lstrip('/')}"
+        return self._request("POST", url, body)
+
+
+def _load_graph_client(env: EnvFile) -> Optional[GraphClient]:
+    """Return a GraphClient if OIDC_ENTRA_* credentials are all set, else warn and return None."""
+    tenant_id     = env.get("OIDC_ENTRA_TENANT_ID")
+    client_id     = env.get("OIDC_ENTRA_CLIENT_ID")
+    client_secret = env.get("OIDC_ENTRA_CLIENT_SECRET")
+    if not all([tenant_id, client_id, client_secret]):
+        yellow(
+            "OIDC_ENTRA_TENANT_ID / OIDC_ENTRA_CLIENT_ID / OIDC_ENTRA_CLIENT_SECRET "
+            "not set — skipping Entra group provisioning"
+        )
+        return None
+    return GraphClient(tenant_id, client_id, client_secret)
+
+
+# ── Entra + Authentik group lifecycle ─────────────────────────────────────────
+
+# Maps Docker container name → Authentik application slug for the six OIDC services.
+# Used to look up the correct app pk when binding the Authentik group as an access policy.
+_OIDC_CONTAINER_SLUGS: dict[str, str] = {
+    "nextcloud":     "nextcloud",
+    "tandoor":       "tandoor",
+    "affine":        "affine",
+    "jellyfin":      "jellyfin",
+    "immich-server": "immich",
+    "vikunja":       "vikunja",
+}
+
+
+def _discover_running_services() -> list[str]:
+    """Return the names of all currently-running Docker containers."""
+    try:
+        r = subprocess.run(
+            ["docker", "ps", "--format", "{{.Names}}"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode != 0:
+            yellow(f"  docker ps failed (exit {r.returncode}) — skipping group discovery")
+            return []
+        return [line.strip() for line in r.stdout.splitlines() if line.strip()]
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return []
+
+
+def _ensure_entra_group(gc: GraphClient, name: str) -> str:
+    """Find or create an Entra security group by displayName. Returns group ID."""
+    existing = gc.get(
+        "groups",
+        **{"$filter": f"displayName eq '{name}'", "$select": "id,displayName"},
+    ).get("value", [])
+    if existing:
+        return existing[0]["id"]
+    group = gc.post("groups", {
+        "displayName":     name,
+        "mailNickname":    name,
+        "securityEnabled": True,
+        "mailEnabled":     False,
+        "groupTypes":      [],
+    })
+    green(f"  created Entra group: {name}")
+    return group["id"]
+
+
+def _ensure_authentik_group(ak: AuthentikClient, name: str) -> str:
+    """Find or create an Authentik group by name. Returns group pk."""
+    existing = ak.get("core/groups/", name=name).get("results", [])
+    if existing:
+        return existing[0]["pk"]
+    group = ak.post("core/groups/", {"name": name})
+    green(f"  created Authentik group: {name}")
+    return group["pk"]
+
+
+def _ensure_policy_binding(ak: AuthentikClient, app_pk: str, group_pk: str) -> None:
+    """Bind an Authentik group to an application as an access policy (idempotent)."""
+    existing = ak.get("policies/bindings/", target=app_pk).get("results", [])
+    if any(b.get("group") == group_pk for b in existing):
+        return
+    ak.post("policies/bindings/", {
+        "target":  app_pk,
+        "group":   group_pk,
+        "enabled": True,
+        "order":   0,
+    })
+    green(f"  bound group {group_pk} → app {app_pk}")
+
+
+def _sync_group_membership(
+    gc: GraphClient,
+    ak: AuthentikClient,
+    entra_group_id: str,
+    authentik_group_pk: str,
+) -> None:
+    """Sync all Entra group members to the matching Authentik group."""
+    # Collect all Entra group members, paging through @odata.nextLink.
+    members: list[dict] = []
+    page = gc.get(
+        f"groups/{entra_group_id}/members",
+        **{"$select": "id,displayName,mail,userPrincipalName"},
+    )
+    while True:
+        members.extend(page.get("value", []))
+        next_link = page.get("@odata.nextLink")
+        if not next_link:
+            break
+        page = gc.get_url(next_link)
+
+    # Current Authentik group member PKs.
+    group_data = ak.get(f"core/groups/{authentik_group_pk}/")
+    current_pks = {str(pk) for pk in group_data.get("users", [])}
+
+    for member in members:
+        mail = (member.get("mail") or "").strip()
+        if not mail:
+            yellow(f"  SKIPPED (no email): {member.get('displayName', '?')}")
+            continue
+
+        results = ak.get("core/users/", email=mail).get("results", [])
+        if results:
+            user_pk = results[0]["pk"]
+            if str(user_pk) in current_pks:
+                green(f"  ALREADY MEMBER: {mail}")
+                continue
+            ak.post(f"core/groups/{authentik_group_pk}/add_user/", {"pk": user_pk})
+            green(f"  ADDED: {mail}")
+        else:
+            new_user = ak.post("core/users/", {
+                "username":  member.get("userPrincipalName") or mail,
+                "name":      member.get("displayName") or mail,
+                "email":     mail,
+                "type":      "external",
+                "is_active": True,
+            })
+            ak.post(
+                f"core/groups/{authentik_group_pk}/add_user/", {"pk": new_user["pk"]}
+            )
+            green(f"  CREATED+ADDED: {mail}")
+
+
 # ── Preflight API key check ────────────────────────────────────────────────────
 
 def check_api_keys(env: EnvFile) -> bool:
@@ -270,24 +370,26 @@ def provision_service(
     property_mappings: list[str],
     id_var: str,
     secret_var: str,
-) -> tuple[str, str]:
+) -> tuple[str, str, Optional[str]]:
     """
     Create an Authentik OAuth2/OIDC provider + application if CLIENT_ID is blank.
-    Returns (client_id, client_secret).
+    Returns (client_id, client_secret, app_pk).
     """
     existing_id = env.get(id_var)
     if existing_id:
         yellow(f"{name}: {id_var} already set — skipping")
-        return existing_id, env.get(secret_var)
+        return existing_id, env.get(secret_var), _get_app_pk(ak, slug)
 
     # Check whether the provider already exists in Authentik (e.g. from a
     # prior partial run where credentials weren't written back to .env).
+    app_pk: Optional[str] = None
     existing = ak.get("providers/oauth2/", name=name).get("results", [])
     if existing:
         provider      = existing[0]
         pk            = provider["pk"]
         client_id     = provider["client_id"]
         client_secret = provider["client_secret"]
+        app_pk        = _get_app_pk(ak, slug)
         green(f"  {name}: provider already exists (pk={pk}) — reusing credentials")
     else:
         step(f"{name}: creating OAuth2/OIDC provider")
@@ -309,17 +411,19 @@ def provision_service(
 
         step(f"{name}: creating application (slug={slug})")
         try:
-            ak.post("core/applications/", {"name": name, "slug": slug, "provider": pk})
+            app_result = ak.post("core/applications/", {"name": name, "slug": slug, "provider": pk})
+            app_pk = app_result.get("pk")
             green("  application created")
         except RuntimeError as exc:
             if "already exists" in str(exc):
                 green("  application already exists — skipping")
+                app_pk = _get_app_pk(ak, slug)
             else:
                 raise
 
     env.set_if_blank(id_var,     client_id)
     env.set_if_blank(secret_var, client_secret)
-    return client_id, client_secret
+    return client_id, client_secret, app_pk
 
 
 # ── Jellyfin SSO plugin configurator ──────────────────────────────────────────
@@ -712,12 +816,22 @@ Credentials:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def main(argv: list[str]) -> int:
-    script_dir = Path(__file__).resolve().parent
-    env_path   = (
-        Path(argv[1]).resolve() if len(argv) > 1
-        else (script_dir / ".." / ".env").resolve()
+def main() -> int:
+    default_env = Path(__file__).resolve().parent.parent / ".env"
+    parser = argparse.ArgumentParser(
+        description="Provision Authentik OIDC providers and optional Entra security groups.",
     )
+    parser.add_argument(
+        "env_file", nargs="?", default=str(default_env),
+        metavar="PATH", help="Path to .env (default: <unified-stack>/.env)",
+    )
+    parser.add_argument(
+        "--sync", action="store_true",
+        help="Sync Entra group members into Authentik users/groups after provisioning",
+    )
+    args = parser.parse_args()
+    env_path = Path(args.env_file).resolve()
+    do_sync  = args.sync
 
     if not env_path.exists():
         red(f"ERROR: .env not found at {env_path}")
@@ -748,7 +862,7 @@ def main(argv: list[str]) -> int:
     # Fall back to container env vars if .env values are missing
     def resolve(env_key: str, container: str, default: str = "") -> str:
         val = env.get(env_key)
-        if not val and container_running(container):
+        if not val and container_state(container) == "running":
             val = get_container_env_var(container, env_key) or ""
         return val or default
 
@@ -862,7 +976,7 @@ def main(argv: list[str]) -> int:
             "url": f"https://{nc_sub}.{tailnet_fqdn}/apps/user_oidc/code",
         })
 
-    nc_id, nc_secret = provision_service(
+    nc_id, nc_secret, nc_app_pk = provision_service(
         ak, env,
         slug="nextcloud", name="Nextcloud",
         redirect_uris=redirect_uris_nc,
@@ -884,7 +998,7 @@ def main(argv: list[str]) -> int:
 
     # ── Tandoor ────────────────────────────────────────────────────────────────
     step("Provisioning Tandoor")
-    td_id, td_secret = provision_service(
+    td_id, td_secret, td_app_pk = provision_service(
         ak, env,
         slug="tandoor", name="Tandoor",
         redirect_uris=[{
@@ -908,7 +1022,7 @@ def main(argv: list[str]) -> int:
 
     # ── AFFiNE ─────────────────────────────────────────────────────────────────
     step("Provisioning AFFiNE")
-    af_id, af_secret = provision_service(
+    af_id, af_secret, af_app_pk = provision_service(
         ak, env,
         slug="affine", name="AFFiNE",
         redirect_uris=[{
@@ -935,7 +1049,7 @@ def main(argv: list[str]) -> int:
         f"https://{auth_sub}.{public_fqdn}"
         "/application/o/jellyfin/.well-known/openid-configuration"
     )
-    jf_id, jf_secret = provision_service(
+    jf_id, jf_secret, jf_app_pk = provision_service(
         ak, env,
         slug="jellyfin", name="Jellyfin",
         redirect_uris=[{"matching_mode": "strict", "url": jf_redirect}],
@@ -947,7 +1061,7 @@ def main(argv: list[str]) -> int:
 
     jf_api_key      = env.get("JELLYFIN_API_KEY")
     jf_auto_ok      = False
-    if jf_api_key and container_running("jellyfin"):
+    if jf_api_key and container_state("jellyfin") == "running":
         step("Configuring Jellyfin SSO plugin")
         jf_auto_ok = configure_jellyfin_sso(
             jellyfin_url  = jellyfin_url,
@@ -976,7 +1090,7 @@ def main(argv: list[str]) -> int:
     immich_url  = f"https://{im_sub}.{public_fqdn}"
     im_redirect = f"{immich_url}/auth/login"
     im_issuer   = f"https://{auth_sub}.{public_fqdn}/application/o/immich/"
-    im_id, im_secret = provision_service(
+    im_id, im_secret, im_app_pk = provision_service(
         ak, env,
         slug="immich", name="Immich",
         redirect_uris=[
@@ -992,7 +1106,7 @@ def main(argv: list[str]) -> int:
 
     im_api_key  = env.get("IMMICH_API_KEY")
     im_auto_ok  = False
-    if im_api_key and container_running("immich-server"):
+    if im_api_key and container_state("immich-server") == "running":
         step("Configuring Immich OAuth")
         im_auto_ok = configure_immich_oidc(
             immich_url=immich_url,
@@ -1021,7 +1135,7 @@ def main(argv: list[str]) -> int:
     # to /auth/openid/authentik — Authentik must have that exact URI registered.
     vk_redirect = f"https://{vk_sub}.{public_fqdn}/auth/openid/authentik"
     vk_issuer   = f"https://{auth_sub}.{public_fqdn}/application/o/vikunja/"
-    vk_id, vk_secret = provision_service(
+    vk_id, vk_secret, vk_app_pk = provision_service(
         ak, env,
         slug="vikunja", name="Vikunja",
         redirect_uris=[{"matching_mode": "strict", "url": vk_redirect}],
@@ -1037,10 +1151,56 @@ def main(argv: list[str]) -> int:
         "redirect_uri":  vk_redirect,
     }
 
+    # ── Entra group lifecycle ──────────────────────────────────────────────────
+    gc = _load_graph_client(env)
+    entra_prefix = env.get("ENTRA_GROUP_PREFIX")     or "authentik"
+    ak_prefix    = env.get("AUTHENTIK_GROUP_PREFIX") or "entra"
+
+    # Keyed by Authentik slug — used for policy binding in the next task.
+    oidc_app_pks: dict[str, Optional[str]] = {
+        "nextcloud": nc_app_pk,
+        "tandoor":   td_app_pk,
+        "affine":    af_app_pk,
+        "jellyfin":  jf_app_pk,
+        "immich":    im_app_pk,
+        "vikunja":   vk_app_pk,
+    }
+
+    # Per-service Entra and Authentik group ids — collected for --sync use.
+    service_group_ids: list[tuple[str, str, str]] = []  # (svc, entra_id, ak_pk)
+
+    if gc is not None:
+        step("Provisioning Entra + Authentik security groups")
+        all_services = _discover_running_services()
+        services = [s for s in all_services if s in _OIDC_CONTAINER_SLUGS]
+        if not services:
+            yellow("  No OIDC-managed containers found — skipping group provisioning")
+        for svc in services:
+            slug_name  = _OIDC_CONTAINER_SLUGS[svc]
+            entra_name = f"{entra_prefix}-{slug_name}"
+            ak_name    = f"{ak_prefix}-{slug_name}"
+            entra_id   = _ensure_entra_group(gc, entra_name)
+            ak_pk      = _ensure_authentik_group(ak, ak_name)
+            service_group_ids.append((svc, entra_id, ak_pk))
+            # Policy binding for the six OIDC services only.
+            slug = _OIDC_CONTAINER_SLUGS.get(svc)
+            if slug:
+                app_pk = oidc_app_pks.get(slug)
+                if app_pk:
+                    _ensure_policy_binding(ak, app_pk, ak_pk)
+            green(f"  {svc}: Entra group={entra_name}, Authentik group={ak_name}")
+
+        # --sync: mirror Entra group membership into Authentik.
+        if do_sync:
+            step("Syncing Entra group membership into Authentik")
+            for svc, entra_id, ak_pk in service_group_ids:
+                step(f"  Syncing {svc}")
+                _sync_group_membership(gc, ak, entra_id, ak_pk)
+
     # ── Restart running containers ─────────────────────────────────────────────
     step("Restarting running services")
     for svc in ("nextcloud", "tandoor", "affine", "vikunja"):
-        if container_running(svc):
+        if container_state(svc) == "running":
             restart_service(env_path, svc)
         else:
             yellow(f"  {svc} not running — start it after configuring credentials")
@@ -1055,4 +1215,4 @@ def main(argv: list[str]) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv))
+    sys.exit(main())

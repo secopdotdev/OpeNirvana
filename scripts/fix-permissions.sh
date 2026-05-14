@@ -45,6 +45,32 @@ fix_dir() {
     c_grn "  chown ${owner}:${group} $dir"
 }
 
+# ── Single-service provisioning mode ─────────────────────────────────────────
+# Usage: fix-permissions.sh --service <name> [--tailscale]
+# Creates /dock/conf/<name> and /dock/data/<name> (and /dock/conf/tail/<name>
+# when --tailscale is passed), then sets docktaetor:media 770 ownership.
+# Called automatically by add-service.py after scaffolding a new service.
+if [ "${1:-}" = "--service" ]; then
+    svc="${2:?Usage: fix-permissions.sh --service <name> [--tailscale]}"
+    want_tailscale=false
+    for arg in "$@"; do [ "$arg" = "--tailscale" ] && want_tailscale=true; done
+
+    echo "Provisioning host directories for service: $svc"
+
+    for dir in "${DOCK_CONF}/${svc}" "${DOCK_DATA}/${svc}"; do
+        install -d -o 1010 -g 1010 -m 770 "$dir"
+        c_grn "  ${dir}  (docktaetor:media 770)"
+    done
+
+    if $want_tailscale; then
+        install -d -o 1010 -g 1010 -m 770 "${DOCK_CONF}/tail/${svc}"
+        c_grn "  ${DOCK_CONF}/tail/${svc}  (docktaetor:media 770)"
+    fi
+
+    c_grn "Done. Directories ready for ${svc}."
+    exit 0
+fi
+
 # ── Standard services: docktaetor:media ───────────────────────────────────────
 echo "Applying standard ownership (${DEFAULT_USER}:${DEFAULT_GROUP}) to all service dirs..."
 
@@ -53,11 +79,19 @@ for base in "$DOCK_CONF" "$DOCK_DATA"; do
     for svc_dir in "$base"/*/; do
         svc=$(basename "$svc_dir")
         # Skip services with known overrides (handled below)
-        case "$svc" in affine|spreed-signaling|janus) continue ;; esac
+        case "$svc" in affine|spreed-signaling|janus|redpanda|redpanda-console) continue ;; esac
         chown "${DEFAULT_USER}:${DEFAULT_GROUP}" "$svc_dir" 2>/dev/null || true
         # Don't recurse here — service-internal dirs may be owned by container UIDs
     done
 done
+
+# ── Redpanda: UID/GID 101 ────────────────────────────────────────────────────
+# Runs as UID/GID 101 (redpanda user inside the container). Requires owner-level
+# access to /dock/data/redpanda for WAL and data segments. conf dir uses standard
+# docktaetor:media ownership since it holds no container-written files.
+echo ""
+echo "Applying 101:101 to Redpanda data dir..."
+fix_dir "${DOCK_DATA}/redpanda" 101 101
 
 # ── AFFiNE: root:root ─────────────────────────────────────────────────────────
 # Runs as UID 0 with cap_drop:ALL (no DAC_OVERRIDE). Must own its dirs as root.

@@ -205,6 +205,7 @@ services:
       N8N_SUBDOMAIN: ${N8N_SUBDOMAIN:-soar}
       TALK_SUBDOMAIN: ${TALK_SUBDOMAIN:-talk}
       JANUS_SUBDOMAIN: ${JANUS_SUBDOMAIN:-gate}
+      REDPANDA_CONSOLE_SUBDOMAIN: ${REDPANDA_CONSOLE_SUBDOMAIN:-kafka}
     volumes:
       - ${DOCK_CONF}/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
       - ${DOCK_CONF}/caddy/snippets:/etc/caddy/snippets:ro
@@ -1133,7 +1134,7 @@ services:
     security_opt:
       - no-new-privileges:true
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/ | grep -qi spreed"]
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:8080/api/v1/stats"]
       interval: 30s
       timeout: 10s
       retries: 5
@@ -1802,6 +1803,8 @@ services:
       - falco
     environment:
       WEBUI_URL: https://${FALCO_SUBDOMAIN:-sec}.${PUBLIC_FQDN}
+      KAFKA_HOSTPORT: redpanda:9092
+      KAFKA_TOPIC: falco.alerts
     networks:
       security:
         ipv4_address: 10.0.13.25
@@ -1891,6 +1894,94 @@ services:
       timeout: 10s
       retries: 5
       start_period: 15s
+    restart: unless-stopped
+    labels:
+      - autoheal=true
+    logging: *default-logging
+
+  # ==========================================================
+  # Redpanda — Kafka-protocol message broker for security events.
+  # Falcosidekick publishes to falco.alerts; n8n consumes from it.
+  # redpanda-init (one-shot) creates topics with retention settings.
+  # redpanda-console exposes a read-only topic inspector at
+  # kafka-console.{PUBLIC_FQDN}, gated by Authentik forward-auth.
+  # Prometheus metrics: http://redpanda:9644/public_metrics
+  # ==========================================================
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:latest
+    container_name: redpanda
+    command:
+      - redpanda
+      - start
+      - --mode dev-container
+      - --smp 1
+      - --memory 400M
+      - --reserve-memory 0M
+      - --default-log-level=info
+      - --kafka-addr internal://0.0.0.0:9092
+      - --advertise-kafka-addr internal://redpanda:9092
+      - --rpc-addr redpanda:33145
+      - --advertise-rpc-addr redpanda:33145
+    volumes:
+      - ${DOCK_DATA}/redpanda:/var/lib/redpanda/data
+    networks:
+      security:
+        ipv4_address: 10.0.13.36
+    mem_limit: 512m
+    cpus: 1
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9644/v1/cluster/health_overview"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    labels:
+      - autoheal=true
+    logging: *default-logging
+
+  redpanda-init:
+    image: docker.redpanda.com/redpandadata/redpanda:latest
+    container_name: redpanda-init
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - >-
+        rpk topic create falco.alerts falco.alerts.dlq
+        --brokers redpanda:9092
+        --topic-config retention.ms=604800000
+        --topic-config retention.bytes=1073741824
+        --if-not-exists
+    networks:
+      security:
+    restart: "no"
+    logging: *default-logging
+
+  redpanda-console:
+    image: docker.redpanda.com/redpandadata/console:latest
+    container_name: redpanda-console
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+      KAFKA_SCHEMAREGISTRY_ENABLED: "false"
+    networks:
+      security:
+        ipv4_address: 10.0.13.37
+    mem_limit: 256m
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:8080/"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     restart: unless-stopped
     labels:
       - autoheal=true
@@ -2001,6 +2092,8 @@ services:
       apps:
         ipv4_address: 10.0.15.25
       data:
+      security:
+        ipv4_address: 10.0.13.40
     mem_limit: ${N8N_MEM_LIMIT:-1g}
     security_opt:
       - no-new-privileges:true

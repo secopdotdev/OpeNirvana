@@ -515,7 +515,7 @@ All scripts live in `unified-stack/scripts/`. Run them from the `unified-stack/`
 | Script | Purpose | When to run | Idempotent | Root/sudo |
 |--------|---------|-------------|:----------:|:---------:|
 | `gen-secrets.py` | Fill blank secrets in `.env`; fetch container-issued keys on second pass | (1) Before `compose up`; (2) after stack is running; (3) after any secret rotation | Yes | No |
-| `setup-oidc.py` | Provision Authentik OIDC providers for all apps; write credentials to `.env` | After Authentik is healthy and users exist; re-run to add missing services | Yes | No |
+| `setup-oidc.py` | Provision Authentik OIDC providers for all apps; write credentials to `.env`; optionally create paired Entra/Authentik security groups and sync membership (`--sync`) | After Authentik is healthy and users exist; re-run to add missing services | Yes | No |
 | `setup-entra.py` | Federate Authentik with Microsoft Entra ID; gate all logins on an Entra group | `--setup` once to enable; `--sync` on cron for membership updates | Yes | No |
 | `undo-entra.py` | Disable Entra ID federation; restore local password login | Entra lockout recovery or to roll back federation | Yes | No |
 | `maintain.py` | Postgres backup, Zeek intel refresh, and Wazuh agent sync — unified daily maintenance | Nightly via cron; individually as needed | Yes | Docker socket / **Yes** (wazuh) |
@@ -565,10 +565,72 @@ Services covered: **Nextcloud, Tandoor, Vikunja, AFFiNE, Jellyfin** (requires `J
 # Authentik must be healthy and at least one user must exist
 sudo python3 scripts/setup-oidc.py
 
+# Also provision Entra + Authentik security groups and bind OIDC access policies
+# (requires OIDC_ENTRA_* vars in .env — see "Entra App Registration" section below)
+python3 scripts/setup-oidc.py
+
+# Provision + sync Entra group members into Authentik users/groups
+python3 scripts/setup-oidc.py --sync
+
 # Re-run at any time; services with an existing CLIENT_ID are skipped
 ```
 
 Idempotent: any service whose `_CLIENT_ID` variable is already populated is skipped.
+
+---
+
+### Entra App Registration for OIDC Group Management
+
+**What this App Registration does**
+
+Creates per-service security groups in Microsoft Entra (Azure AD) and mirrors their membership into Authentik. This is separate from `setup-entra.py`'s `Authentik-Sync` App Registration (which federates *authentication*). This registration is only about *authorisation groups* — it lets you control which users can access which services by managing Entra group membership.
+
+**Pre-requisites**
+
+- `setup-oidc.py` has already run successfully (Authentik OIDC providers exist).
+- An Azure account with permission to create App Registrations and grant admin consent.
+
+**Step-by-step: create the App Registration**
+
+1. Azure portal → Entra ID → App registrations → New registration
+2. Name: `Authentik-OIDC-Groups` (or any name)
+3. Supported account types: **Single tenant**
+4. Redirect URI: none
+5. After creation, note the **Application (client) ID** and **Directory (tenant) ID**
+6. Certificates & secrets → New client secret → note the **Value** (shown once)
+7. API permissions → Add a permission → Microsoft Graph → **Application permissions** → add:
+
+| Permission | Purpose |
+|---|---|
+| `Group.ReadWrite.All` | Create and read per-service security groups |
+| `GroupMember.Read.All` | List group members for `--sync` |
+| `User.Read.All` | Resolve member UPN/email for Authentik user lookup |
+
+8. Grant admin consent for your organisation.
+
+**`.env` configuration**
+
+```
+OIDC_ENTRA_TENANT_ID=<Directory (tenant) ID>
+OIDC_ENTRA_CLIENT_ID=<Application (client) ID>
+OIDC_ENTRA_CLIENT_SECRET=<client secret value>
+
+# Optional — change group naming prefixes (defaults shown)
+ENTRA_GROUP_PREFIX=authentik
+AUTHENTIK_GROUP_PREFIX=entra
+```
+
+**Running**
+
+```bash
+# Provision OIDC providers and create/bind groups (no member sync)
+python3 scripts/setup-oidc.py
+
+# Provision + sync Entra group members into Authentik users/groups
+python3 scripts/setup-oidc.py --sync
+```
+
+Without `--sync`, only group creation and policy binding run. With `--sync`, provisioning runs first then member sync follows. Add `--sync` to the daily cron in `docker-host-config.sh` to keep group membership current.
 
 ---
 
@@ -840,3 +902,112 @@ python3 -m pytest tests/test_setup_entra.py::test_msal_guard_exits_when_missing 
    app can reach `authentik-server:9000` for token validation without exposing authentik-worker.
 4. Add tailscale-ingress multi-home: add the new layer to its `networks:` list.
 5. Restart: `docker compose up -d --build`.
+
+---
+
+## `add-service.py` (repo root)
+
+Scaffolds and fully provisions a new service in one command. For unified+Authentik services every
+external-facing dependency — Caddy routing, DNS, Authentik app registration, and env vars — is
+wired automatically.
+
+```
+python add-service.py <name> [options]
+```
+
+### Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--port PORT` | `80` | Internal container port |
+| `--image IMAGE` | placeholder | Docker image |
+| `--type {standalone,unified}` | `standalone` | `standalone` = dev/ Tailscale-sidecar; `unified` = Caddy + Authentik |
+| `--auth {authentik,native-oidc,none}` | `authentik` | Auth gate for unified type |
+| `--db {none,postgres,redis,both}` | `none` | Add local DB sidecar(s) — standalone only |
+| `--subdomain SLUG` | service name | External subdomain slug (e.g. `hoard` → `hoard.secop.dev`) |
+| `--out DIR` | `./dev/<name>` or `./unified-stack/services/<name>` | Output base directory |
+| `--dry-run` | off | Print what would happen without writing files or calling external APIs |
+| `--no-host-setup` | off | Skip SSH host provisioning (print manual commands instead) |
+| `--ssh-host USER@HOST` | `rooter@streamer` | SSH target for host provisioning |
+| `--ssh-key PATH` | `~/.ssh/streamer` | SSH identity file |
+| `--repo-path PATH` | `/home/rooter/git/finnsbeincaddy` | Repo path on the Docker host |
+
+### Prerequisites for cloud provisioning
+
+For `--type unified --auth authentik` the script reads these vars from `unified-stack/.env`:
+
+| Variable | Purpose |
+|----------|---------|
+| `CLOUDFLARE_API_TOKEN` | Create the public CNAME record for the service |
+| `AUTHENTIK_BOOTSTRAP_TOKEN` | Register the proxy provider + application in Authentik |
+| `AUTHENTIK_SUBDOMAIN` | Authentik's own subdomain (used to build the API base URL) |
+| `PUBLIC_FQDN` | Root domain (e.g. `secop.dev`) |
+| `TAILNET_FQDN` | Tailnet FQDN for Caddy's tailnet site block |
+
+These are already present for normal stack operation; no extra setup is required.
+
+### What it does automatically
+
+**For all types** (non-`--dry-run`):
+
+- Generates service files in `unified-stack/services/<name>/` (unified) or `dev/<name>/` (standalone)
+- SSHes to the Docker host and runs `fix-permissions.sh --service <name>` to create
+  `/dock/conf/<name>` and `/dock/data/<name>` with `docktaetor:media 770`
+
+**Additionally for `--type unified --auth authentik`**, the following 7 provisioning steps run
+automatically after scaffold. Each step is idempotent — re-running skips anything already done:
+
+| Step | What happens |
+|------|-------------|
+| **1. Caddyfile** | Inserts `(backend-<name>)` snippet, public `@<name>` handle, and tailnet `@<name>-ts` handle into `templates/caddy/Caddyfile` |
+| **2. `.env`** | Appends `<NAME>_SUBDOMAIN=<slug>` to `unified-stack/.env` if not already set |
+| **3. `.env.example`** | Inserts `<NAME>_SUBDOMAIN=<slug>` after the last `_SUBDOMAIN=` line in `.env.example` |
+| **4. Caddy reload** | Runs `docker exec caddy caddy reload --config /etc/caddy/Caddyfile` if the Caddyfile changed |
+| **5. Cloudflare DNS** | Creates a proxied CNAME `<subdomain>.<domain>` pointing at the same target as `auth.<domain>` |
+| **6. Authentik** | Creates a `forward_single` proxy provider + application, assigns it to the embedded outpost |
+| **7. Health check** | Runs `check-stack.py` so you see live status of all services immediately |
+
+### What requires manual follow-up
+
+| Step | Standalone | Unified (authentik) |
+|------|-----------|---------------------|
+| Set the Docker image | Edit `IMAGE_URL` in `dev/<name>/.env` | Edit `image:` in the generated service block in `docker-compose.yml` |
+| Set the Tailscale auth key | Edit `TS_AUTHKEY` in `dev/<name>/.env` | N/A — unified uses the shared ingress |
+| Add service block to compose | N/A | Paste the printed block into `unified-stack/docker-compose.yml` |
+| Start the service | `docker compose --env-file dev/<name>/.env -f dev/<name>/docker-compose.yml up -d` | `docker compose up -d <name>` |
+| OIDC integration | N/A | If the service uses Authentik SSO, run `python3 scripts/setup-oidc.py` after start |
+| Special UID permissions | N/A | If the service runs as a non-standard UID with `cap_drop:ALL`, add it to `fix-permissions.sh` and re-run |
+
+### Re-provisioning an existing service
+
+If `unified-stack/services/<name>` already exists the script skips scaffold and runs provisioning
+only. This is useful to repair a partially-provisioned service or to apply any step that was
+missed (e.g. because `CLOUDFLARE_API_TOKEN` was not set at creation time):
+
+```bash
+python add-service.py hoarder --port 3000 --type unified
+# → "hoarder already exists — skipping scaffold, running provisioning only"
+# All 7 steps run; already-done steps are silently skipped.
+```
+
+### Examples
+
+```bash
+# Standalone service (Tailscale-sidecar, Postgres + Redis sidecars):
+python add-service.py paperless --port 8000 --type standalone --db both
+
+# Unified service — scaffold + full provisioning (DNS, Authentik, Caddyfile, env):
+python add-service.py hoarder --port 3000 --type unified
+
+# Unified service with a custom subdomain slug:
+python add-service.py actual-budget --port 5006 --type unified --subdomain budget
+
+# Unified service with native OIDC (service handles its own login, no Authentik proxy):
+python add-service.py gitea --port 3000 --type unified --auth native-oidc
+
+# Preview everything without writing files or calling external APIs:
+python add-service.py myapp --port 9000 --type unified --dry-run
+
+# Write files but skip SSH host provisioning:
+python add-service.py myapp --port 9000 --no-host-setup
+```

@@ -24,12 +24,15 @@ env | grep -oE '^[A-Z0-9]+_DB_NAME=' | sed 's/_DB_NAME=//' | while read -r APP; 
 
     echo "Provisioning $APP -> database '$db' owned by '$user'"
 
-    psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" <<-EOSQL
-	SELECT 'CREATE ROLE $user LOGIN PASSWORD ''$pw'''
-	    WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '$user')\gexec
-	SELECT 'CREATE DATABASE $db OWNER $user'
-	    WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = '$db')\gexec
-	GRANT ALL PRIVILEGES ON DATABASE $db TO $user;
+    # Pass values as psql variables so format() can quote them correctly:
+    # %I = identifier quoting (double-quotes), %L = literal quoting (single-quotes).
+    psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" \
+        -v "appdb=$db" -v "appuser=$user" -v "apppw=$pw" <<-EOSQL
+	SELECT format('CREATE ROLE %I LOGIN PASSWORD %L', :appuser, :apppw)
+	    WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = :'appuser')\gexec
+	SELECT format('CREATE DATABASE %I OWNER %I', :appdb, :appuser)
+	    WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = :'appdb')\gexec
+	GRANT ALL PRIVILEGES ON DATABASE :"appdb" TO :"appuser";
 EOSQL
 done
 

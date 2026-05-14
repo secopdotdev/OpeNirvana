@@ -6,10 +6,6 @@ general: {
 	log_to_stdout = true
 	server_name = "janus"
 
-	# Token-based API auth — must match server.conf [janus] token in spreed-signaling.
-	token_auth = true
-	token_auth_secret = "${JANUS_API_SECRET}"
-
 	# Admin secret — for the admin REST API exposed at gate.secop.dev via Caddy.
 	admin_secret = "${JANUS_ADMIN_SECRET}"
 }
@@ -23,4 +19,5 @@ nat: {
 	# Advertise the host public IP in ICE candidates so WebRTC peers can reach us.
 	# Required when Janus runs behind NAT (e.g. inside Docker with bridge networking).
 	nat_1_1_mapping = "${HOST_PUBLIC_IP}"
+	full_trickle = true
 }

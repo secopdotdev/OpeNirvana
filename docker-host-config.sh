@@ -6,11 +6,24 @@ set -euo pipefail
 # Colour output helpers.
 c_red()  { printf "\033[31m%s\033[0m\n" "$*"; }
 c_grn()  { printf "\033[32m%s\033[0m\n" "$*"; }
+c_yel()  { printf "\033[33m%s\033[0m\n" "$*"; }
 c_blu()  { printf "\033[34m%s\033[0m\n" "$*"; }
 step()   { printf "\n\033[36m==> %s\033[0m\n" "$*"; }
 
+# Edit a directive in an OpenSSH-style config file in place.
+# Handles commented (#Directive val) and uncommented (Directive val) forms.
+# Appends the directive if absent.
+sshd_config_set() {
+    local file="$1" key="$2" val="$3"
+    if grep -qE "^#?[[:space:]]*${key}[[:space:]]" "$file"; then
+        sed -i -E "s|^#?[[:space:]]*(${key})[[:space:]].*|\1 ${val}|" "$file"
+    else
+        echo "${key} ${val}" >> "$file"
+    fi
+}
+
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ENV_FILE="/dock/conf/.env"
+ENV_FILE="$REPO_DIR/.env"
 CRS_VERSION="v4.7.0"
 
 require_root() {
@@ -174,12 +187,14 @@ create_dock_tree() {
     chown -R 1000:1000 /dock/data/tandoor
     # Vikunja runs as uid 1000. Files dir needs 1000 ownership.
     chown -R 1000:1000 /dock/data/vikunja
-    # ntfy runs as root (uid 0) inside the container but cap_drop:ALL removes
-    # CAP_DAC_OVERRIDE. Dirs owned by docktaetor:media (1010:1010) would be
-    # inaccessible to the containerised root. Own them by root so the process
-    # can read/write without elevated capabilities.
+    # ntfy and AFFiNE run as root (uid 0) with cap_drop:ALL (no DAC_OVERRIDE).
+    # Without DAC_OVERRIDE, the containerised root cannot access dirs owned by
+    # 1010:1010 with mode 770. Own them by root so the process has normal
+    # owner-level access without elevated capabilities.
     chown -R root:root /dock/data/ntfy /dock/conf/ntfy
     chmod -R 755 /dock/data/ntfy /dock/conf/ntfy
+    chown -R root:root /dock/data/affine
+    chmod -R 755 /dock/data/affine
 }
 
 copy_templates() {
@@ -261,7 +276,9 @@ configure_hpb() {
         NC_HPB_SHARED_SECRET="$shared_secret" JANUS_API_SECRET="$janus_api_secret" \
             envsubst '${NC_HPB_HASH_KEY} ${NC_HPB_BLOCK_KEY} ${NC_HPB_SHARED_SECRET} ${JANUS_API_SECRET}' \
             < "$tmpl_dir/spreed-signaling/server.conf" > "$ss_conf.new"
-        install -o 1010 -g 1010 -m 640 "$ss_conf.new" "$ss_conf"
+        # 644: spreed-signaling drops from root to an unprivileged user at startup;
+        # the dropped user needs "other" read access since the file is root:root.
+        install -o root -g root -m 644 "$ss_conf.new" "$ss_conf"
         rm -f "$ss_conf.new"
         c_grn "Rendered spreed-signaling/server.conf"
     fi
@@ -282,7 +299,9 @@ configure_hpb() {
         HOST_PUBLIC_IP="$pub_ip" \
             envsubst '${JANUS_API_SECRET} ${JANUS_ADMIN_SECRET} ${HOST_PUBLIC_IP}' \
             < "$tmpl_dir/janus/janus.jcfg" > "$janus_jcfg.new"
-        install -o 1010 -g 1010 -m 640 "$janus_jcfg.new" "$janus_jcfg"
+        # 644: janus runs as root with cap_drop:ALL; without DAC_OVERRIDE it cannot
+        # read docktaetor-owned files. root:root 644 lets any UID read the config.
+        install -o root -g root -m 644 "$janus_jcfg.new" "$janus_jcfg"
         rm -f "$janus_jcfg.new"
         c_grn "Rendered janus/janus.jcfg (nat_1_1_mapping=${pub_ip:-UNSET})"
     fi
@@ -290,11 +309,15 @@ configure_hpb() {
     # --- janus-gateway/janus.transport.http.jcfg (no template vars) ---
     local janus_http=/dock/conf/janus/janus.transport.http.jcfg
     if [ ! -f "$janus_http" ]; then
-        install -o 1010 -g 1010 -m 640 \
+        # 644: same cap_drop:ALL / no DAC_OVERRIDE reason as janus.jcfg above.
+        install -o root -g root -m 644 \
             "$tmpl_dir/janus/janus.transport.http.jcfg" "$janus_http"
         c_grn "Installed janus/janus.transport.http.jcfg"
     else
-        c_grn "janus/janus.transport.http.jcfg already present."
+        # copy_templates() may have laid this down as 1010:1010 640 — always fix.
+        chown root:root "$janus_http"
+        chmod 644 "$janus_http"
+        c_grn "janus/janus.transport.http.jcfg already present (perms ensured root:root 644)."
     fi
 }
 
@@ -348,8 +371,12 @@ fetch_owasp_crs() {
 ensure_env_file() {
     step "Ensuring .env file..."
     if [ ! -f "$ENV_FILE" ]; then
-        install -D -o 1010 -g 1010 -m 600 "$REPO_DIR/.env.example" "$ENV_FILE"
-        c_grn "Created $ENV_FILE from .env.example"
+        # Copy .env.example; keep ownership with the git-repo owner (SUDO_USER or current),
+        # not with docktaetor, so the user running docker compose can read secrets.
+        local repo_owner
+        repo_owner=$(stat -c '%U' "$REPO_DIR" 2>/dev/null || echo "${SUDO_USER:-$(id -un)}")
+        install -D -o "$repo_owner" -g "$repo_owner" -m 600 "$REPO_DIR/.env.example" "$ENV_FILE"
+        c_grn "Created $ENV_FILE from .env.example (owned by ${repo_owner})"
     fi
 }
 
@@ -381,33 +408,18 @@ resolve_public_ip() {
         return
     fi
 
-    python3 - "$ENV_FILE" "HOST_PUBLIC_IP" "$ip" <<'PYEOF'
-import sys, re
-path, key, val = sys.argv[1], sys.argv[2], sys.argv[3]
-with open(path, 'r') as f:
-    content = f.read()
-new_content = re.sub(
-    rf'^({re.escape(key)}=)\s*$',
-    lambda m: f'{m.group(1)}{val}',
-    content,
-    flags=re.MULTILINE
-)
-if new_content == content:
-    # Line absent (or has trailing comment) — append it.
-    new_content = content.rstrip('\n') + f'\n{key}={val}\n'
-with open(path, 'w') as f:
-    f.write(new_content)
-PYEOF
+    python3 "$REPO_DIR/scripts/gen-secrets.py" "$ENV_FILE" --set "HOST_PUBLIC_IP=$ip"
     c_grn "HOST_PUBLIC_IP resolved and set: $ip"
 }
 
 generate_missing_secrets() {
     step "Generating missing secrets..."
-    # Delegate to gen-secrets.sh which uses a safe character set, handles Wazuh
-    # password complexity requirements, and never overwrites existing values.
-    bash "$REPO_DIR/scripts/gen-secrets.sh" "$ENV_FILE"
+    python3 "$REPO_DIR/scripts/gen-secrets.py" "$ENV_FILE"
     chmod 600 "$ENV_FILE"
-    chown docktaetor:media "$ENV_FILE"
+    # Keep ownership with the repo user so docker compose (running as that user) can read it.
+    local repo_owner
+    repo_owner=$(stat -c '%U' "$REPO_DIR" 2>/dev/null || echo "${SUDO_USER:-$(id -un)}")
+    chown "${repo_owner}:${repo_owner}" "$ENV_FILE"
 }
 
 install_wazuh_agent() {
@@ -423,21 +435,18 @@ install_wazuh_agent() {
         systemctl enable wazuh-agent
     fi
     # Install our custom decoders/rules and localfile config.
-    bash "$REPO_DIR/scripts/wazuh-agent-ingest.sh"
+    python3 "$REPO_DIR/scripts/maintain.py" wazuh
 }
 
 install_cron_jobs() {
     step "Installing cron jobs..."
-    install -m 755 "$REPO_DIR/scripts/pg-backup.sh"           /usr/local/bin/pg-backup.sh
-    install -m 755 "$REPO_DIR/scripts/zeek-intel-refresh.sh"  /usr/local/bin/zeek-intel-refresh.sh
-    cat > /etc/cron.d/unified-stack <<'EOF'
+    cat > /etc/cron.d/unified-stack <<EOF
 # Unified-stack scheduled jobs
 MAILTO=""
 SHELL=/bin/bash
 PATH=/usr/local/bin:/usr/bin:/bin
 
-0 2 * * * root /usr/local/bin/pg-backup.sh           >> /var/log/pg-backup.log 2>&1
-0 3 * * * root /usr/local/bin/zeek-intel-refresh.sh  >> /var/log/zeek-intel.log 2>&1
+0 2 * * * root python3 ${REPO_DIR}/scripts/maintain.py all >> /var/log/maintain.log 2>&1
 EOF
     chmod 644 /etc/cron.d/unified-stack
 }
@@ -472,29 +481,18 @@ harden_sshd() {
     local before
     before=$(md5sum "$cfg" | cut -d' ' -f1)
 
-    # Edit directives in place — handles both commented (#Directive val) and
-    # uncommented (Directive val) forms. Appends the line if not present at all.
-    sshd_set() {
-        local key="$1" val="$2"
-        if grep -qE "^#?[[:space:]]*${key}[[:space:]]" "$cfg"; then
-            sed -i -E "s|^#?[[:space:]]*(${key})[[:space:]].*|\1 ${val}|" "$cfg"
-        else
-            echo "${key} ${val}" >> "$cfg"
-        fi
-    }
-
-    sshd_set SyslogFacility       AUTH
-    sshd_set LogLevel              INFO
-    sshd_set LoginGraceTime        2m
-    sshd_set PermitRootLogin       no
-    sshd_set MaxAuthTries          3
-    sshd_set MaxSessions           5
-    sshd_set AuthorizedKeysFile    ".ssh/authorized_keys"
-    sshd_set AllowAgentForwarding  yes
-    sshd_set PrintLastLog          yes
-    sshd_set X11Forwarding         yes
-    sshd_set PubkeyAuthentication  yes
-    sshd_set HostbasedAuthentication yes
+    sshd_config_set "$cfg" SyslogFacility       AUTH
+    sshd_config_set "$cfg" LogLevel              INFO
+    sshd_config_set "$cfg" LoginGraceTime        2m
+    sshd_config_set "$cfg" PermitRootLogin       no
+    sshd_config_set "$cfg" MaxAuthTries          3
+    sshd_config_set "$cfg" MaxSessions           5
+    sshd_config_set "$cfg" AuthorizedKeysFile    ".ssh/authorized_keys"
+    sshd_config_set "$cfg" AllowAgentForwarding  yes
+    sshd_config_set "$cfg" PrintLastLog          yes
+    sshd_config_set "$cfg" X11Forwarding         yes
+    sshd_config_set "$cfg" PubkeyAuthentication  yes
+    sshd_config_set "$cfg" HostbasedAuthentication yes
 
     # Validate before reloading — bail out rather than lock ourselves out.
     if ! sshd -t -f "$cfg"; then
@@ -546,7 +544,109 @@ EOF
 
 health_tier_recommend() {
     step "Host-tier recommendation..."
-    bash "$REPO_DIR/scripts/health-recommend.sh"
+
+    local cpus mem_gb tier
+    cpus=$(nproc)
+    mem_gb=$(awk '/MemTotal/ {printf "%d\n", $2/1024/1024}' /proc/meminfo)
+
+    if [ "$mem_gb" -ge 48 ] && [ "$cpus" -ge 12 ]; then
+        tier="HIGH"
+    elif [ "$mem_gb" -ge 14 ] && [ "$cpus" -ge 6 ]; then
+        tier="MED"
+    else
+        tier="LOW"
+    fi
+
+    printf "    CPUs: %s\n    RAM:  %s GB\n\nRecommended tier: %s\n\nEdit .env: uncomment the %s tier block, comment the others.\n" \
+        "$cpus" "$mem_gb" "$tier" "$tier"
+}
+
+setup_mfa() {
+    step "MFA setup (TOTP + SSH key hardening)..."
+
+    local mfa_user mfa_home sshd_cfg pam_sshd key_path
+    mfa_user=${SUDO_USER:-$(id -un)}
+    mfa_home=$(getent passwd "$mfa_user" | cut -d: -f6)
+    sshd_cfg=/etc/ssh/sshd_config
+    pam_sshd=/etc/pam.d/sshd
+    key_path="${mfa_home}/.ssh/id_ed25519"
+
+    _mfa_wall_of_shame() {
+        echo
+        c_red "╔══════════════════════════════════════════════════════════════════╗"
+        c_red "║                     ⚠  SECURITY WARNING  ⚠                      ║"
+        c_red "╠══════════════════════════════════════════════════════════════════╣"
+        c_red "║  Password authentication remains enabled on this host.           ║"
+        c_red "║  This makes it susceptible to brute-force and credential-        ║"
+        c_red "║  stuffing attacks.                                                ║"
+        c_red "║                                                                   ║"
+        c_red "║  Re-run docker-host-config.sh when you are ready to disable it.  ║"
+        c_red "╚══════════════════════════════════════════════════════════════════╝"
+        echo
+    }
+
+    # ── TOTP ──────────────────────────────────────────────────────────────────
+    if [ -f "${mfa_home}/.google_authenticator" ]; then
+        c_grn "TOTP already configured for ${mfa_user} — skipping"
+    else
+        c_blu "Running google-authenticator for ${mfa_user}..."
+        c_blu "Scan the QR code with your TOTP app."
+        c_blu "Answer 'y' to update ~/.google_authenticator to proceed with SSH hardening."
+        echo
+        sudo -u "$mfa_user" google-authenticator
+
+        if [ ! -f "${mfa_home}/.google_authenticator" ]; then
+            c_red "${mfa_home}/.google_authenticator not found — TOTP setup was not completed."
+            _mfa_wall_of_shame
+            return
+        fi
+        c_grn "TOTP setup complete."
+    fi
+
+    echo
+    # ── SSH key ───────────────────────────────────────────────────────────────
+    read -r -p "Generate SSH key for ${mfa_user} and display public key? (y/n): " gen_key
+    if [[ "$gen_key" =~ ^[Yy]$ ]]; then
+        install -d -o "$mfa_user" -m 700 "${mfa_home}/.ssh"
+        if [ -f "$key_path" ]; then
+            c_yel "Key already exists at ${key_path} — skipping generation."
+        else
+            sudo -u "$mfa_user" ssh-keygen -t ed25519 -f "$key_path" -N ""
+            c_grn "Key generated."
+        fi
+        echo
+        c_blu "=== Public key — add to ~/.ssh/authorized_keys on connecting clients ==="
+        cat "${key_path}.pub"
+        echo
+
+        # ── Disable password auth ─────────────────────────────────────────────
+        read -r -p "Disable password authentication (key + TOTP only)? (y/n): " disable_pass
+        if [[ "$disable_pass" =~ ^[Yy]$ ]]; then
+            sshd_config_set "$sshd_cfg" PasswordAuthentication         no
+            sshd_config_set "$sshd_cfg" KbdInteractiveAuthentication   yes
+
+            if grep -q 'pam_google_authenticator.so' "$pam_sshd"; then
+                c_grn "pam_google_authenticator.so already in ${pam_sshd}"
+            else
+                echo 'auth required pam_google_authenticator.so' >> "$pam_sshd"
+                c_grn "Added pam_google_authenticator.so to ${pam_sshd}"
+            fi
+
+            if ! sshd -t -f "$sshd_cfg"; then
+                c_red "sshd_config validation failed — NOT restarting. Fix ${sshd_cfg} manually."
+                return 1
+            fi
+
+            systemctl daemon-reload
+            systemctl restart ssh.socket
+            c_grn "SSH restarted. Password authentication is now disabled."
+            c_yel "IMPORTANT: Keep this session open and verify key+TOTP login works in a new terminal before closing."
+        else
+            _mfa_wall_of_shame
+        fi
+    else
+        _mfa_wall_of_shame
+    fi
 }
 
 validate_env() {
@@ -575,7 +675,7 @@ IMPORTANT: Before starting the stack, complete these steps:
        TAILSCALE_AUTHKEY  — from https://login.tailscale.com/admin/settings/keys
        CLOUDFLARE_API_TOKEN — from your Cloudflare API tokens dashboard
 
-  2. All other secrets were generated by gen-secrets.sh above.
+  2. All other secrets were generated by gen-secrets.py above.
      Review ${ENV_FILE} to verify everything looks correct.
 
   3. Bring up the core stack:
@@ -664,8 +764,7 @@ main() {
     health_tier_recommend
     validate_env
     print_summary
-    # MFA setup is interactive — run last so non-interactive steps complete first.
-    bash "$REPO_DIR/scripts/setup-mfa.sh"
+    setup_mfa
 }
 
 main "$@"

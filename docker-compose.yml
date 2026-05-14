@@ -916,7 +916,7 @@ services:
         ipv4_address: 10.0.10.50
       data:
       oidc-clients:
-        ipv4_address: 10.0.17.10
+        ipv4_address: 10.0.17.11
     mem_limit: ${AUTHENTIK_SERVER_MEM_LIMIT:-2g}
     healthcheck:
       test: ["CMD", "ak", "healthcheck"]
@@ -1047,6 +1047,7 @@ services:
       NEXTCLOUD_OIDC_DISCOVERY_URL: ${NEXTCLOUD_OIDC_DISCOVERY_URL:-}
     volumes:
       - ${DOCK_DATA}/nextcloud:/var/www/html
+      - ${DOCK_CONF}/nextcloud/servername.conf:/etc/apache2/conf-enabled/servername.conf:ro
     networks:
       apps:
         ipv4_address: 10.0.15.26
@@ -1126,6 +1127,9 @@ services:
     mem_limit: ${SPREED_SIGNALING_MEM_LIMIT:-256m}
     cap_drop:
       - ALL
+    cap_add:
+      - SETGID
+      - SETUID
     security_opt:
       - no-new-privileges:true
     healthcheck:
@@ -1152,8 +1156,8 @@ services:
     image: ${JANUS_IMAGE:-meetecho/janus-gateway:latest}
     container_name: janus-gateway
     volumes:
-      - ${DOCK_CONF}/janus/janus.jcfg:/etc/janus/janus.jcfg:ro
-      - ${DOCK_CONF}/janus/janus.transport.http.jcfg:/etc/janus/janus.transport.http.jcfg:ro
+      - ${DOCK_CONF}/janus/janus.jcfg:/usr/local/etc/janus/janus.jcfg:ro
+      - ${DOCK_CONF}/janus/janus.transport.http.jcfg:/usr/local/etc/janus/janus.transport.http.jcfg:ro
     ports:
       - "20000-20100:20000-20100/udp"
     networks:
@@ -1165,7 +1169,8 @@ services:
     security_opt:
       - no-new-privileges:true
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8088/janus/info | grep -q janus"]
+      # canyan/janus-gateway has no wget/curl; check HTTP port via /proc/net/tcp6 (hex 1F98 = 8088).
+      test: ["CMD-SHELL", "grep -q '1F98' /proc/net/tcp6 || grep -q '1F98' /proc/net/tcp"]
       interval: 30s
       timeout: 10s
       retries: 5
@@ -1464,7 +1469,7 @@ services:
     volumes:
       - ${DOCK_CONF}/jellyseerr:/app/config
     networks:
-      apps:
+      media:
         ipv4_address: 10.0.14.22
     mem_limit: ${JELLYSEERR_MEM_LIMIT:-512m}
     security_opt:
@@ -1508,7 +1513,7 @@ services:
       - ${DOCK_DATA}/ntfy/cache:/var/cache/ntfy
       - ${DOCK_DATA}/ntfy/data:/var/lib/ntfy
     networks:
-      productivity:
+      apps:
         ipv4_address: 10.0.15.20
     mem_limit: ${NTFY_MEM_LIMIT:-256m}
     security_opt:
@@ -1554,6 +1559,10 @@ services:
       COMMENT_PREF_DEFAULT: "1"
       SHOPPING_MIN_AUTOSYNC_INTERVAL: "5"
       TZ: ${TZ}
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      REDIS_DB: ${REDIS_DB_TANDOOR}
       # OIDC — Django allauth reads these natively at startup.
       # The provider id "authentik" fixes the callback path to
       # /accounts/oidc/authentik/login/callback/ — match this in Authentik.
@@ -1564,10 +1573,11 @@ services:
       - ${DOCK_DATA}/tandoor/media:/opt/recipes/mediafiles
       - ${DOCK_DATA}/tandoor/static:/opt/recipes/staticfiles
     networks:
-      productivity:
+      apps:
         ipv4_address: 10.0.15.21
-      auth:
       data:
+      oidc-clients:
+        ipv4_address: 10.0.17.23
     mem_limit: ${TANDOOR_MEM_LIMIT:-512m}
     cap_drop:
       - ALL
@@ -1613,6 +1623,11 @@ services:
       VIKUNJA_SERVICE_PUBLICURL: https://${VIKUNJA_SUBDOMAIN:-tasks}.${PUBLIC_FQDN}/
       VIKUNJA_SERVICE_TIMEZONE: ${TZ}
       VIKUNJA_LOG_LEVEL: info
+      VIKUNJA_KEYVALUE_TYPE: memory
+      VIKUNJA_REDIS_HOST: redis
+      VIKUNJA_REDIS_PORT: "6379"
+      VIKUNJA_REDIS_PASSWORD: ${REDIS_PASSWORD}
+      VIKUNJA_REDIS_DB: ${REDIS_DB_VIKUNJA}
       # OIDC — Vikunja reads these natively at startup. The provider key
       # "AUTHENTIK" determines the redirect URI path segment (/auth/openid/authentik).
       VIKUNJA_AUTH_OPENID_ENABLED: "true"
@@ -1625,10 +1640,11 @@ services:
     volumes:
       - ${DOCK_DATA}/vikunja:/app/vikunja/files
     networks:
-      productivity:
+      apps:
         ipv4_address: 10.0.15.22
-      auth:
       data:
+      oidc-clients:
+        ipv4_address: 10.0.17.22
     mem_limit: ${VIKUNJA_MEM_LIMIT:-512m}
     security_opt:
       - no-new-privileges:true
@@ -1659,14 +1675,12 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      redis:
+      redis-affine:
         condition: service_healthy
     environment:
       DATABASE_URL: postgresql://${AFFINE_DB_USER}:${AFFINE_DB_PASSWORD}@postgres:5432/${AFFINE_DB_NAME}
-      REDIS_SERVER_HOST: redis
+      REDIS_SERVER_HOST: redis-affine
       REDIS_SERVER_PORT: "6379"
-      REDIS_SERVER_PASSWORD: ${REDIS_PASSWORD}
-      REDIS_SERVER_DATABASE: ${REDIS_DB_AFFINE:-2}
       AFFINE_SERVER_EXTERNAL_URL: https://${AFFINE_SUBDOMAIN:-affine}.${PUBLIC_FQDN}
       AFFINE_SERVER_HOST: "0.0.0.0"
       AFFINE_SERVER_PORT: "3010"
@@ -1680,10 +1694,11 @@ services:
       - ${DOCK_DATA}/affine/config:/root/.affine/config
       - ${DOCK_DATA}/affine/storage:/root/.affine/storage
     networks:
-      productivity:
+      apps:
         ipv4_address: 10.0.15.23
-      auth:
       data:
+      oidc-clients:
+        ipv4_address: 10.0.17.21
     mem_limit: ${AFFINE_MEM_LIMIT:-2g}
     security_opt:
       - no-new-privileges:true
@@ -1698,6 +1713,46 @@ services:
     restart: unless-stopped
     labels:
       - autoheal=true
+    logging: *default-logging
+
+  # ==========================================================
+  # redis-affine — Dedicated Redis for AFFiNE.
+  # AFFiNE requires noeviction policy (it uses Redis as a primary
+  # key-value store, not a cache). The shared redis uses allkeys-lru
+  # which causes AFFiNE to warn and potentially lose data under memory
+  # pressure. Isolated to the apps network; no password needed.
+  # ==========================================================
+  redis-affine:
+    image: redis:7-alpine
+    container_name: redis-affine
+    profiles: [apps]
+    command:
+      - redis-server
+      - --maxmemory-policy
+      - noeviction
+      - --protected-mode
+      - "no"
+    networks:
+      apps:
+        ipv4_address: 10.0.15.27
+    mem_limit: ${REDIS_AFFINE_MEM_LIMIT:-512m}
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+    cap_drop:
+      - ALL
+    cap_add:
+      - SETUID
+      - SETGID
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
     logging: *default-logging
 
   # ==========================================================
@@ -1872,9 +1927,11 @@ services:
       - ${DOCK_DATA}/immich/upload:/usr/src/app/upload
       - /etc/localtime:/etc/localtime:ro
     networks:
-      productivity:
+      apps:
         ipv4_address: 10.0.15.24
       data:
+      oidc-clients:
+        ipv4_address: 10.0.17.24
     mem_limit: ${IMMICH_SERVER_MEM_LIMIT:-2g}
     security_opt:
       - no-new-privileges:true
@@ -1896,7 +1953,7 @@ services:
     volumes:
       - ${DOCK_DATA}/immich/model-cache:/cache
     networks:
-      - productivity
+      - apps
     mem_limit: ${IMMICH_ML_MEM_LIMIT:-2g}
     security_opt:
       - no-new-privileges:true
@@ -1941,7 +1998,7 @@ services:
     volumes:
       - ${DOCK_DATA}/n8n:/home/node/.n8n
     networks:
-      productivity:
+      apps:
         ipv4_address: 10.0.15.25
       data:
     mem_limit: ${N8N_MEM_LIMIT:-1g}

@@ -650,7 +650,7 @@ IMMICH  (OAuth via system-config API)
 
 Step 1: (if auto-config was skipped) Get an admin API key
   Immich → Account Settings → API Keys → New API Key → copy key
-  Set IMMICH_API_KEY in /dock/conf/.env, then re-run setup-oidc.py.
+  Set IMMICH_API_KEY in unified-stack/.env, then re-run setup-oidc.py.
 
   Or apply manually with curl:
 

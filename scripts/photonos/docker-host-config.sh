@@ -6,6 +6,9 @@
 # Photon-native tooling: tdnf for packages, rpm for queries, iptables for the
 # firewall, and sshd.service for SSH.
 #
+# On a Photon OS *Minimal* install, run bootstrap-photonos-minimal.sh first to
+# install the userland tools (curl, tar, grep, ...) this script depends on.
+#
 # Idempotent: safe to re-run. Never overwrites existing user data or .env values.
 set -euo pipefail
 

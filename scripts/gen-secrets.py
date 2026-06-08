@@ -6,7 +6,7 @@ secure random values. Safe character set: A-Za-z0-9 plus - and _
 parsing or application password validators).
 
 Usage:
-    python3 scripts/gen-secrets.py [path/to/.env] [--apply]
+    python3 scripts/gen-secrets.py [path/to/.env] [--apply] [--target {env,bao}]
 
     --apply   After generating secrets, apply them to the running stack:
                 - Updates Postgres user passwords (ALTER ROLE)
@@ -14,17 +14,42 @@ Usage:
                 - Restarts wazuh-dashboard to rebuild its keystore
               Requires the stack to already be running.
 
+    --target env  (default) Write generated secrets into .env (existing behaviour).
+    --target bao  Seed generated secrets into OpenBao KV v2, write-if-absent.
+                  Reads BAO_ADDR from the environment; root token from
+                  ${DOCK_CONF}/openbao/init.json or the BAO_TOKEN env var.
+                  Container-issued keys (CrowdSec bouncer, Authentik outpost token)
+                  are always written to .env only — they require the running stack
+                  and cannot be seeded into KV at bootstrap time.
+
 Existing non-empty values are NEVER overwritten. Run again safely at any time.
 """
 
 import argparse
+import json
+import os
 import re
 import secrets
 import string
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+# grp is Linux/macOS only; guard so the module can be imported on Windows (tests, dev).
+try:
+    import grp as _grp_module  # type: ignore[import-not-found]
+    _GRP_AVAILABLE = True
+except ImportError:
+    _grp_module = None  # type: ignore[assignment]
+    _GRP_AVAILABLE = False
+
+if TYPE_CHECKING:
+    from bao_client import BaoClient as _BaoClientType
+
+from secrets_provider import BaoProvider, EnvFileProvider, SecretsProvider
 
 # ── Secret generation ──────────────────────────────────────────────────────────
 
@@ -46,15 +71,54 @@ def wazuh_secret(n: int = 28) -> str:
     return gen_secret(n) + "_W"
 
 
+def docker_gid() -> str:
+    """Return the GID of the host 'docker' group as a string.
+
+    Alloy needs this GID in group_add so it can read /var/run/docker.sock.
+    Docker's installer assigns the GID dynamically; it varies across distros
+    and installation scenarios, so we detect it at gen-secrets time and pin
+    the result in .env rather than hard-coding in docker-compose.yml.
+    """
+    if not _GRP_AVAILABLE:
+        return ""  # Not on Linux/macOS; leave blank so compose uses its default.
+    try:
+        import grp  # noqa: PLC0415 — imported here because it's Linux-only
+        return str(grp.getgrnam("docker").gr_gid)  # type: ignore[attr-defined]
+    except KeyError:
+        return ""   # docker not installed yet; leave blank so compose uses its default
+
+
 # ── .env file helpers ──────────────────────────────────────────────────────────
 
 def _read(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
+def _atomic_write(path: Path, text: str) -> None:
+    """Crash-safe write: temp file in the same dir + os.replace (never partial-write)."""
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".env.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+
+
 def _get_value(content: str, key: str) -> str:
     m = re.search(rf"^{re.escape(key)}=(.*)$", content, re.MULTILINE)
-    return m.group(1).strip().rstrip("\r") if m else ""
+    if not m:
+        return ""
+    raw = m.group(1).rstrip("\r")
+    # Strip inline comments the same way Docker Compose does: ' #' or '\t#' starts a comment.
+    raw = re.sub(r"\s+#.*$", "", raw)
+    return raw.strip()
 
 
 def set_if_empty(path: Path, key: str, value: str) -> None:
@@ -62,17 +126,122 @@ def set_if_empty(path: Path, key: str, value: str) -> None:
     if _get_value(content, key):
         print(f"  SKIP {key} (already set)")
         return
-    # Fill a blank KEY= line in-place, or append if the key is absent entirely.
-    new = re.sub(
-        rf"^({re.escape(key)}=)\s*$",
+    # Fill a blank KEY= line in-place — tolerate a trailing inline comment on the
+    # blank line (e.g. `KEY=   # hint`), matching utils.EnvFile.set_if_blank. Without
+    # the optional `(#...)?` group, a commented-blank line is not matched and the
+    # value is wrongly *appended* as a duplicate; env_get (awk, first-match) then
+    # reads the original empty+commented line, silently losing the value
+    # (the HOST_PUBLIC_IP → empty nat_1_1_mapping / broken-WebRTC bug).
+    new, count = re.subn(
+        rf"^({re.escape(key)}=)\s*(#[^\n]*)?\s*$",
         lambda m: f"{m.group(1)}{value}",
         content,
         flags=re.MULTILINE,
     )
-    if new == content:
+    if not count:
         new = content.rstrip("\n") + f"\n{key}={value}\n"
-    path.write_text(new, encoding="utf-8")
+    _atomic_write(path, new)
     print(f"  SET  {key}")
+
+
+# ── OpenBao target helpers ─────────────────────────────────────────────────────
+
+def _resolve_bao_token(env_path: Path) -> str:
+    """Return a root token for OpenBao.
+
+    Preference order:
+      1. BAO_TOKEN environment variable (explicit override).
+      2. ${DOCK_CONF}/openbao/init.json next to the .env (standard escrow location).
+      3. init.json in the same directory as the .env (fallback for non-standard layouts).
+
+    Raises RuntimeError if no token can be found.
+    """
+    # 1. Explicit env override.
+    token_env = os.environ.get("BAO_TOKEN", "")
+    if token_env:
+        return token_env
+
+    # 2. Derive path from DOCK_CONF entry in the .env file itself.
+    try:
+        content = _read(env_path)
+        dock_conf = _get_value(content, "DOCK_CONF")
+        if dock_conf:
+            candidate = Path(dock_conf) / "openbao" / "init.json"
+            if candidate.exists():
+                data = json.loads(candidate.read_text(encoding="utf-8"))
+                token = data.get("root_token", "")
+                if token:
+                    return token
+    except Exception:  # noqa: BLE001  — best-effort; fall through
+        pass
+
+    # 3. Sibling init.json (non-standard / dev layout).
+    candidate2 = env_path.parent / "openbao" / "init.json"
+    if candidate2.exists():
+        data2 = json.loads(candidate2.read_text(encoding="utf-8"))
+        token2 = data2.get("root_token", "")
+        if token2:
+            return token2
+
+    raise RuntimeError(
+        "Cannot resolve OpenBao root token. "
+        "Set BAO_TOKEN env var or ensure init.json exists at "
+        "${DOCK_CONF}/openbao/init.json (run bao-bootstrap.py first)."
+    )
+
+
+def _make_provider(target: str, env_path: Path) -> "SecretsProvider":
+    """Return the appropriate SecretsProvider for the given --target value."""
+    if target == "bao":
+        return BaoProvider(_build_bao_client(env_path))
+    return EnvFileProvider(env_path)
+
+
+def _build_bao_client(env_path: Path) -> "_BaoClientType":
+    """Import BaoClient (hvac-backed adapter) and return an authenticated instance."""
+    # Defer import so that --target env (the default) never requires hvac to be installed.
+    try:
+        from bao_client import BaoClient  # type: ignore[import-not-found]
+    except ImportError as exc:
+        raise ImportError(
+            "bao_client / hvac not importable. Ensure host bootstrap ran "
+            "(install_python_packages installs hvac) or run `pip install hvac`."
+        ) from exc
+
+    addr = os.environ.get("BAO_ADDR", "http://127.0.0.1:8200")
+    token = _resolve_bao_token(env_path)
+    return BaoClient(addr, token=token)
+
+
+def _emit(
+    spec: "list[tuple[str, str]]",
+    target: str,
+    env_path: Path,
+    bao: "object | None" = None,
+) -> None:
+    """Dispatch a secrets spec to either the .env file or OpenBao KV v2.
+
+    Args:
+        spec:     List of (KEY, generated_value) pairs.
+        target:   ``"env"`` (write .env) or ``"bao"`` (seed KV write-if-absent).
+        env_path: Path to the .env file.
+        bao:      BaoClient instance; required when *target* is ``"bao"``.
+    """
+    if target == "bao":
+        if bao is None:
+            raise ValueError("_emit called with target='bao' but no BaoClient provided")
+        # bao_client is imported at this point; access kv_get/kv_put via the object.
+        for key, value in spec:
+            path = key.lower()  # KV path is the lower-cased key name
+            existing = bao.kv_get(path)  # type: ignore[union-attr]
+            if existing:
+                print(f"  SKIP {key} (already in bao:{path})")
+                continue
+            bao.kv_put(path, {"value": value})  # type: ignore[union-attr]
+            print(f"  SET  bao:{path}")
+    else:
+        for key, value in spec:
+            set_if_empty(env_path, key, value)
 
 
 # ── Docker helpers ─────────────────────────────────────────────────────────────
@@ -95,7 +264,7 @@ def _docker_exec(container: str, *cmd: str) -> subprocess.CompletedProcess:
 # ── Container-issued keys ──────────────────────────────────────────────────────
 
 def fetch_crowdsec_key(env_path: Path) -> None:
-    key = "CROWDSEC_BOUNCER_KEY"
+    key = "CROWDSEC_BOUNCER_API_KEY"
     if _get_value(_read(env_path), key):
         print(f"  SKIP {key} (already set)")
         return
@@ -213,14 +382,32 @@ def apply_secrets(env_path: Path) -> None:
         print("  SKIP     Postgres not running — start stack first, then re-run with --apply")
 
     # Wazuh: delete the security-init flag so the next bring-up re-seeds OpenSearch.
+    # The flag file is created and owned by the wazuh-security-init container (root
+    # inside the container, restricted perms on the host). When this script runs as
+    # an unprivileged user (typical for run.sh -y), os.stat() on the file raises
+    # PermissionError. Treat that as "we cannot manage the flag here" and fall back
+    # to a container-side removal via docker exec; if that also fails, skip gracefully.
     dock_conf = val("DOCK_CONF")
     if dock_conf:
         flag = Path(dock_conf) / "wazuh/certs/.security-initialized"
-        if flag.exists():
-            flag.unlink()
-            print(f"  REMOVED  {flag} (wazuh-security-init will re-seed on next up)")
-        else:
-            print("  SKIP     wazuh-security-init flag not present (already clean)")
+        try:
+            if flag.exists():
+                flag.unlink()
+                print(f"  REMOVED  {flag} (wazuh-security-init will re-seed on next up)")
+            else:
+                print("  SKIP     wazuh-security-init flag not present (already clean)")
+        except PermissionError:
+            # Fall back to container-side rm — the wazuh-manager container has the
+            # volume mounted and runs as root inside.
+            r = subprocess.run(
+                ["docker", "exec", "wazuh-manager", "rm", "-f",
+                 "/etc/wazuh-indexer/certs/.security-initialized"],
+                capture_output=True, text=True,
+            )
+            if r.returncode == 0:
+                print(f"  REMOVED  {flag} via docker exec wazuh-manager (host perms denied)")
+            else:
+                print(f"  SKIP     cannot manage {flag} (host: PermissionError; container: rc={r.returncode}) — wazuh-security-init may not re-seed")
 
     # Re-run wazuh-security-init, then restart wazuh-dashboard to rebuild its keystore.
     compose_file = env_path.parent / "docker-compose.yml"
@@ -278,6 +465,17 @@ def main() -> None:
                         help="Apply new secrets to the running stack after generating")
     parser.add_argument("--set", metavar="KEY=VALUE",
                         help="Set a single key if currently empty; skip full secret generation")
+    parser.add_argument(
+        "--target",
+        choices=["env", "bao"],
+        default="env",
+        help=(
+            "Where to write generated secrets. "
+            "'env' (default): write into .env (existing behaviour). "
+            "'bao': seed into OpenBao KV v2, write-if-absent. "
+            "Container-issued keys are always .env-only regardless of --target."
+        ),
+    )
     args = parser.parse_args()
 
     env_path = Path(args.env_file)
@@ -289,64 +487,92 @@ def main() -> None:
         set_if_empty(env_path, key.strip(), value)
         return
 
-    print(f"Generating secrets for: {env_path}")
+    target: str = args.target
+
+    # Build the provider eagerly so we fail fast before generating any secrets
+    # (avoids generating values we can't store if the backend is unreachable).
+    provider = _make_provider(target, env_path)
+
+    print(f"Generating secrets for: {env_path}  [target={target}]")
     print()
 
-    # Postgres
-    set_if_empty(env_path, "POSTGRES_SUPERUSER_PASSWORD", gen_secret(30))
+    # ── Build the secrets spec ─────────────────────────────────────────────────
+    # Each entry is (KEY, generated_value). Order is preserved for display.
+    # All entries go through _emit() which handles both .env and bao targets.
+    secrets_spec: list[tuple[str, str]] = [
+        # Postgres
+        ("POSTGRES_SUPERUSER_PASSWORD", gen_secret(30)),
 
-    # Redis
-    set_if_empty(env_path, "REDIS_PASSWORD", gen_secret(30))
+        # Redis
+        ("REDIS_PASSWORD", gen_secret(30)),
 
-    # Wazuh — requires upper + lower + digit + special; _W suffix covers special.
-    set_if_empty(env_path, "WAZUH_API_PASSWORD",                  wazuh_secret(28))
-    set_if_empty(env_path, "WAZUH_INDEXER_ADMIN_PASSWORD",        wazuh_secret(28))
-    set_if_empty(env_path, "WAZUH_INDEXER_KIBANASERVER_PASSWORD", wazuh_secret(28))
+        # Wazuh — requires upper + lower + digit + special; _W suffix covers special.
+        ("WAZUH_API_PASSWORD",                  wazuh_secret(28)),
+        ("WAZUH_INDEXER_ADMIN_PASSWORD",        wazuh_secret(28)),
+        ("WAZUH_INDEXER_KIBANASERVER_PASSWORD", wazuh_secret(28)),
 
-    # Authentik — 50-char secret key is the Authentik recommendation.
-    set_if_empty(env_path, "AUTHENTIK_SECRET_KEY",         gen_secret(50))
-    set_if_empty(env_path, "AUTHENTIK_BOOTSTRAP_PASSWORD", gen_secret(30))
-    set_if_empty(env_path, "AUTHENTIK_BOOTSTRAP_TOKEN",    gen_secret(30))
-    set_if_empty(env_path, "AUTHENTIK_DB_PASSWORD",        gen_secret(30))
+        # Authentik — 50-char secret key is the Authentik recommendation.
+        ("AUTHENTIK_SECRET_KEY",         gen_secret(50)),
+        ("AUTHENTIK_BOOTSTRAP_PASSWORD", gen_secret(30)),
+        ("AUTHENTIK_BOOTSTRAP_TOKEN",    gen_secret(30)),
+        ("AUTHENTIK_DB_PASSWORD",        gen_secret(30)),
 
-    # Nextcloud
-    set_if_empty(env_path, "NEXTCLOUD_DB_PASSWORD",    gen_secret(30))
-    set_if_empty(env_path, "NEXTCLOUD_ADMIN_PASSWORD", gen_secret(30))
+        # Nextcloud
+        ("NEXTCLOUD_DB_PASSWORD",    gen_secret(30)),
+        ("NEXTCLOUD_ADMIN_PASSWORD", gen_secret(30)),
 
-    # Coturn
-    set_if_empty(env_path, "COTURN_SECRET", gen_secret(30))
+        # Coturn
+        ("COTURN_SECRET", gen_secret(30)),
 
-    # HPB (Nextcloud Talk High-Performance Backend)
-    # NC_HPB_SHARED_SECRET must not change after configuring Nextcloud Talk —
-    # it is entered manually in the Talk admin settings and cannot be auto-updated.
-    set_if_empty(env_path, "NC_HPB_SHARED_SECRET", gen_secret(30))
-    set_if_empty(env_path, "NC_HPB_HASH_KEY",      gen_hex(64))    # HMAC-SHA256; any length
-    set_if_empty(env_path, "NC_HPB_BLOCK_KEY",     gen_secret(32)) # AES-256; exactly 32 bytes
-    set_if_empty(env_path, "JANUS_API_SECRET",     gen_secret(30))
-    set_if_empty(env_path, "JANUS_ADMIN_SECRET",   gen_secret(30))
+        # HPB (Nextcloud Talk High-Performance Backend)
+        # NC_HPB_SHARED_SECRET must not change after configuring Nextcloud Talk —
+        # it is entered manually in the Talk admin settings and cannot be auto-updated.
+        ("NC_HPB_SHARED_SECRET", gen_secret(30)),
+        ("NC_HPB_HASH_KEY",      gen_hex(64)),    # HMAC-SHA256; any length
+        ("NC_HPB_BLOCK_KEY",     gen_secret(32)), # AES-256; exactly 32 bytes
+        ("JANUS_API_SECRET",     gen_secret(30)),
+        ("JANUS_ADMIN_SECRET",   gen_secret(30)),
 
-    # Tandoor — SECRET_KEY must not change after first run (encrypts sessions).
-    set_if_empty(env_path, "TANDOOR_DB_PASSWORD", gen_secret(30))
-    set_if_empty(env_path, "TANDOOR_SECRET_KEY",  gen_secret(50))
+        # Tandoor — SECRET_KEY must not change after first run (encrypts sessions).
+        ("TANDOOR_DB_PASSWORD", gen_secret(30)),
+        ("TANDOOR_SECRET_KEY",  gen_secret(50)),
 
-    # Vikunja — JWT_SECRET must not change after first run (signs user tokens).
-    set_if_empty(env_path, "VIKUNJA_DB_PASSWORD", gen_secret(30))
-    set_if_empty(env_path, "VIKUNJA_JWT_SECRET",  gen_secret(50))
+        # Vikunja — JWT_SECRET must not change after first run (signs user tokens).
+        ("VIKUNJA_DB_PASSWORD", gen_secret(30)),
+        ("VIKUNJA_JWT_SECRET",  gen_secret(50)),
 
-    # AFFiNE
-    set_if_empty(env_path, "AFFINE_DB_PASSWORD", gen_secret(30))
+        # AFFiNE
+        ("AFFINE_DB_PASSWORD", gen_secret(30)),
 
-    # Dockhand
-    set_if_empty(env_path, "DOCKHAND_ENCRYPTION_KEY", gen_secret(32))
+        # Grafana — admin password is break-glass only; all logins go through Authentik SSO.
+        ("GRAFANA_ADMIN_PASSWORD", gen_secret(24)),
 
-    # Immich
-    set_if_empty(env_path, "IMMICH_DB_PASSWORD", gen_secret(30))
+        # Docker socket GID — varies by distro/installer; detected at setup time so
+        # docker-compose.yml can reference ${DOCKER_GID} without hard-coding a GID.
+        ("DOCKER_GID", docker_gid()),
 
-    # n8n — ENCRYPTION_KEY must not change after first run (encrypts stored credentials).
-    set_if_empty(env_path, "N8N_DB_PASSWORD",    gen_secret(30))
-    set_if_empty(env_path, "N8N_ENCRYPTION_KEY", gen_secret(32))
+        # Dockhand
+        ("DOCKHAND_ENCRYPTION_KEY", gen_secret(32)),
 
-    # Container-issued keys — require the stack to be running.
+        # Immich
+        ("IMMICH_DB_PASSWORD", gen_secret(30)),
+
+        # n8n — ENCRYPTION_KEY must not change after first run (encrypts stored credentials).
+        ("N8N_DB_PASSWORD",    gen_secret(30)),
+        ("N8N_ENCRYPTION_KEY", gen_secret(32)),
+    ]
+
+    # Dispatch the spec through the provider (write-if-blank semantics).
+    for key, value in secrets_spec:
+        provider.set_if_blank(key, value)
+
+    # Container-issued keys — require the running stack; always .env-only.
+    # These keys are issued by containers at runtime (cscli, Authentik server) and
+    # cannot be generated offline. They are excluded from --target bao deliberately:
+    # seeding would require the stack to already be up, which defeats the bootstrap
+    # order (bootstrap → seed → compose up). They are written to .env regardless of
+    # --target so the stack can start correctly.
+    #
     # CrowdSec bouncer key: issued by cscli; timestamped name avoids collisions on re-runs.
     fetch_crowdsec_key(env_path)
 

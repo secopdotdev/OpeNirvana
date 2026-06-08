@@ -1,0 +1,17 @@
+# Development / TEST dependencies (what the test suite + type checker need).
+#
+# Most of unified-stack/scripts/ is stdlib-only, but ADR-0002/0003 permit a few
+# controlled runtime deps installed on the host by
+# docker-host-config.sh:install_python_packages() (hvac, msal, dtop). The test
+# suite imports the Python-importable ones, so they must be present just to
+# COLLECT the suite — without them pytest errors out before running a single test:
+#   - hvac: bao_client.py / test_bao_client.py (+ bao_sync, secrets_provider)
+#   - msal: utils_entra.py / test_setup_entra.py
+# Keeping these declared here (not ad-hoc `pip install`) is what makes the CI gate
+# reproducible. (dtop is a TUI, never imported by tests — intentionally omitted.)
+
+pytest>=8,<9
+pyright>=1.1.400
+PyYAML>=6,<7        # test_gen_dashy.py validates that rendered dashy config parses as YAML
+hvac>=2.4,<3        # OpenBao/Vault client (ADR 0002) — imported by bao_client + tests
+msal>=1.37,<2       # Microsoft Entra ID federation — imported by utils_entra + tests

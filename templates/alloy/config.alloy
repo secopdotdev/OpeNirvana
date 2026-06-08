@@ -1,0 +1,51 @@
+// Discover all running Docker containers via the Docker API.
+discovery.docker "containers" {
+  host = "unix:///var/run/docker.sock"
+}
+
+// Define relabeling rules: strip the leading "/" from the container name
+// and promote the log stream (stdout/stderr) to a label.
+discovery.relabel "containers" {
+  targets = []
+
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_log_stream"]
+    target_label  = "stream"
+  }
+}
+
+// Tail logs from every discovered container and apply the relabeling rules.
+loki.source.docker "containers" {
+  host          = "unix:///var/run/docker.sock"
+  targets       = discovery.docker.containers.targets
+  forward_to    = [loki.write.default.receiver]
+  relabel_rules = discovery.relabel.containers.rules
+}
+
+// ── Image-version updates ─────────────────────────────────────────────────
+// Tail the JSONL that check-versions.py writes (one object per service per run)
+// and ship it to Loki under job="image-updates" for the Grafana updates table.
+local.file_match "version_check" {
+  path_targets = [{
+    __path__ = "/var/log/version-check/updates.jsonl",
+    job      = "image-updates",
+  }]
+}
+
+loki.source.file "version_check" {
+  targets    = local.file_match.version_check.targets
+  forward_to = [loki.write.default.receiver]
+}
+
+// Push collected logs to Loki on the monitoring network.
+loki.write "default" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}

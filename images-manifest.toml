@@ -1,0 +1,98 @@
+# Image digest pins — security/observability core (Rec 6).
+#
+# Adapted from prod-host infra/registry/images-manifest.yaml. openirvana uses
+# TOML, not YAML, because the stdlib-only invariant (ADR-0001) forbids a YAML parser
+# in unified-stack/scripts/; tomllib is stdlib and matches the profiles.toml SoT
+# (ADR-0003/0004). This manifest is the SOURCE OF TRUTH for the pinned digests of the
+# security/observability core — the highest-blast-radius images, which run on :latest
+# today (finding V3: 27 unpinned, 0 digest pins).
+#
+# Each entry freezes the index (multi-arch manifest-list) digest of the listed ref, so
+# a mutated upstream tag deploys a DIFFERENT image only with a detectable digest change.
+#
+# Refresh (when a deliberate update is wanted):
+#   docker buildx imagetools inspect <ref> --format '{{.Manifest.Digest}}'
+#   then update `digest` below.  (A `make pin-refresh` target is a planned follow-up.)
+#
+# Verify the deployed containers still match these pins:
+#   python3 unified-stack/scripts/check-versions.py --verify-pins
+#
+# Scope note: this is the CORE-FIRST set (user decision). The remaining ~13 unpinned
+# images are a follow-up; pinning the security/observability core first maximises
+# reproducibility where a supply-chain swap would do the most damage.
+
+[meta]
+scope = "security-observability-core"
+generated = "2026-06-05"
+digest_kind = "index"  # multi-arch manifest-list digest
+
+[[image]]
+service = "crowdsec"
+ref     = "crowdsecurity/crowdsec:latest"
+digest  = "sha256:2f527c9bb8b367120eb08b82890aa912ce96bfa1ada93dda0721700e4b4e0dde"
+
+[[image]]
+service = "falco"
+ref     = "falcosecurity/falco:latest"
+digest  = "sha256:288c8dd795834ee660d7adfb7d66db525a24a0b78c1f125155f8e237677c030c"
+
+[[image]]
+service = "falcosidekick"
+ref     = "falcosecurity/falcosidekick:latest"
+digest  = "sha256:f975158dd7e177bc10778e89998629416834e525f702ca434532851b70605cb4"
+
+[[image]]
+service = "falcosidekick-ui"
+ref     = "falcosecurity/falcosidekick-ui:latest"
+digest  = "sha256:e566e3667f1ca19ac402ed7106c43a50b36cd2298ab57a300d4bb473506dfe69"
+
+[[image]]
+service = "vector"
+ref     = "timberio/vector:latest-alpine"
+digest  = "sha256:32fd554fdd6dc3c17b5ec8e983e9889f37b0c87fa3c8cc28aa318d69cf34d392"
+
+[[image]]
+service = "grafana"
+ref     = "grafana/grafana-oss:latest"
+digest  = "sha256:5dad0df181cb644a14e13617b913b261a54f7d4fd4510721dba420929f35bea2"
+
+[[image]]
+service = "prometheus"
+ref     = "prom/prometheus:latest"
+digest  = "sha256:69f5241418838263316593f7274a304b095c40bcf22e57272865da91bd60a8ac"
+
+[[image]]
+service = "cadvisor"
+ref     = "gcr.io/cadvisor/cadvisor:latest"
+digest  = "sha256:3de2bd5203120b866d74a9b283b2ffb8ec382fbf9dc321814700c6ea6f44ec57"
+
+[[image]]
+service = "node-exporter"
+ref     = "prom/node-exporter:latest"
+digest  = "sha256:e9cff4fc67b1818f8c97adb115b9f12c9a54b533de86765d4a0effc01b357205"
+
+[[image]]
+service = "postgres-exporter"
+ref     = "prometheuscommunity/postgres-exporter:latest"
+digest  = "sha256:e96064f876226d94bb6ce48a4c4b3dd76edba91168ec1ab024e5c4b959310b0f"
+
+[[image]]
+service = "alertmanager"
+ref     = "prom/alertmanager:v0.28.0"
+digest  = "sha256:d5155cfac40a6d9250ffc97c19db2c5e190c7bc57c6b67125c94903358f8c7d8"
+
+[[image]]
+service = "loki"
+ref     = "grafana/loki:3.5.0"
+digest  = "sha256:4c431d2e6b9b38718694b31c5d56be7c80dc69c513215fde1aeb5b02cd4e2665"
+
+[[image]]
+service = "alloy"
+ref     = "grafana/alloy:v1.9.1"
+digest  = "sha256:b5fc87ff9a8941d6ed3ae5f099d9cb8598b3cd42fef9a8af128ed782258b4017"
+
+[[image]]
+service = "redis-exporter"
+ref     = "oliver006/redis_exporter:v1.83.0"
+digest  = "sha256:e8c209894d4c0cc55b1259ddd47e0b769ad1ff864b356736ee885462a3b0e48c"
+

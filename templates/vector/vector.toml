@@ -1,0 +1,92 @@
+# Vector log pipeline: Caddy access logs + Coraza WAF events → ClickHouse
+# Runs inside the security network; reaches ClickHouse via HTTP on port 8123.
+
+[api]
+enabled = true
+address = "0.0.0.0:8686"
+
+# ─── Sources ────────────────────────────────────────────────────────────────
+
+[sources.caddy_access_log]
+type        = "file"
+include     = ["/var/log/caddy/access.log"]
+read_from   = "beginning"
+data_dir    = "/var/lib/vector"
+
+[sources.coraza_audit_log]
+type        = "file"
+include     = ["/var/log/caddy/coraza-audit.log"]
+read_from   = "beginning"
+data_dir    = "/var/lib/vector"
+
+# ─── Transforms ─────────────────────────────────────────────────────────────
+
+[transforms.parse_access]
+type   = "remap"
+inputs = ["caddy_access_log"]
+drop_on_error = true
+source = '''
+  parsed, err = parse_json(.message)
+  if err != null { abort }
+  . = {
+    "ts":           format_timestamp!(from_unix_timestamp!(to_int!(parsed.ts)), format: "%Y-%m-%d %H:%M:%S"),
+    "request_host": string(parsed.request.host) ?? "",
+    "request_uri":  string(parsed.request.uri) ?? "",
+    "method":       string(parsed.request.method) ?? "",
+    "status":       to_int(parsed.status) ?? 0,
+    "duration":     to_float(parsed.duration) ?? 0.0,
+    "bytes_sent":   to_int(parsed.size) ?? 0,
+    "client_ip":    string(parsed.request.remote_ip) ?? "",
+    "user_agent":   string(parsed.request.headers."User-Agent"[0]) ?? "",
+    "request_id":   string(parsed.request.id) ?? ""
+  }
+'''
+
+[transforms.parse_coraza]
+type   = "remap"
+inputs = ["coraza_audit_log"]
+drop_on_error = true
+source = '''
+  parsed, err = parse_json(.message)
+  if err != null { abort }
+  . = {
+    "ts":          format_timestamp!(from_unix_timestamp!(to_int!(parsed.timestamp)), format: "%Y-%m-%d %H:%M:%S"),
+    "client_ip":   string(parsed.client_ip) ?? "",
+    "rule_id":     to_int(parsed.rule_id) ?? 0,
+    "rule_msg":    string(parsed.rule_message) ?? "",
+    "severity":    string(parsed.severity) ?? "unknown",
+    "request_uri": string(parsed.uri) ?? "",
+    "method":      string(parsed.method) ?? "",
+    "action":      string(parsed.action) ?? ""
+  }
+'''
+
+# ─── Sinks ──────────────────────────────────────────────────────────────────
+
+[sinks.clickhouse_access]
+type          = "clickhouse"
+inputs        = ["parse_access"]
+endpoint      = "http://clickhouse:8123"
+database      = "your-org"
+table         = "caddy_access_logs"
+compression   = "gzip"
+auth.strategy = "basic"
+auth.user     = "vector"
+auth.password = "${CLICKHOUSE_VECTOR_PASSWORD}"
+
+[sinks.clickhouse_access.batch]
+timeout_secs = 5
+
+[sinks.clickhouse_coraza]
+type          = "clickhouse"
+inputs        = ["parse_coraza"]
+endpoint      = "http://clickhouse:8123"
+database      = "your-org"
+table         = "coraza_events"
+compression   = "gzip"
+auth.strategy = "basic"
+auth.user     = "vector"
+auth.password = "${CLICKHOUSE_VECTOR_PASSWORD}"
+
+[sinks.clickhouse_coraza.batch]
+timeout_secs = 5

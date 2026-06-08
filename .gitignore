@@ -1,6 +1,9 @@
 # Secrets and runtime state
 .env
 .env.local
+.env.bak
+.env.tmp
+audit-user-access.log
 
 # Runtime bind-mount directories (created by docker-host-config.sh on target host)
 /dock/
@@ -11,14 +14,21 @@
 *.rdb
 
 # Caddy builder intermediate
-build/caddy/.xcaddy-cache/
+templates/caddy/build/.xcaddy-cache/
 
 # Python / pytest
 tests/__pycache__/
 scripts/__pycache__/
-scripts/photonos/__pycache__/
 .pytest_cache/
 
 # OS cruft
 .DS_Store
 Thumbs.db
+
+# Secret-bearing files — must never be committed
+.env.bak*
+oidc-setup-output.txt
+
+# OpenBao init material — unseal keys + root token. NEVER commit.
+**/openbao/init.json
+**/openbao/init.json.age

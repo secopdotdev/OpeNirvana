@@ -1,0 +1,56 @@
+groups:
+  - name: infrastructure
+    rules:
+      # Any Prometheus scrape target has been unreachable for 2+ minutes.
+      - alert: ScrapeTargetDown
+        expr: up == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Scrape target {{ $labels.job }} is down"
+          description: >-
+            Prometheus scrape target {{ $labels.job }} ({{ $labels.instance }})
+            has been unreachable for more than 2 minutes. Check container health
+            and network connectivity.
+
+      # Host filesystem is more than 85% full.
+      - alert: HostDiskFull
+        expr: >-
+          (node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs"}
+          / node_filesystem_size_bytes) < 0.15
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Disk {{ $labels.mountpoint }} is almost full"
+          description: >-
+            Mountpoint {{ $labels.mountpoint }} on {{ $labels.instance }} has
+            less than 15% free space ({{ $value | humanizePercentage }} free).
+            Run: docker system prune -f && maintain.py backup to free space.
+
+      # Host memory usage above 90% for 5+ minutes.
+      - alert: HostMemoryHigh
+        expr: >-
+          (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) > 0.9
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Host memory usage above 90%"
+          description: >-
+            {{ $labels.instance }} is using {{ $value | humanizePercentage }} of
+            available memory. Consider stopping non-critical services or expanding RAM.
+
+      # Host CPU busy above 90% for 10+ minutes.
+      - alert: HostCpuHigh
+        expr: >-
+          (1 - avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[5m]))) > 0.9
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Host CPU usage above 90%"
+          description: >-
+            {{ $labels.instance }} CPU is {{ $value | humanizePercentage }} busy
+            for the last 10 minutes. Check for runaway processes or heavy workloads.

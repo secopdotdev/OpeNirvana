@@ -6,7 +6,7 @@ general: {
 	log_to_stdout = true
 	server_name = "janus"
 
-	# Admin secret — for the admin REST API exposed at gate.secop.dev via Caddy.
+	# Admin secret — for the admin REST API exposed at example.com via Caddy.
 	admin_secret = "${JANUS_ADMIN_SECRET}"
 }
 

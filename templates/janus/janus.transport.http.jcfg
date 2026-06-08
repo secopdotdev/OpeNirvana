@@ -7,7 +7,7 @@ general: {
 	base_path = "/janus"
 	http = true
 	port = 8088
-	# Admin endpoint — routed via Caddy at gate.secop.dev, gated by Authentik.
+	# Admin endpoint — routed via Caddy at example.com, gated by Authentik.
 	admin_http = true
 	admin_port = 8188
 	admin_base_path = "/admin"

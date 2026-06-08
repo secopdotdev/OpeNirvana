@@ -1,5 +1,5 @@
 {
-    admin 127.0.0.1:2019
+    admin :2019
     email {$ADMIN_EMAIL}
     # Unordered plugin handlers — pin to the standard pipeline so named
     # snippets can import them outside of explicit route blocks.
@@ -15,7 +15,14 @@
         level {$CADDY_LOG_LEVEL}
     }
 
-    metrics
+    # NOTE: global `metrics` is the prime suspect for the WebSocket bug —
+    # its response instrumentation wraps WriteHeader, which collides with
+    # reverse_proxy's HTTP/1.1 101 hijack for WS upgrades. Caddy logs
+    # "superfluous response.WriteHeader call from metrics.go:77" on every
+    # request, and on WS the 101 status line never reaches the client.
+    # Disabled until we either pin Caddy to a version that fixes it or
+    # move Prometheus scraping to a non-instrumenting source.
+    # metrics
 
     servers {
         protocols h1 h2 h3
@@ -25,20 +32,43 @@
         }
     }
 
-    cache {
-        ttl 10m
-        api {
-            basepath /souin-api
-        }
-        redis {
-            url redis://:{$REDIS_PASSWORD}@redis:6379/{$REDIS_DB_CADDY_CACHE}
-        }
-    }
+    # NOTE: global `cache` (Souin) wraps every ResponseWriter to intercept
+    # responses for caching. It does not handle the Hijack() that
+    # reverse_proxy performs on WS upgrades, which corrupts the HTTP/1.1
+    # 101 Switching Protocols response (browser sees raw WS frames, CF
+    # returns 520). Re-enable per-site for cacheable endpoints only.
+    # cache {
+    #     ttl 10m
+    #     api {
+    #         basepath /souin-api
+    #     }
+    #     redis {
+    #         url redis://:{$REDIS_PASSWORD}@redis:6379/{$REDIS_DB_CADDY_CACHE}
+    #     }
+    # }
 
     crowdsec {
         api_url http://crowdsec:8080
-        api_key {$CROWDSEC_BOUNCER_KEY}
+        api_key {$CROWDSEC_BOUNCER_API_KEY}
         ticker_interval 15s
+    }
+
+    storage redis {
+        host       redis
+        port       6379
+        password   {$REDIS_PASSWORD}
+        db         {$REDIS_DB_CADDY_TLS}
+        key_prefix caddy_tls
+        tls_enabled false
+    }
+
+    security {
+        authorization policy m2m_api_policy {
+            crypto key verify from env CADDY_JWT_SHARED_SECRET
+            validate bearer header
+            allow roles api_client
+            disable auth redirect
+        }
     }
 }
 
@@ -66,6 +96,18 @@ import snippets/*.caddy
     reverse_proxy authentik-server:9000
 }
 
+# Dashy — home launcher served at the apex domain.
+(backend-dashy) {
+    reverse_proxy dashy:8080
+}
+
+# Grafana — metrics + health dashboards (WebSocket for Grafana Live).
+(backend-grafana) {
+    reverse_proxy grafana:3000 {
+        flush_interval -1
+    }
+}
+
 # Wazuh dashboard — OpenSearch Dashboards with self-signed cert.
 (backend-wazuh) {
     reverse_proxy https://wazuh-dashboard:5601 {
@@ -77,6 +119,9 @@ import snippets/*.caddy
 
 # Nextcloud — file sync + collaboration.
 # Well-known redirects are required by CalDAV/CardDAV clients.
+# Served from a dedicated cloud.* site (below), NOT the *.{PUBLIC_FQDN}
+# wildcard, so the notify_push /push/* WebSocket can bypass the response-
+# wrapping middleware (coraza/security-headers) that breaks the WS hijack.
 (backend-nextcloud) {
     redir /.well-known/carddav /remote.php/dav 301
     redir /.well-known/caldav  /remote.php/dav 301
@@ -139,6 +184,14 @@ import snippets/*.caddy
     reverse_proxy redpanda-console:8080
 }
 
+# ClickHouse — analytics database. HTTP interface on :8123 serves both the
+# /play web UI (interactive SQL) and the query API. External traffic is
+# human/UI only — Vector and other internal writers connect directly via
+# the docker network with basic-auth, bypassing Caddy entirely.
+(backend-clickhouse) {
+    reverse_proxy clickhouse:8123
+}
+
 # Zeek log browser — filebrowser serving Zeek TSV logs read-only.
 (backend-zeek) {
     reverse_proxy zeek-logs:80
@@ -149,9 +202,11 @@ import snippets/*.caddy
     reverse_proxy dockhand:3000
 }
 
-# Immich — photo/video library.
+# Immich — photo/video library (SSE for upload progress).
 (backend-immich) {
-    reverse_proxy immich-server:2283
+    reverse_proxy immich-server:2283 {
+        flush_interval -1
+    }
 }
 
 # ==============================================================
@@ -178,15 +233,26 @@ import snippets/*.caddy
     reverse_proxy affine:3010
 }
 
-# n8n — workflow automation.
+# n8n — workflow automation (SSE for live execution logs).
 (backend-n8n) {
-    reverse_proxy n8n:5678
+    reverse_proxy n8n:5678 {
+        flush_interval -1
+    }
 }
 
 # nextcloud-spreed-signaling — HPB WebSocket signaling server.
 # Not behind Authentik: Nextcloud Talk clients connect directly via WebSocket.
+# transport http versions 1.1 — force HTTP/1.1 upstream so the WS Upgrade
+# header reaches spreed-signaling and the 101 response is forwarded
+# verbatim. Without this, Caddy may negotiate h2 to upstream where the
+# Upgrade semantics don't apply, breaking the handshake.
 (backend-spreed-signaling) {
-    reverse_proxy spreed-signaling:8080
+    reverse_proxy spreed-signaling:8080 {
+        flush_interval -1
+        transport http {
+            versions 1.1
+        }
+    }
 }
 
 # Janus Gateway — WebRTC media server admin API.
@@ -212,7 +278,88 @@ import snippets/*.caddy
 }
 
 # ==============================================================
-# Public ingress: *.{$PUBLIC_FQDN}   (e.g. *.secop.dev)
+# Nextcloud Talk HPB signaling — dedicated site, no middleware.
+# Pure WebSocket pass-through. The public-policy block (coraza WAF +
+# security-headers) corrupts the WS handshake response, producing
+# "superfluous WriteHeader" in Caddy logs and HTTP 520 at Cloudflare.
+# Exact-host site beats the *.{PUBLIC_FQDN} wildcard for routing.
+# Auth is enforced by spreed-signaling's [backend] shared-secret check.
+# ==============================================================
+{$TALK_SUBDOMAIN}.{$PUBLIC_FQDN} {
+    tls {
+        dns cloudflare {$CLOUDFLARE_API_TOKEN}
+        resolvers 1.1.1.1
+    }
+    # crowdsec http wraps every ResponseWriter to check IPs against LAPI;
+    # like the other instrumenting modules it breaks Hijack() on a WS 101
+    # upgrade. The shared-secret check in spreed-signaling's [backend] is
+    # the only meaningful auth boundary on this endpoint anyway.
+    import backend-spreed-signaling
+}
+
+{$TALK_SUBDOMAIN}.{$TAILNET_FQDN} {
+    tls {
+        get_certificate tailscale
+    }
+    import backend-spreed-signaling
+}
+
+# ==============================================================
+# Nextcloud — dedicated site (NOT the *.{FQDN} wildcard) so the
+# notify_push Client Push WebSocket at /push/ws can bypass the
+# response-wrapping middleware (coraza WAF + security-headers)
+# that corrupts the WS 101 hijack — the same root cause that
+# forced talk.* onto its own site. Nextcloud's own traffic still
+# gets the full security stack via the inner handle block; only
+# /push/* is exempt. Exact-host beats the wildcard for routing.
+# Nextcloud is not behind Authentik (it owns its own login +
+# user_oidc), so no forward_auth here. notify_push:setup keeps
+# the conventional https://<cloud>/push endpoint.
+# ==============================================================
+{$NEXTCLOUD_SUBDOMAIN}.{$PUBLIC_FQDN} {
+    tls {
+        dns cloudflare {$CLOUDFLARE_API_TOKEN}
+        resolvers 1.1.1.1
+    }
+
+    handle_path /push/* {
+        reverse_proxy notify-push:7867 {
+            flush_interval -1
+        }
+    }
+
+    handle {
+        # Nextcloud ships its own nonce-based CSP; use the CSP-less base so
+        # Caddy doesn't overwrite it with a strict default-src that blocks
+        # NC's inline styles/scripts. (crowdsec + coraza still apply.)
+        import crowdsec
+        import coraza
+        import security-headers-base
+        import backend-nextcloud
+    }
+}
+
+{$NEXTCLOUD_SUBDOMAIN}.{$TAILNET_FQDN} {
+    tls {
+        get_certificate tailscale
+    }
+
+    handle_path /push/* {
+        reverse_proxy notify-push:7867 {
+            flush_interval -1
+        }
+    }
+
+    handle {
+        import crowdsec
+        import coraza
+        import security-headers-base
+        import backend-nextcloud
+    }
+}
+
+# ==============================================================
+# Public ingress: *.{$PUBLIC_FQDN}   (e.g. *.example.com)
 # TLS via Cloudflare DNS-01 challenge — single wildcard cert.
 # All unmatched hosts abort (no default backend).
 # ==============================================================
@@ -223,7 +370,6 @@ import snippets/*.caddy
     # override theirs. Must be at site level (after the import) so it
     # runs after security-headers adds the header.
     header @authentik    -Content-Security-Policy
-    header @nextcloud    -Content-Security-Policy
     header @jellyfin-pub -Content-Security-Policy
     header @affine-pub   -Content-Security-Policy
     header @vikunja-pub  -Content-Security-Policy
@@ -231,10 +377,32 @@ import snippets/*.caddy
     header @immich       -Content-Security-Policy
     header @n8n-pub      -Content-Security-Policy
     header @janus-pub    -Content-Security-Policy
+    header @ntfy-pub     -Content-Security-Policy
+
+    # FileBrowser (Zeek log viewer) bootstraps the SPA from an inline
+    # <script> that sets window.FileBrowser; the global default-src 'self'
+    # CSP blocks it, leaving the config undefined and the page fully blank.
+    # Dedicated matcher (not the @zeek routing matcher) so the strip also
+    # applies to the forward_auth response — mirrors @wazuh-pub below.
+    @zeek-pub host {$ZEEK_SUBDOMAIN}.{$PUBLIC_FQDN}
+    header @zeek-pub -Content-Security-Policy
 
     # Wazuh (OpenSearch Dashboards) bundles use Function() constructor.
     @wazuh-pub host {$WAZUH_SUBDOMAIN}.{$PUBLIC_FQDN}
     header @wazuh-pub -Content-Security-Policy
+
+    # Dockhand SPA bootstraps from an inline <script>; same CSP issue as zeek.
+    # Dedicated matcher so the strip applies to the forward_auth response too.
+    @dockhand-pub host {$DOCKHAND_SUBDOMAIN}.{$PUBLIC_FQDN}
+    header @dockhand-pub -Content-Security-Policy
+
+    # Grafana uses inline scripts/styles in dashboard panels.
+    @grafana-pub host {$GRAFANA_SUBDOMAIN}.{$PUBLIC_FQDN}
+    header @grafana-pub -Content-Security-Policy
+
+    # ClickHouse /play UI uses inline scripts to render result tables.
+    @clickhouse-pub host {$CLICKHOUSE_SUBDOMAIN}.{$PUBLIC_FQDN}
+    header @clickhouse-pub -Content-Security-Policy
 
     # Media *arr apps and qBittorrent use inline scripts/styles.
     @media host {$PROWLARR_SUBDOMAIN}.{$PUBLIC_FQDN} {$RADARR_SUBDOMAIN}.{$PUBLIC_FQDN} {$SONARR_SUBDOMAIN}.{$PUBLIC_FQDN} {$LIDARR_SUBDOMAIN}.{$PUBLIC_FQDN} {$QBIT_SUBDOMAIN}.{$PUBLIC_FQDN}
@@ -248,7 +416,7 @@ import snippets/*.caddy
     # ── Global Authentik gate ──────────────────────────────────────────────
     # forward_auth is a directive-level handler that runs BEFORE handle blocks
     # in Caddy's standard directive ordering. The combined matcher excludes:
-    #   (a) auth.secop.dev — the identity provider itself
+    #   (a) example.com — the identity provider itself
     #   (b) /outpost.goauthentik.io/* — OAuth callback/flow paths that must
     #       reach authentik-proxy directly to complete the login sequence.
     # A separate handle block routes outpost paths to authentik-proxy;
@@ -290,10 +458,9 @@ import snippets/*.caddy
         import backend-wazuh
     }
 
-    @nextcloud host {$NEXTCLOUD_SUBDOMAIN}.{$PUBLIC_FQDN}
-    handle @nextcloud {
-        import backend-nextcloud
-    }
+    # cloud.{$PUBLIC_FQDN} is handled by its dedicated site block above (so the
+    # notify_push /push/* WebSocket can bypass response middleware) — the
+    # wildcard never matches that host now.
 
     @prowlarr host {$PROWLARR_SUBDOMAIN}.{$PUBLIC_FQDN}
     handle @prowlarr {
@@ -392,19 +559,27 @@ import snippets/*.caddy
         import backend-n8n
     }
 
-    @spreed-pub host {$TALK_SUBDOMAIN}.{$PUBLIC_FQDN}
-    handle @spreed-pub {
-        import backend-spreed-signaling
-    }
+    # talk.{$PUBLIC_FQDN} is handled by its dedicated site block above —
+    # the *.{$PUBLIC_FQDN} wildcard never matches that host now.
 
     @janus-pub host {$JANUS_SUBDOMAIN}.{$PUBLIC_FQDN}
     handle @janus-pub {
         import backend-janus
     }
 
-    @redpanda-console host {$REDPANDA_CONSOLE_SUBDOMAIN}.{$PUBLIC_FQDN}
+    @redpanda-console host {$KAFKA_SUBDOMAIN}.{$PUBLIC_FQDN}
     handle @redpanda-console {
         import backend-redpanda-console
+    }
+
+    @grafana host {$GRAFANA_SUBDOMAIN}.{$PUBLIC_FQDN}
+    handle @grafana {
+        import backend-grafana
+    }
+
+    @clickhouse host {$CLICKHOUSE_SUBDOMAIN}.{$PUBLIC_FQDN}
+    handle @clickhouse {
+        import backend-clickhouse
     }
 
     # Catch-all: reject any subdomain not explicitly matched above.
@@ -414,7 +589,7 @@ import snippets/*.caddy
 }
 
 # ==============================================================
-# Tailnet ingress: *.{$TAILNET_FQDN}   (e.g. *.neon-lenok.ts.net)
+# Tailnet ingress: *.{$TAILNET_FQDN}   (e.g. *.your-tailnet.example)
 # http:// prefix — Tailscale Serve terminates TLS in front of Caddy;
 # Caddy listens on :80 inside the tailscale-ingress netns.
 # Without http://, Caddy's auto-HTTPS tries on-demand certs for every
@@ -424,16 +599,28 @@ http://*.{$TAILNET_FQDN} {
     import tailnet-policy
 
     header @authentik    -Content-Security-Policy
-    header @nextcloud    -Content-Security-Policy
     header @jellyfin-ts  -Content-Security-Policy
     header @affine-ts    -Content-Security-Policy
     header @vikunja-ts   -Content-Security-Policy
     header @tandoor-ts   -Content-Security-Policy
     header @immich-ts    -Content-Security-Policy
     header @n8n-ts       -Content-Security-Policy
+    header @ntfy-ts      -Content-Security-Policy
+
+    @zeek-ts-pub host {$ZEEK_SUBDOMAIN}.{$TAILNET_FQDN}
+    header @zeek-ts-pub -Content-Security-Policy
 
     @wazuh-ts host {$WAZUH_SUBDOMAIN}.{$TAILNET_FQDN}
     header @wazuh-ts -Content-Security-Policy
+
+    @dockhand-ts-pub host {$DOCKHAND_SUBDOMAIN}.{$TAILNET_FQDN}
+    header @dockhand-ts-pub -Content-Security-Policy
+
+    @grafana-ts-pub host {$GRAFANA_SUBDOMAIN}.{$TAILNET_FQDN}
+    header @grafana-ts-pub -Content-Security-Policy
+
+    @clickhouse-ts-pub host {$CLICKHOUSE_SUBDOMAIN}.{$TAILNET_FQDN}
+    header @clickhouse-ts-pub -Content-Security-Policy
 
     @media host {$PROWLARR_SUBDOMAIN}.{$TAILNET_FQDN} {$RADARR_SUBDOMAIN}.{$TAILNET_FQDN} {$SONARR_SUBDOMAIN}.{$TAILNET_FQDN} {$LIDARR_SUBDOMAIN}.{$TAILNET_FQDN} {$QBIT_SUBDOMAIN}.{$TAILNET_FQDN}
     header @media -Content-Security-Policy
@@ -476,10 +663,9 @@ http://*.{$TAILNET_FQDN} {
         import backend-wazuh
     }
 
-    @nextcloud host {$NEXTCLOUD_SUBDOMAIN}.{$TAILNET_FQDN}
-    handle @nextcloud {
-        import backend-nextcloud
-    }
+    # cloud.{$TAILNET_FQDN} is handled by its dedicated site block above (so the
+    # notify_push /push/* WebSocket can bypass response middleware) — the
+    # wildcard never matches that host now.
 
     @prowlarr host {$PROWLARR_SUBDOMAIN}.{$TAILNET_FQDN}
     handle @prowlarr {
@@ -576,10 +762,8 @@ http://*.{$TAILNET_FQDN} {
         import backend-n8n
     }
 
-    @spreed-ts host {$TALK_SUBDOMAIN}.{$TAILNET_FQDN}
-    handle @spreed-ts {
-        import backend-spreed-signaling
-    }
+    # talk.{$TAILNET_FQDN} is handled by its dedicated site block at the top —
+    # the *.{$TAILNET_FQDN} wildcard never matches that host now.
 
     @janus-ts host {$JANUS_SUBDOMAIN}.{$TAILNET_FQDN}
     handle @janus-ts {
@@ -587,13 +771,89 @@ http://*.{$TAILNET_FQDN} {
         import backend-janus
     }
 
-    @redpanda-console-ts host {$REDPANDA_CONSOLE_SUBDOMAIN}.{$TAILNET_FQDN}
+    @redpanda-console-ts host {$KAFKA_SUBDOMAIN}.{$TAILNET_FQDN}
     handle @redpanda-console-ts {
         import backend-redpanda-console
+    }
+
+    @grafana-ts host {$GRAFANA_SUBDOMAIN}.{$TAILNET_FQDN}
+    handle @grafana-ts {
+        import backend-grafana
+    }
+
+    @clickhouse-ts host {$CLICKHOUSE_SUBDOMAIN}.{$TAILNET_FQDN}
+    handle @clickhouse-ts {
+        import backend-clickhouse
     }
 
     # Catch-all: reject any subdomain not explicitly matched above.
     handle {
         abort
+    }
+}
+
+# ==============================================================
+# Apex public: {$PUBLIC_FQDN}   (e.g. example.com)
+# Dashy launcher — Authentik-gated like all other services.
+# Wildcard cert (*.{$PUBLIC_FQDN}) does NOT cover the apex, so
+# a separate DNS-01 cert is issued for the bare domain.
+# ==============================================================
+{$PUBLIC_FQDN} {
+    import public-policy
+
+    tls {
+        dns cloudflare {$CLOUDFLARE_API_TOKEN}
+        resolvers 1.1.1.1
+    }
+
+    @outpost-apex {
+        path /outpost.goauthentik.io/*
+    }
+    handle @outpost-apex {
+        reverse_proxy authentik-proxy:9000
+    }
+
+    @apex-needs-auth {
+        not path /outpost.goauthentik.io/*
+    }
+    # Dashy is a Vue SPA — default-src 'self' blocks its bundled assets.
+    # Matcher-based header removal compiles before the global security-headers
+    # set route, ensuring the delete is the outer handler that finalizes last.
+    header @apex-needs-auth -Content-Security-Policy
+    forward_auth @apex-needs-auth authentik-proxy:9000 {
+        uri /outpost.goauthentik.io/auth/caddy
+        copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid X-Authentik-Jwt X-Authentik-Meta-Jwks X-Authentik-Meta-Outpost X-Authentik-Meta-Provider X-Authentik-Meta-App X-Authentik-Meta-Version
+    }
+
+    handle {
+        import backend-dashy
+    }
+}
+
+# ==============================================================
+# Apex tailnet: {$TAILNET_FQDN}   (e.g. your-tailnet.example)
+# Dashy launcher on the bare tailnet domain — same Authentik gate.
+# ==============================================================
+http://{$TAILNET_FQDN} {
+    import tailnet-policy
+
+    @outpost-apex-ts {
+        path /outpost.goauthentik.io/*
+    }
+    handle @outpost-apex-ts {
+        reverse_proxy authentik-proxy:9000
+    }
+
+    @apex-ts-needs-auth {
+        not path /outpost.goauthentik.io/*
+    }
+    header @apex-ts-needs-auth -Content-Security-Policy
+    forward_auth @apex-ts-needs-auth authentik-proxy:9000 {
+        uri /outpost.goauthentik.io/auth/caddy
+        copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid X-Authentik-Jwt X-Authentik-Meta-Jwks X-Authentik-Meta-Outpost X-Authentik-Meta-Provider X-Authentik-Meta-App X-Authentik-Meta-Version
+    }
+
+    handle {
+        import backend-dashy
     }
 }

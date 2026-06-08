@@ -1,5 +1,9 @@
 <decoder name="caddy-json">
-  <prematch>^\{"level":</prematch>
-  <use_own_name>true</use_own_name>
-  <plugin_decoder>JSON_Decoder</plugin_decoder>
+  <prematch>^{"level":</prematch>
+</decoder>
+
+<decoder name="caddy-json-srcip">
+  <parent>caddy-json</parent>
+  <regex>"client_ip":"(\d+\.\d+\.\d+\.\d+)"</regex>
+  <order>srcip</order>
 </decoder>

@@ -1,0 +1,3 @@
+(m2m-auth) {
+    authorize with m2m_api_policy
+}

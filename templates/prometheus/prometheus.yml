@@ -1,0 +1,60 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  scrape_timeout: 10s
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - alertmanager:9093
+
+rule_files:
+  - 'alerts/*.yml'
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # Caddy admin API metrics (admin bound to :2019 — all interfaces).
+  - job_name: caddy
+    static_configs:
+      - targets: ['tailscale-ingress:2019']
+    metrics_path: /metrics
+
+  # Container-level CPU, memory, network, and disk metrics.
+  - job_name: cadvisor
+    static_configs:
+      - targets: ['cadvisor:8080']
+
+  # Host-level hardware and OS metrics (CPU, memory, disk, network).
+  - job_name: node
+    static_configs:
+      - targets: ['node-exporter:9100']
+
+  # PostgreSQL query stats, connection pool, replication.
+  - job_name: postgres
+    static_configs:
+      - targets: ['postgres-exporter:9187']
+
+  # Redis command stats, memory, hit/miss rates.
+  - job_name: redis
+    static_configs:
+      - targets: ['redis-exporter:9121']
+
+  # CrowdSec decisions, alerts, and API call metrics.
+  # Requires prometheus.listen_addr=0.0.0.0 in CrowdSec config.
+  # See: https://docs.crowdsec.net/docs/observability/prometheus
+  - job_name: crowdsec
+    static_configs:
+      - targets: ['crowdsec:6060']
+    honor_labels: true
+
+  # NOTE: No `authentik` scrape job. This Authentik build does not expose a
+  # Prometheus metrics listener on :9300 (verified empty), and an always-down
+  # target would trip the ScrapeTargetDown alert. Authentik login/auth
+  # analytics come from Loki (authentik-server container logs) instead — see
+  # the Observability "Security & Auth" dashboard. To enable the Prometheus
+  # side later: turn on Authentik's metrics listener, then re-add this job and
+  # put authentik-server on the monitoring network.

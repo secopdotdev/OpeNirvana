@@ -66,8 +66,3 @@ grpc_output:
 
 webserver:
   enabled: false
-
-metadata_download:
-  max_mb: 100
-  chunk_wait_us: 1000
-  watch_freq_sec: 1

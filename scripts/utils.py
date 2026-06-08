@@ -6,9 +6,12 @@ Import with: from utils import EnvFile, AuthentikClient, red, green, yellow, ste
 """
 
 import json
+import os
 import re
+import shlex
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -36,15 +39,41 @@ class EnvFile:
 
     def __init__(self, path: Path) -> None:
         self.path = path
-        self._text = path.read_text()
+        self._text = path.read_text(encoding="utf-8")
 
     def get(self, key: str) -> str:
-        """Return the value for KEY, stripping inline comments and whitespace."""
+        """Return the value for KEY, stripping inline comments and whitespace.
+
+        Single- or double-quoted values (written by set_if_blank/force_set when the
+        value contains shell-special chars such as '#') are decoded via shlex.split
+        so the quoting is removed and the raw value is returned without the comment
+        regex ever touching the interior of the string.
+        """
         for line in self._text.splitlines():
             if line.startswith(f"{key}="):
                 val = line[len(key) + 1:]
+                stripped = val.strip()
+                if stripped[:1] in ("'", '"'):
+                    # Quoted value — shlex.split is the correct inverse of shlex.quote
+                    # and handles all escape forms including embedded single-quotes.
+                    parts = shlex.split(stripped)
+                    return parts[0] if parts else ""
                 return self._INLINE_COMMENT.sub("", val).strip()
         return ""
+
+    def _atomic_write(self, text: str) -> None:
+        d = self.path.parent
+        fd, tmp = tempfile.mkstemp(dir=d, prefix=".env.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(text)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, self.path)     # atomic swap
+        except BaseException:
+            try: os.unlink(tmp)
+            except FileNotFoundError: pass
+            raise
 
     def force_set(self, key: str, value: str) -> None:
         """Write KEY=value unconditionally, replacing any existing value or appending."""
@@ -57,11 +86,11 @@ class EnvFile:
         )
         if count:
             self._text = new
-            self.path.write_text(new)
+            self._atomic_write(new)
             print(f"  updated {key}")
         else:
             self._text = self._text.rstrip("\n") + f"\n{key}={value}\n"
-            self.path.write_text(self._text)
+            self._atomic_write(self._text)
             print(f"  wrote  {key} (appended)")
 
     def set_if_blank(self, key: str, value: str) -> None:
@@ -84,11 +113,11 @@ class EnvFile:
         )
         if count:
             self._text = new
-            self.path.write_text(new)
+            self._atomic_write(new)
             print(f"  wrote  {key}")
         else:
             self._text = self._text.rstrip("\n") + f"\n{key}={value}\n"
-            self.path.write_text(self._text)
+            self._atomic_write(self._text)
             print(f"  wrote  {key} (appended)")
 
 
@@ -112,7 +141,7 @@ class AuthentikClient:
             },
         )
         try:
-            with urllib.request.urlopen(req, timeout=20) as resp:
+            with urllib.request.urlopen(req, timeout=60) as resp:
                 raw = resp.read()
                 return json.loads(raw) if raw else {}
         except urllib.error.HTTPError as exc:
@@ -130,8 +159,83 @@ class AuthentikClient:
     def patch(self, path: str, body: dict) -> dict:
         return self._request("PATCH", path, body)
 
+    def put(self, path: str, body: dict) -> dict:
+        return self._request("PUT", path, body)
+
     def delete(self, path: str) -> None:
         self._request("DELETE", path)
+
+
+# ── Authentik access-policy discovery ──────────────────────────────────────────
+
+def discover_app_access_groups(ak: "AuthentikClient", apps: list[dict]) -> dict[str, list[str]]:
+    """Return {str(app pk): [group names that grant access]} for the given apps.
+
+    Uses three bulk-paginated calls (all groups, all bindings, expression policies
+    for matched bindings only) then attributes in Python. Avoids the N+1
+    per-group query that hit Authentik's slow bindings endpoint, and sidesteps
+    the GenericFK bug (target= filter omits GROUP-type bindings) by fetching
+    all bindings without a filter.
+    """
+    app_pks = {str(a["pk"]) for a in apps}
+    required: dict[str, list[str]] = {str(a["pk"]): [] for a in apps}
+
+    # 1. Fetch all groups once (pk → name lookup table).
+    groups_by_pk: dict[str, str] = {}
+    page = 1
+    while True:
+        resp = ak.get("core/groups/", page=str(page), page_size="100")
+        for g in resp.get("results", []):
+            groups_by_pk[str(g["pk"])] = g["name"]
+        if not resp.get("pagination", {}).get("next"):
+            break
+        page += 1
+
+    # 2. Fetch ALL policy bindings in bulk (avoids one request per group).
+    all_bindings: list[dict] = []
+    page = 1
+    while True:
+        resp = ak.get("policies/bindings/", page=str(page), page_size="100")
+        all_bindings.extend(resp.get("results", []))
+        if not resp.get("pagination", {}).get("next"):
+            break
+        page += 1
+
+    # 3. Fetch expression policies only for policy-type bindings targeting our apps.
+    expr_pks = {
+        str(b["policy"])
+        for b in all_bindings
+        if str(b.get("target", "")) in app_pks
+        and b.get("policy")
+        and not b.get("group")
+    }
+    policy_group_map: dict[str, str] = {}
+    for pk in expr_pks:
+        try:
+            pol = ak.get(f"policies/expression/{pk}/")
+            m = re.search(r'ak_groups\.filter\(name="([^"]+)"\)', pol.get("expression", ""))
+            if m:
+                policy_group_map[pk] = m.group(1)
+        except RuntimeError:
+            pass
+
+    # 4. Attribute bindings to apps (local, no additional HTTP calls).
+    for b in all_bindings:
+        tgt = str(b.get("target", ""))
+        if tgt not in app_pks:
+            continue
+        group_pk = str(b.get("group") or "")
+        policy_pk = str(b.get("policy") or "")
+        if group_pk:
+            name = groups_by_pk.get(group_pk)
+            if name and name not in required[tgt]:
+                required[tgt].append(name)
+        elif policy_pk and policy_pk in policy_group_map:
+            name = policy_group_map[policy_pk]
+            if name not in required[tgt]:
+                required[tgt].append(name)
+
+    return required
 
 
 # ── Cloudflare DNS API client ──────────────────────────────────────────────────
@@ -204,7 +308,7 @@ class CloudflareClient:
         return None
 
     def create_cname(self, zone_id: str, fqdn: str, target: str, proxied: bool = True) -> dict:
-        """Create a CNAME record. fqdn = full record name (e.g. 'kafka.secop.dev')."""
+        """Create a CNAME record. fqdn = full record name (e.g. 'example.com')."""
         return self._request("POST", f"/zones/{zone_id}/dns_records", {
             "type":    "CNAME",
             "name":    fqdn,

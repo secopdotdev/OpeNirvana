@@ -11,6 +11,13 @@ x-hardened: &hardened
   cap_drop:
     - ALL
   restart: unless-stopped
+  # Default CPU quota — a STABILITY control, not an efficiency knob: without it an
+  # unbounded container (query storm, compromised app, crypto-miner) can starve the
+  # scheduler -> healthcheck timeouts -> autoheal restart storm -> cascading failure
+  # (perf-resource-workstream.md). Services with their own `cpus:` (caddy, postgres)
+  # override via merge; the heavy wazuh indexers use *wazuh-indexer and are unaffected.
+  # Generous + env-tunable so it caps runaways without throttling normal workloads.
+  cpus: ${DEFAULT_CPU_LIMIT:-2}
   labels:
     - autoheal=true
 
@@ -54,58 +61,68 @@ networks:
     driver: bridge
     ipam:
       config:
-        - subnet: 10.0.10.0/24
-          gateway: 10.0.10.10
+        - subnet: 192.0.2.10/24
+          gateway: 192.0.2.10
   auth-internal:
     driver: bridge
     ipam:
       config:
-        - subnet: 10.0.11.0/24
-          gateway: 10.0.11.10
+        - subnet: 192.0.2.10/24
+          gateway: 192.0.2.10
   data:
     driver: bridge
     ipam:
       config:
-        - subnet: 10.0.12.0/24
-          gateway: 10.0.12.10
+        - subnet: 192.0.2.10/24
+          gateway: 192.0.2.10
   security:
     driver: bridge
     ipam:
       config:
-        - subnet: 10.0.13.0/24
-          gateway: 10.0.13.10
+        - subnet: 192.0.2.10/24
+          gateway: 192.0.2.10
   media:
     driver: bridge
     ipam:
       config:
-        - subnet: 10.0.14.0/24
-          gateway: 10.0.14.10
+        - subnet: 192.0.2.10/24
+          gateway: 192.0.2.10
   apps:
     driver: bridge
     ipam:
       config:
-        - subnet: 10.0.15.0/24
-          gateway: 10.0.15.10
+        - subnet: 192.0.2.10/24
+          gateway: 192.0.2.10
   cloud:
     driver: bridge
     ipam:
       config:
-        - subnet: 10.0.16.0/24
-          gateway: 10.0.16.10
+        - subnet: 192.0.2.10/24
+          gateway: 192.0.2.10
   oidc-clients:
     driver: bridge
     ipam:
       config:
-        - subnet: 10.0.17.0/24
-          gateway: 10.0.17.10
+        - subnet: 192.0.2.10/24
+          gateway: 192.0.2.10
+  monitoring:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 192.0.2.10/24
+          gateway: 192.0.2.10
 
 services:
   # ==========================================================
   # Tailscale ingress sidecar — caddy shares this netns.
   # ==========================================================
   tailscale-ingress:
+    profiles: [core, tailscale-ingress]
     image: tailscale/tailscale:latest
     container_name: tailscale-ingress
+    labels:
+      - autoheal=true
+    mem_limit: ${TAILSCALE_INGRESS_MEM_LIMIT:-256m}
     hostname: ${TAILSCALE_INGRESS_HOSTNAME}
     environment:
       TS_AUTHKEY: ${TAILSCALE_AUTHKEY}
@@ -118,11 +135,13 @@ services:
       # has no knowledge of Docker container names — caddy (which shares this
       # netns) can't resolve authentik-server, wazuh-dashboard, etc.
       TS_ACCEPT_DNS: "false"
-      # Tags are applied at authkey-generation time in the Tailscale admin
-      # console (key must carry tag:ingress + tag:docker). Do NOT re-assert
-      # via --advertise-tags — that triggers a tagOwners ACL ownership check
-      # against the key's issuing user and fails even when the key already
-      # owns the tags.
+      # Tags (tag:ingress, tag:docker) are applied at authkey-generation time.
+      # Run `python3 scripts/set-auth.py tailscale` BEFORE `docker compose up`
+      # to provision the Tailscale ACL and create a properly tagged reusable key;
+      # the key is written to TAILSCALE_AUTHKEY in .env automatically.
+      # Do NOT use --advertise-tags here — that triggers a separate tagOwners ACL
+      # ownership check against the key's issuing user (fails for OAuth-issued keys
+      # even when the key already carries the tags).
     ports:
       - "80:80"
       - "443:443"
@@ -135,17 +154,17 @@ services:
       - NET_ADMIN
     networks:
       ingress:
-        ipv4_address: 10.0.10.200
+        ipv4_address: 192.0.2.10
       data:
-        ipv4_address: 10.0.12.200
+        ipv4_address: 192.0.2.10
       security:
-        ipv4_address: 10.0.13.200
+        ipv4_address: 192.0.2.10
       media:
-        ipv4_address: 10.0.14.200
+        ipv4_address: 192.0.2.10
       apps:
-        ipv4_address: 10.0.15.200
+        ipv4_address: 192.0.2.10
       cloud:
-        ipv4_address: 10.0.16.200
+        ipv4_address: 192.0.2.10
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:41234/healthz"]
       interval: 10s
@@ -156,9 +175,10 @@ services:
     logging: *default-logging
 
   caddy:
+    profiles: [core, caddy]
     <<: *hardened
     build:
-      context: ./build/caddy
+      context: ./templates/caddy/build
     container_name: caddy
     depends_on:
       tailscale-ingress:
@@ -167,6 +187,8 @@ services:
         condition: service_healthy
       authentik-server:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     environment:
       ADMIN_EMAIL: ${ADMIN_EMAIL}
       PUBLIC_FQDN: ${PUBLIC_FQDN}
@@ -174,9 +196,11 @@ services:
       EXTRA_ALLOWED_IP: ${EXTRA_ALLOWED_IP}
       CADDY_LOG_LEVEL: ${CADDY_LOG_LEVEL}
       CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN}
-      CROWDSEC_BOUNCER_KEY: ${CROWDSEC_BOUNCER_KEY}
+      CROWDSEC_BOUNCER_API_KEY: ${CROWDSEC_BOUNCER_API_KEY}
       REDIS_PASSWORD: ${REDIS_PASSWORD}
       REDIS_DB_CADDY_CACHE: ${REDIS_DB_CADDY_CACHE}
+      REDIS_DB_CADDY_TLS: ${REDIS_DB_CADDY_TLS}
+      CADDY_JWT_SHARED_SECRET: ${CADDY_JWT_SHARED_SECRET}
       # Per-service subdomains — configure in .env.
       # These become {sub}.PUBLIC_FQDN and {sub}.TAILNET_FQDN routes.
       AUTHENTIK_SUBDOMAIN: ${AUTHENTIK_SUBDOMAIN}
@@ -205,7 +229,8 @@ services:
       N8N_SUBDOMAIN: ${N8N_SUBDOMAIN:-soar}
       TALK_SUBDOMAIN: ${TALK_SUBDOMAIN:-talk}
       JANUS_SUBDOMAIN: ${JANUS_SUBDOMAIN:-gate}
-      REDPANDA_CONSOLE_SUBDOMAIN: ${REDPANDA_CONSOLE_SUBDOMAIN:-kafka}
+      KAFKA_SUBDOMAIN: ${KAFKA_SUBDOMAIN:-kafka}
+      GRAFANA_SUBDOMAIN: ${GRAFANA_SUBDOMAIN:-dash}
     volumes:
       - ${DOCK_CONF}/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
       - ${DOCK_CONF}/caddy/snippets:/etc/caddy/snippets:ro
@@ -213,6 +238,12 @@ services:
       - ${DOCK_CONF}/caddy/data:/data
       - ${DOCK_CONF}/caddy/logs:/var/log/caddy
       - ${DOCK_CONF}/caddy/souin:/var/cache/souin
+    # Caddy runs inside tailscale-ingress's network namespace (so it serves on
+    # the tailnet + the published 80/443). COUPLING: recreating tailscale-ingress
+    # gives it a new netns and orphans Caddy on the old one (ingress → HTTP 521).
+    # ALWAYS recreate caddy together with it:
+    #   docker compose up -d tailscale-ingress caddy
+    # A full `docker compose up -d` handles this automatically.
     network_mode: "service:tailscale-ingress"
     mem_limit: ${CADDY_MEM_LIMIT:-2g}
     cpus: ${CADDY_CPUS:-2}
@@ -224,9 +255,9 @@ services:
       start_period: 30s
     logging: *default-logging
     read_only: false  # Caddy's /data needs write access — socketed volume not enough
-    user: "1010:1010"  # match docktaetor:media on host — cap_drop:ALL strips
+    user: "1010:1010"  # match svc-user:media on host — cap_drop:ALL strips
                        # DAC_OVERRIDE, so root-in-container can't read 640
-                       # config files owned by docktaetor:media.
+                       # config files owned by svc-user:media.
     cap_add:
       # The caddy binary has file cap cap_net_bind_service=ep so it can bind
       # :80/:443 without root. no-new-privileges + cap_drop:ALL strips that at
@@ -234,8 +265,9 @@ services:
       - NET_BIND_SERVICE
 
   crowdsec:
+    profiles: [core, crowdsec]
     <<: *hardened
-    image: crowdsecurity/crowdsec:latest
+    image: crowdsecurity/crowdsec:${CROWDSEC_VERSION:-latest}
     container_name: crowdsec
     cap_add:
       - DAC_OVERRIDE
@@ -246,7 +278,7 @@ services:
     environment:
       GID: "1010"
       DISABLE_ONLINE_API: "true"
-      COLLECTIONS: "crowdsecurity/caddy crowdsecurity/linux crowdsecurity/iptables"
+      COLLECTIONS: "crowdsecurity/caddy crowdsecurity/linux crowdsecurity/iptables crowdsecurity/whitelist-good-actors"
       PARSERS: "crowdsecurity/caddy-logs crowdsecurity/whitelists"
     volumes:
       # Bind whole /etc/crowdsec so image-seeded dirs (patterns, parsers,
@@ -257,9 +289,9 @@ services:
       - ${DOCK_CONF}/caddy/logs:/var/log/caddy:ro
     networks:
       security:
-        ipv4_address: 10.0.13.20
+        ipv4_address: 192.0.2.10
       ingress:
-        ipv4_address: 10.0.10.21
+        ipv4_address: 192.0.2.10
     mem_limit: ${CROWDSEC_MEM_LIMIT:-1g}
     healthcheck:
       test: ["CMD", "cscli", "lapi", "status"]
@@ -270,10 +302,35 @@ services:
     read_only: false
     logging: *default-logging
 
+  torproxy:
+    profiles: [core, netsec]
+    image: dperson/torproxy:latest
+    container_name: torproxy
+    restart: unless-stopped
+    networks:
+      security:
+        ipv4_address: 192.0.2.10
+    mem_limit: ${TORPROXY_MEM_LIMIT:-256m}
+    cap_drop:
+      - ALL
+    cap_add:
+      - SETUID
+      - SETGID
+      - DAC_OVERRIDE
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip | grep -q '\"IsTor\":true'"]
+      interval: 60s
+      timeout: 20s
+      retries: 3
+      start_period: 90s
+    logging: *default-logging
+
   socket-proxy-ro:
+    profiles: [core, socket-proxy-ro]
     <<: *hardened
-    image: tecnativa/docker-socket-proxy:latest
+    image: tecnativa/docker-socket-proxy:${SOCKET_PROXY_VERSION:-v0.4.2}
     container_name: socket-proxy-ro
+    mem_limit: 64m
     environment:
       CONTAINERS: "1"
       SERVICES: "1"
@@ -291,7 +348,7 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     networks:
       security:
-        ipv4_address: 10.0.13.21
+        ipv4_address: 192.0.2.10
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:2375/_ping"]
       interval: 10s
@@ -306,28 +363,44 @@ services:
       - SETGID
     logging: *default-logging
 
+  # RW Docker-API proxy for the management plane (Dockhand) + autoheal.
+  # Scoped to single-host container management: view + lifecycle (start/stop/
+  # restart/delete), console (EXEC), volumes, images (pull via AUTH +
+  # DISTRIBUTION), and SYSTEM (df/prune). Swarm endpoints (NODES/SECRETS/
+  # CONFIGS) stay off — not a swarm. This grants Dockhand effectively full
+  # Docker control, which a management UI requires; the boundary is that
+  # Dockhand is Authentik-gated and this proxy is reachable only on the
+  # internal `security` network.
   socket-proxy-rw:
+    profiles: [core, socket-proxy-rw]
     <<: *hardened
-    image: tecnativa/docker-socket-proxy:latest
+    image: tecnativa/docker-socket-proxy:${SOCKET_PROXY_VERSION:-v0.4.2}
     container_name: socket-proxy-rw
+    mem_limit: 64m
     environment:
       CONTAINERS: "1"
       SERVICES: "1"
       TASKS: "1"
       NETWORKS: "1"
       IMAGES: "1"
+      VOLUMES: "1"
       INFO: "1"
       EVENTS: "1"
       VERSION: "1"
+      EXEC: "1"
+      SYSTEM: "1"
+      AUTH: "1"
+      DISTRIBUTION: "1"
       POST: "1"
       ALLOW_START: "1"
       ALLOW_STOP: "1"
       ALLOW_RESTARTS: "1"
+      ALLOW_DELETE: "1"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     networks:
       security:
-        ipv4_address: 10.0.13.22
+        ipv4_address: 192.0.2.10
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:2375/_ping"]
       interval: 10s
@@ -343,6 +416,7 @@ services:
     logging: *default-logging
 
   autoheal:
+    profiles: [core, autoheal]
     <<: *hardened
     image: willfarrell/autoheal:latest
     container_name: autoheal
@@ -361,6 +435,7 @@ services:
     logging: *default-logging
 
   postgres:
+    profiles: [core, postgres]
     image: pgvector/pgvector:pg16
     container_name: postgres
     environment:
@@ -405,7 +480,7 @@ services:
       - max_connections=${POSTGRES_MAX_CONNECTIONS:-200}
     networks:
       data:
-        ipv4_address: 10.0.12.30
+        ipv4_address: 192.0.2.10
     mem_limit: ${POSTGRES_MEM_LIMIT:-4g}
     cpus: ${POSTGRES_CPUS:-2}
     healthcheck:
@@ -431,6 +506,7 @@ services:
     logging: *default-logging
 
   redis:
+    profiles: [core, redis]
     <<: *hardened
     image: redis:7-alpine
     container_name: redis
@@ -455,7 +531,7 @@ services:
       - ${DOCK_DB}/redis:/data
     networks:
       data:
-        ipv4_address: 10.0.12.31
+        ipv4_address: 192.0.2.10
     mem_limit: ${REDIS_MEM_LIMIT:-2g}
     healthcheck:
       test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
@@ -467,6 +543,7 @@ services:
     logging: *default-logging
 
   wazuh-init:
+    profiles: [siem, wazuh-init]
     # One-shot: generates internal TLS certs the first time the stack comes up.
     # Subsequent runs detect admin.pem and exit 0. Generates each cert with both
     # IP and DNS SANs so clients connecting via docker-compose service names
@@ -557,17 +634,17 @@ services:
         DNS.1=wazuh-indexer-1
         DNS.2=wazuh-indexer-2
         DNS.3=wazuh-indexer-3
-        IP.1=10.0.13.31
-        IP.2=10.0.13.33
-        IP.3=10.0.13.34
+        IP.1=192.0.2.10
+        IP.2=192.0.2.10
+        IP.3=192.0.2.10
         EOF
         openssl req -new -key wazuh-indexer-key.pem -out wazuh-indexer.csr -config wazuh-indexer.cnf
         openssl x509 -req -in wazuh-indexer.csr -CA root-ca.pem -CAkey root-ca.key \
           -CAcreateserial -out wazuh-indexer.pem -days 3650 -sha256 \
           -extfile wazuh-indexer.cnf -extensions v3
 
-        gen_server_cert wazuh-manager   wazuh-manager   10.0.13.30
-        gen_server_cert wazuh-dashboard wazuh-dashboard 10.0.13.32
+        gen_server_cert wazuh-manager   wazuh-manager   192.0.2.10
+        gen_server_cert wazuh-dashboard wazuh-dashboard 192.0.2.10
 
         install -o 1000 -g 1000 -m 640 root-ca.pem        /certs/
         install -o 1000 -g 1000 -m 640 admin.pem          /certs/
@@ -583,11 +660,12 @@ services:
       - ${DOCK_CONF}/wazuh/certs:/certs
     networks:
       security:
-        ipv4_address: 10.0.13.29
+        ipv4_address: 192.0.2.10
     restart: "no"
     logging: *default-logging
 
   wazuh-indexer-1:
+    profiles: [siem, wazuh-indexer-1]
     <<: *wazuh-indexer
     container_name: wazuh-indexer-1
     environment:
@@ -601,9 +679,10 @@ services:
       - ${DOCK_CONF}/wazuh/certs:/usr/share/wazuh-indexer/certs:ro
     networks:
       security:
-        ipv4_address: 10.0.13.31
+        ipv4_address: 192.0.2.10
 
   wazuh-indexer-2:
+    profiles: [siem, wazuh-indexer-2]
     <<: *wazuh-indexer
     container_name: wazuh-indexer-2
     environment:
@@ -617,9 +696,10 @@ services:
       - ${DOCK_CONF}/wazuh/certs:/usr/share/wazuh-indexer/certs:ro
     networks:
       security:
-        ipv4_address: 10.0.13.33
+        ipv4_address: 192.0.2.10
 
   wazuh-indexer-3:
+    profiles: [siem, wazuh-indexer-3]
     <<: *wazuh-indexer
     container_name: wazuh-indexer-3
     environment:
@@ -633,9 +713,10 @@ services:
       - ${DOCK_CONF}/wazuh/certs:/usr/share/wazuh-indexer/certs:ro
     networks:
       security:
-        ipv4_address: 10.0.13.34
+        ipv4_address: 192.0.2.10
 
   wazuh-security-init:
+    profiles: [siem, wazuh-security-init]
     # One-shot: seeds the OpenSearch security index with bcrypt hashes of the
     # admin and kibanaserver passwords from the environment. Idempotent — a
     # flag file on the shared certs volume records success.
@@ -690,11 +771,12 @@ services:
       - ${DOCK_CONF}/wazuh/certs:/certs
     networks:
       security:
-        ipv4_address: 10.0.13.35
+        ipv4_address: 192.0.2.10
     restart: "no"
     logging: *default-logging
 
   wazuh-manager:
+    profiles: [siem, wazuh-manager]
     image: wazuh/wazuh-manager:${WAZUH_VERSION}
     container_name: wazuh-manager
     depends_on:
@@ -721,12 +803,19 @@ services:
     volumes:
       - ${DOCK_DATA}/wazuh/manager:/var/ossec/data
       - ${DOCK_CONF}/wazuh/certs:/etc/ssl/wazuh:ro
-      # Custom decoders/rules are copied in by post-start script rather than
-      # bind-mounted under /var/ossec/etc, because sub-mounts there shadow the
-      # cont-init config seeding that populates ossec.conf on first boot.
+      # Log sources tailed by the localfile block added by maintain.py wazuh.
+      # Bind-mounted at the same host path so ossec.conf paths match exactly.
+      - ${DOCK_CONF}/caddy/logs:${DOCK_CONF}/caddy/logs:ro
+      - ${DOCK_CONF}/crowdsec/notifications:${DOCK_CONF}/crowdsec/notifications:ro
+      - ${DOCK_CONF}/falco:${DOCK_CONF}/falco:ro
+      # Zeek live logs: shared spool/logger dir exposed at the path agent-host.conf
+      # references as /dock/conf/zeek/logs/current/ (bypasses dangling symlink on host).
+      - ${DOCK_DATA}/zeek/spool/logger:${DOCK_CONF}/zeek/logs/current:ro
+      # Cloudflare security event log tailed by Wazuh.
+      - ${DOCK_CONF}/cloudflare:${DOCK_CONF}/cloudflare:ro
     networks:
       security:
-        ipv4_address: 10.0.13.30
+        ipv4_address: 192.0.2.10
     ulimits:
       nofile:
         soft: 65536
@@ -749,6 +838,7 @@ services:
     logging: *default-logging
 
   wazuh-dashboard:
+    profiles: [siem, wazuh-dashboard]
     image: wazuh/wazuh-dashboard:${WAZUH_VERSION}
     container_name: wazuh-dashboard
     depends_on:
@@ -774,10 +864,13 @@ services:
       # node.options + keystore; shadowing the whole dir breaks the keystore
       # keystore init done by the entrypoint.
       - ${DOCK_CONF}/wazuh/dashboard/opensearch_dashboards.yml:/usr/share/wazuh-dashboard/config/opensearch_dashboards.yml:ro
+      # wazuh.yml holds the Wazuh API connection (host, port, username, password).
+      # Persisted here so container recreation doesn't revert to default credentials.
+      - ${DOCK_CONF}/wazuh/dashboard/wazuh.yml:/usr/share/wazuh-dashboard/data/wazuh/config/wazuh.yml
       - ${DOCK_CONF}/wazuh/certs:/usr/share/wazuh-dashboard/certs:ro
     networks:
       security:
-        ipv4_address: 10.0.13.32
+        ipv4_address: 192.0.2.10
     mem_limit: ${WAZUH_DASHBOARD_MEM_LIMIT:-1g}
     healthcheck:
       # 401 from /status means the server is up — Wazuh requires auth to read it.
@@ -792,7 +885,8 @@ services:
     logging: *default-logging
 
   falco:
-    image: falcosecurity/falco:latest
+    profiles: [runtime-sec, falco]
+    image: falcosecurity/falco:${FALCO_VERSION:-latest}
     container_name: falco
     privileged: true
     pid: host
@@ -813,7 +907,7 @@ services:
       - ${DOCK_CONF}/falco:/var/log/falco
     networks:
       security:
-        ipv4_address: 10.0.13.24
+        ipv4_address: 192.0.2.10
     mem_limit: ${FALCO_MEM_LIMIT:-512m}
     healthcheck:
       test: ["CMD-SHELL", "pidof falco >/dev/null"]
@@ -827,7 +921,8 @@ services:
     logging: *default-logging
 
   zeek:
-    image: zeek/zeek:latest
+    profiles: [netmon, zeek]
+    image: zeek/zeek:${ZEEK_VERSION:-8.1.1}
     container_name: zeek
     network_mode: host
     environment:
@@ -838,6 +933,7 @@ services:
       - ${DOCK_CONF}/zeek/networks.cfg:/usr/local/zeek/etc/networks.cfg:ro
       - ${DOCK_CONF}/zeek/intel:/usr/local/zeek/intel:ro
       - ${DOCK_CONF}/zeek/logs:/usr/local/zeek/logs
+      - ${DOCK_DATA}/zeek/spool:/usr/local/zeek/spool
     cap_drop:
       - ALL
     cap_add:
@@ -862,6 +958,7 @@ services:
     logging: *default-logging
 
   authentik-migration:
+    profiles: [core, authentik-migration]
     image: ghcr.io/goauthentik/server:${AUTHENTIK_VERSION}
     container_name: authentik-migration
     depends_on:
@@ -877,7 +974,7 @@ services:
       AUTHENTIK_POSTGRESQL__NAME: ${AUTHENTIK_DB_NAME}
       AUTHENTIK_REDIS__HOST: redis
       AUTHENTIK_REDIS__PASSWORD: ${REDIS_PASSWORD}
-      AUTHENTIK_REDIS__DB: ${AUTHENTIK_REDIS_DB}
+      AUTHENTIK_REDIS__DB: ${REDIS_DB_AUTHENTIK}
       AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY}
       AUTHENTIK_ERROR_REPORTING__ENABLED: "false"
       AUTHENTIK_DISABLE_UPDATE_CHECK: "true"
@@ -887,6 +984,7 @@ services:
     logging: *default-logging
 
   authentik-server:
+    profiles: [core, authentik-server]
     image: ghcr.io/goauthentik/server:${AUTHENTIK_VERSION}
     container_name: authentik-server
     depends_on:
@@ -900,24 +998,26 @@ services:
       AUTHENTIK_POSTGRESQL__NAME: ${AUTHENTIK_DB_NAME}
       AUTHENTIK_REDIS__HOST: redis
       AUTHENTIK_REDIS__PASSWORD: ${REDIS_PASSWORD}
-      AUTHENTIK_REDIS__DB: ${AUTHENTIK_REDIS_DB}
+      AUTHENTIK_REDIS__DB: ${REDIS_DB_AUTHENTIK}
       AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY}
       AUTHENTIK_BOOTSTRAP_EMAIL: ${ADMIN_EMAIL}
       AUTHENTIK_BOOTSTRAP_PASSWORD: ${AUTHENTIK_BOOTSTRAP_PASSWORD}
       AUTHENTIK_BOOTSTRAP_TOKEN: ${AUTHENTIK_BOOTSTRAP_TOKEN}
       AUTHENTIK_ERROR_REPORTING__ENABLED: "false"
       AUTHENTIK_DISABLE_UPDATE_CHECK: "true"
+    ports:
+      - "127.0.0.1:9000:9000"
     volumes:
       - ${DOCK_CONF}/authentik/media:/media
       - ${DOCK_CONF}/authentik/custom-templates:/templates:ro
     networks:
       auth-internal:
-        ipv4_address: 10.0.11.20
+        ipv4_address: 192.0.2.10
       ingress:
-        ipv4_address: 10.0.10.50
+        ipv4_address: 192.0.2.10
       data:
       oidc-clients:
-        ipv4_address: 10.0.17.11
+        ipv4_address: 192.0.2.10
     mem_limit: ${AUTHENTIK_SERVER_MEM_LIMIT:-2g}
     healthcheck:
       test: ["CMD", "ak", "healthcheck"]
@@ -931,6 +1031,7 @@ services:
     logging: *default-logging
 
   authentik-worker:
+    profiles: [core, authentik-worker]
     image: ghcr.io/goauthentik/server:${AUTHENTIK_VERSION}
     container_name: authentik-worker
     depends_on:
@@ -944,7 +1045,7 @@ services:
       AUTHENTIK_POSTGRESQL__NAME: ${AUTHENTIK_DB_NAME}
       AUTHENTIK_REDIS__HOST: redis
       AUTHENTIK_REDIS__PASSWORD: ${REDIS_PASSWORD}
-      AUTHENTIK_REDIS__DB: ${AUTHENTIK_REDIS_DB}
+      AUTHENTIK_REDIS__DB: ${REDIS_DB_AUTHENTIK}
       AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY}
       AUTHENTIK_ERROR_REPORTING__ENABLED: "false"
       AUTHENTIK_DISABLE_UPDATE_CHECK: "true"
@@ -953,7 +1054,7 @@ services:
       - ${DOCK_CONF}/authentik/custom-templates:/templates:ro
     networks:
       auth-internal:
-        ipv4_address: 10.0.11.21
+        ipv4_address: 192.0.2.10
       data:
     mem_limit: ${AUTHENTIK_WORKER_MEM_LIMIT:-2g}
     healthcheck:
@@ -974,6 +1075,7 @@ services:
   # external proxies; a dedicated container is required.
   # ==========================================================
   authentik-proxy:
+    profiles: [core, authentik-proxy]
     image: ghcr.io/goauthentik/proxy:${AUTHENTIK_VERSION}
     container_name: authentik-proxy
     depends_on:
@@ -982,24 +1084,77 @@ services:
       redis:
         condition: service_healthy
     environment:
-      AUTHENTIK_HOST: http://authentik-server:9000
+      AUTHENTIK_HOST: https://${AUTHENTIK_SUBDOMAIN}.${PUBLIC_FQDN}
       AUTHENTIK_INSECURE: "true"
       AUTHENTIK_TOKEN: ${AUTHENTIK_OUTPOST_TOKEN}
       AUTHENTIK_REDIS__HOST: redis
       AUTHENTIK_REDIS__PASSWORD: ${REDIS_PASSWORD}
       AUTHENTIK_REDIS__DB: ${REDIS_DB_AUTHENTIK}
+    extra_hosts:
+      # Route example.com to Caddy on the ingress network (avoids Cloudflare
+      # round-trip) so OIDC discovery returns public URLs, not internal hostnames.
+      - "${AUTHENTIK_SUBDOMAIN}.${PUBLIC_FQDN}:192.0.2.10"
     networks:
       ingress:
-        ipv4_address: 10.0.10.22
+        ipv4_address: 192.0.2.10
       data:
     mem_limit: 256m
     security_opt:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9300/metrics | grep -q authentik_outpost_info"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
     restart: unless-stopped
     labels:
       - autoheal=true
+    logging: *default-logging
+
+  # ==========================================================
+  # OpenBao — secrets backend of record (ADR 0001).
+  # File storage on security net; TLS terminated upstream by
+  # Caddy (public) and Tailscale (tailnet). IPC_LOCK granted
+  # so mlock keeps unseal keys out of swap.
+  # UI: bao.PUBLIC_FQDN (Caddy+Authentik) / bao.TAILNET_FQDN
+  # Bootstrap: scripts/bao-bootstrap.py (idempotent, run before compose up)
+  # Digest: record after first pull with:
+  #   docker buildx imagetools inspect openbao/openbao:2.4.1
+  # ==========================================================
+  openbao:
+    profiles: [core, openbao]
+    # digest pinned (verified on first pull): openbao/openbao:2.4.1
+    image: openbao/openbao:2.4.1@sha256:597f62847dd382382056a1d6704d50465908c2040038c4611832a23269a67112
+    container_name: openbao
+    command: ["server", "-config=/openbao/config/openbao.hcl"]
+    # NOTE: no IPC_LOCK cap — OpenBao 2.x removed mlock. Protect keys via host swap
+    # hardening instead (see docs/openbao-runbook.md).
+    environment:
+      BAO_ADDR: http://127.0.0.1:8200
+      BAO_AKV_TENANT_ID: ${BAO_AKV_TENANT_ID:-}
+      BAO_AKV_CLIENT_ID: ${BAO_AKV_CLIENT_ID:-}
+      BAO_AKV_CLIENT_SECRET: ${BAO_AKV_CLIENT_SECRET:-}
+      BAO_AKV_VAULT_NAME: ${BAO_AKV_VAULT_NAME:-}
+      BAO_AKV_KEY_NAME: ${BAO_AKV_KEY_NAME:-}
+    volumes:
+      - ${DOCK_CONF}/openbao/config:/openbao/config:ro
+      - ${DOCK_DATA}/openbao/data:/openbao/data
+      - ${DOCK_DATA}/openbao/audit:/openbao/audit
+    networks:
+      security:
+        ipv4_address: 192.0.2.10
+    healthcheck:
+      # /v1/sys/health: 200 = unsealed+active, 503 = sealed, 501 = uninit. Accept 200/429/472/473/501/503
+      # as "process up" so a sealed-but-running vault is not flapped as unhealthy.
+      test: ["CMD-SHELL", "bao status -address=http://127.0.0.1:8200 >/dev/null 2>&1; rc=$$?; [ $$rc -eq 0 ] || [ $$rc -eq 2 ]"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
     logging: *default-logging
 
   # ==========================================================
@@ -1013,6 +1168,7 @@ services:
   # into /var/www/html at runtime.
   # ==========================================================
   nextcloud:
+    profiles: [files, nextcloud]
     image: nextcloud:${NEXTCLOUD_VERSION:-33}
     container_name: nextcloud
     depends_on:
@@ -1037,6 +1193,14 @@ services:
       REDIS_HOST_DB: ${REDIS_DB_NEXTCLOUD}
       OVERWRITEPROTOCOL: https
       OVERWRITECLIURL: https://${NEXTCLOUD_SUBDOMAIN}.${PUBLIC_FQDN}
+      # Space-separated trusted reverse proxies (the NC image splits this into
+      # the trusted_proxies array). Caddy connects from 192.0.2.10 (shares the
+      # tailscale-ingress netns) on the cloud network. notify-push (192.0.2.10)
+      # also forwards client IPs to NC during its self-test/push validation, so
+      # it must be trusted too — otherwise notify_push:setup fails its
+      # "trusted proxy" check. Without these, mod_remoteip won't honor
+      # X-Forwarded-For and NC sees the proxy IP as the client.
+      TRUSTED_PROXIES: "192.0.2.10 192.0.2.10"
       PHP_MEMORY_LIMIT: 512M
       PHP_UPLOAD_LIMIT: 10G
       # OIDC — read by the occ user_oidc:provider command (see .env.example).
@@ -1051,12 +1215,12 @@ services:
       - ${DOCK_CONF}/nextcloud/servername.conf:/etc/apache2/conf-enabled/servername.conf:ro
     networks:
       apps:
-        ipv4_address: 10.0.15.26
+        ipv4_address: 192.0.2.10
       cloud:
-        ipv4_address: 10.0.16.20
+        ipv4_address: 192.0.2.10
       data:
       oidc-clients:
-        ipv4_address: 10.0.17.20
+        ipv4_address: 192.0.2.10
     mem_limit: ${NEXTCLOUD_MEM_LIMIT:-2g}
     cap_drop:
       - ALL
@@ -1080,13 +1244,70 @@ services:
     logging: *default-logging
 
   # ==========================================================
+  # notify-push — Nextcloud Client Push (High-Performance
+  # Backend for Files). Runs the Rust daemon bundled inside the
+  # notify_push app. The binary only exists AFTER
+  # `occ app:install notify_push` runs in the nextcloud container
+  # (maintain.py nextcloud), so the command polls for it before
+  # exec — this resolves the first-deploy chicken-and-egg without
+  # a separate orchestration step. Reads DB + Redis creds from
+  # the shared read-only config.php. Serves WS on :7867; Caddy
+  # proxies it at <cloud-fqdn>/push (occ notify_push:setup).
+  # entrypoint:[] bypasses the NC image entrypoint so it never
+  # tries to (re)install Nextcloud against the shared volume.
+  # ==========================================================
+  notify-push:
+    profiles: [files, notify-push]
+    <<: *hardened
+    image: nextcloud:${NEXTCLOUD_VERSION:-33}
+    container_name: notify-push
+    depends_on:
+      nextcloud:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    user: "33:33"
+    entrypoint: []
+    command:
+      - /bin/sh
+      - -c
+      - |
+        BIN=/var/www/html/custom_apps/notify_push/bin/x86_64/notify_push
+        echo "notify-push: waiting for binary (installed via 'occ app:install notify_push')..."
+        until [ -x "$$BIN" ]; do sleep 10; done
+        echo "notify-push: starting daemon on :7867"
+        exec "$$BIN" --port 7867 /var/www/html/config/config.php
+    environment:
+      NEXTCLOUD_URL: http://nextcloud
+      PORT: "7867"
+    volumes:
+      - ${DOCK_DATA}/nextcloud:/var/www/html:ro
+    networks:
+      cloud:
+        ipv4_address: 192.0.2.10
+      data:
+    mem_limit: ${NOTIFY_PUSH_MEM_LIMIT:-128m}
+    healthcheck:
+      # Liveness only: /test/cookie returns 400 ("Missing token") without auth,
+      # so DON'T use curl -f (that treats 4xx as failure). A plain request that
+      # gets *any* HTTP response proves the daemon is listening; connection
+      # refused (daemon down / still waiting for the binary) exits non-zero.
+      test: ["CMD-SHELL", "curl -s -o /dev/null http://127.0.0.1:7867/test/cookie || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    logging: *default-logging
+
+  # ==========================================================
   # coturn — TURN/STUN server for Nextcloud Talk WebRTC.
   # Binds directly to host ports 3478 and 49152-49200 (UDP/TCP)
   # — these bypass Cloudflare since CF does not proxy UDP.
   # denied-peer-ip blocks relay to RFC-1918 ranges (SSRF guard).
   # ==========================================================
   coturn:
-    image: coturn/coturn:latest
+    profiles: [talk, coturn]
+    image: coturn/coturn:${COTURN_VERSION:-4.10.0-r1}
     container_name: coturn
     network_mode: host
     volumes:
@@ -1113,6 +1334,7 @@ services:
   # Validates Nextcloud tokens by calling http://nextcloud/ on the talk network.
   # ==========================================================
   spreed-signaling:
+    profiles: [talk, spreed-signaling]
     image: strukturag/nextcloud-spreed-signaling:${SPREED_SIGNALING_VERSION:-latest}
     container_name: spreed-signaling
     depends_on:
@@ -1124,7 +1346,7 @@ services:
       - ${DOCK_CONF}/spreed-signaling/server.conf:/config/server.conf:ro
     networks:
       cloud:
-        ipv4_address: 10.0.16.30
+        ipv4_address: 192.0.2.10
     mem_limit: ${SPREED_SIGNALING_MEM_LIMIT:-256m}
     cap_drop:
       - ALL
@@ -1149,11 +1371,12 @@ services:
   # Service name "janus" must match the URL in server.conf [janus].
   # RTP media ports 20000-20100/udp published to host so WebRTC
   # peers can reach them directly (Cloudflare does not proxy UDP).
-  # Admin API on 8188 is routed via Caddy at gate.secop.dev,
+  # Admin API on 8188 is routed via Caddy at example.com,
   # gated by Authentik. Internal API on 8088 is talk-network only.
   # nat_1_1_mapping in janus.jcfg must be set to the host public IP.
   # ==========================================================
   janus:
+    profiles: [talk, janus]
     image: ${JANUS_IMAGE:-meetecho/janus-gateway:latest}
     container_name: janus-gateway
     volumes:
@@ -1163,7 +1386,7 @@ services:
       - "20000-20100:20000-20100/udp"
     networks:
       cloud:
-        ipv4_address: 10.0.16.31
+        ipv4_address: 192.0.2.10
     mem_limit: ${JANUS_MEM_LIMIT:-512m}
     cap_drop:
       - ALL
@@ -1194,9 +1417,9 @@ services:
   # ==========================================================
 
   gluetun:
+    profiles: [vpn, gluetun]
     image: qmcgaw/gluetun:latest
     container_name: gluetun
-    profiles: [media]
     cap_add:
       - NET_ADMIN
     devices:
@@ -1220,10 +1443,10 @@ services:
       # DOT off: keep Docker's embedded resolver so container names resolve.
       DOT: "off"
       # Allow direct traffic to Docker subnets without going through VPN.
-      FIREWALL_OUTBOUND_SUBNETS: 10.0.0.0/8
+      FIREWALL_OUTBOUND_SUBNETS: 192.0.2.10/8
     networks:
       media:
-        ipv4_address: 10.0.14.30
+        ipv4_address: 192.0.2.10
     mem_limit: ${GLUETUN_MEM_LIMIT:-256m}
     security_opt:
       - no-new-privileges:true
@@ -1241,9 +1464,9 @@ services:
     logging: *default-logging
 
   prowlarr:
-    image: lscr.io/linuxserver/prowlarr:latest
+    profiles: [video, prowlarr]
+    image: lscr.io/linuxserver/prowlarr:${PROWLARR_VERSION:-2.3.5.5327-ls144}
     container_name: prowlarr
-    profiles: [media]
     network_mode: "service:gluetun"
     depends_on:
       gluetun:
@@ -1269,9 +1492,9 @@ services:
     logging: *default-logging
 
   radarr:
-    image: lscr.io/linuxserver/radarr:latest
+    profiles: [video, radarr]
+    image: lscr.io/linuxserver/radarr:${RADARR_VERSION:-6.1.1.10360-ls300}
     container_name: radarr
-    profiles: [media]
     network_mode: "service:gluetun"
     depends_on:
       gluetun:
@@ -1299,9 +1522,9 @@ services:
     logging: *default-logging
 
   sonarr:
-    image: lscr.io/linuxserver/sonarr:latest
+    profiles: [video, sonarr]
+    image: lscr.io/linuxserver/sonarr:${SONARR_VERSION:-4.0.17.2952-ls309}
     container_name: sonarr
-    profiles: [media]
     network_mode: "service:gluetun"
     depends_on:
       gluetun:
@@ -1329,9 +1552,9 @@ services:
     logging: *default-logging
 
   lidarr:
-    image: lscr.io/linuxserver/lidarr:latest
+    profiles: [audio, lidarr]
+    image: lscr.io/linuxserver/lidarr:${LIDARR_VERSION:-3.1.0.4875-ls26}
     container_name: lidarr
-    profiles: [media]
     network_mode: "service:gluetun"
     depends_on:
       gluetun:
@@ -1359,9 +1582,9 @@ services:
     logging: *default-logging
 
   flaresolverr:
-    image: ghcr.io/flaresolverr/flaresolverr:latest
+    profiles: [captcha, flaresolverr]
+    image: ghcr.io/flaresolverr/flaresolverr:${FLARESOLVERR_VERSION:-v3.4.6}
     container_name: flaresolverr
-    profiles: [media]
     network_mode: "service:gluetun"
     depends_on:
       gluetun:
@@ -1386,9 +1609,9 @@ services:
     logging: *default-logging
 
   qbittorrent:
-    image: lscr.io/linuxserver/qbittorrent:latest
+    profiles: [downloads, qbittorrent]
+    image: lscr.io/linuxserver/qbittorrent:${QBITTORRENT_VERSION:-5.1.4-r3-ls452}
     container_name: qbittorrent
-    profiles: [media]
     network_mode: "service:gluetun"
     depends_on:
       gluetun:
@@ -1421,9 +1644,9 @@ services:
   # directly by LAN/Tailnet clients.
   # ==========================================================
   jellyfin:
-    image: lscr.io/linuxserver/jellyfin:${JELLYFIN_VERSION:-latest}
+    profiles: [stream, jellyfin]
+    image: lscr.io/linuxserver/jellyfin:${JELLYFIN_VERSION:-10.11.8ubu2404-ls30}
     container_name: jellyfin
-    profiles: [media]
     environment:
       PUID: ${PUID}
       PGID: ${PGID}
@@ -1436,9 +1659,9 @@ services:
       - /dev/dri:/dev/dri
     networks:
       media:
-        ipv4_address: 10.0.14.21
+        ipv4_address: 192.0.2.10
       oidc-clients:
-        ipv4_address: 10.0.17.25
+        ipv4_address: 192.0.2.10
     mem_limit: ${JELLYFIN_MEM_LIMIT:-4g}
     security_opt:
       - no-new-privileges:true
@@ -1458,9 +1681,9 @@ services:
   # Profile: media. Talks to Sonarr/Radarr via gluetun netns.
   # ==========================================================
   jellyseerr:
+    profiles: [requests, jellyseerr]
     image: fallenbagel/jellyseerr:${JELLYSEERR_VERSION:-latest}
     container_name: jellyseerr
-    profiles: [media]
     depends_on:
       jellyfin:
         condition: service_healthy
@@ -1471,7 +1694,7 @@ services:
       - ${DOCK_CONF}/jellyseerr:/app/config
     networks:
       media:
-        ipv4_address: 10.0.14.22
+        ipv4_address: 192.0.2.10
     mem_limit: ${JELLYSEERR_MEM_LIMIT:-512m}
     security_opt:
       - no-new-privileges:true
@@ -1497,9 +1720,9 @@ services:
   # ==========================================================
 
   ntfy:
+    profiles: [notify, ntfy]
     image: binwiederhier/ntfy:${NTFY_VERSION:-latest}
     container_name: ntfy
-    profiles: [apps]
     command: serve
     environment:
       TZ: ${TZ}
@@ -1515,7 +1738,9 @@ services:
       - ${DOCK_DATA}/ntfy/data:/var/lib/ntfy
     networks:
       apps:
-        ipv4_address: 10.0.15.20
+        ipv4_address: 192.0.2.10
+      security:
+        ipv4_address: 192.0.2.10
     mem_limit: ${NTFY_MEM_LIMIT:-256m}
     security_opt:
       - no-new-privileges:true
@@ -1540,9 +1765,9 @@ services:
   # Runs as uid 1000. Database migrations run on startup.
   # ==========================================================
   tandoor:
+    profiles: [recipes, tandoor]
     image: vabene1111/recipes:${TANDOOR_VERSION:-latest}
     container_name: tandoor
-    profiles: [apps]
     depends_on:
       postgres:
         condition: service_healthy
@@ -1563,6 +1788,7 @@ services:
       REDIS_HOST: redis
       REDIS_PORT: "6379"
       REDIS_PASSWORD: ${REDIS_PASSWORD}
+      REDIS_USERNAME: "default"
       REDIS_DB: ${REDIS_DB_TANDOOR}
       # OIDC — Django allauth reads these natively at startup.
       # The provider id "authentik" fixes the callback path to
@@ -1575,10 +1801,10 @@ services:
       - ${DOCK_DATA}/tandoor/static:/opt/recipes/staticfiles
     networks:
       apps:
-        ipv4_address: 10.0.15.21
+        ipv4_address: 192.0.2.10
       data:
       oidc-clients:
-        ipv4_address: 10.0.17.23
+        ipv4_address: 192.0.2.10
     mem_limit: ${TANDOOR_MEM_LIMIT:-512m}
     cap_drop:
       - ALL
@@ -1595,7 +1821,7 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
-      start_period: 90s
+      start_period: 200s
     restart: unless-stopped
     labels:
       - autoheal=true
@@ -1608,9 +1834,9 @@ services:
   # JWT_SECRET generated by gen-secrets.sh.
   # ==========================================================
   vikunja:
+    profiles: [tasks, vikunja]
     image: vikunja/vikunja:${VIKUNJA_VERSION:-latest}
     container_name: vikunja
-    profiles: [apps]
     depends_on:
       postgres:
         condition: service_healthy
@@ -1637,15 +1863,15 @@ services:
       VIKUNJA_AUTH_OPENID_PROVIDERS_AUTHENTIK_CLIENTID: ${VIKUNJA_OIDC_CLIENT_ID:-}
       VIKUNJA_AUTH_OPENID_PROVIDERS_AUTHENTIK_CLIENTSECRET: ${VIKUNJA_OIDC_CLIENT_SECRET:-}
       VIKUNJA_AUTH_OPENID_PROVIDERS_AUTHENTIK_SCOPE: openid email profile
-      # VIKUNJA_AUTH_LOCAL_ENABLED: "false"  # uncomment to disable password login
+      VIKUNJA_AUTH_LOCAL_ENABLED: "${VIKUNJA_AUTH_LOCAL_ENABLED:-true}"
     volumes:
       - ${DOCK_DATA}/vikunja:/app/vikunja/files
     networks:
       apps:
-        ipv4_address: 10.0.15.22
+        ipv4_address: 192.0.2.10
       data:
       oidc-clients:
-        ipv4_address: 10.0.17.22
+        ipv4_address: 192.0.2.10
     mem_limit: ${VIKUNJA_MEM_LIMIT:-512m}
     security_opt:
       - no-new-privileges:true
@@ -1670,9 +1896,9 @@ services:
   # CORS/WebSocket connections will fail (editor won't load).
   # ==========================================================
   affine:
+    profiles: [notes, affine]
     image: ghcr.io/toeverything/affine:${AFFINE_VERSION:-stable}
     container_name: affine
-    profiles: [apps]
     depends_on:
       postgres:
         condition: service_healthy
@@ -1696,10 +1922,10 @@ services:
       - ${DOCK_DATA}/affine/storage:/root/.affine/storage
     networks:
       apps:
-        ipv4_address: 10.0.15.23
+        ipv4_address: 192.0.2.10
       data:
       oidc-clients:
-        ipv4_address: 10.0.17.21
+        ipv4_address: 192.0.2.10
     mem_limit: ${AFFINE_MEM_LIMIT:-2g}
     security_opt:
       - no-new-privileges:true
@@ -1724,9 +1950,11 @@ services:
   # pressure. Isolated to the apps network; no password needed.
   # ==========================================================
   redis-affine:
+    profiles: [notes, redis-affine]
     image: redis:7-alpine
     container_name: redis-affine
-    profiles: [apps]
+    labels:
+      - autoheal=true
     command:
       - redis-server
       - --maxmemory-policy
@@ -1735,7 +1963,7 @@ services:
       - "no"
     networks:
       apps:
-        ipv4_address: 10.0.15.27
+        ipv4_address: 192.0.2.10
     mem_limit: ${REDIS_AFFINE_MEM_LIMIT:-512m}
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
@@ -1762,6 +1990,7 @@ services:
   # Uses socket-proxy-rw for full container management.
   # ==========================================================
   dockhand:
+    profiles: [container-mgmt, dockhand]
     image: fnsys/dockhand:latest
     container_name: dockhand
     depends_on:
@@ -1775,7 +2004,7 @@ services:
       - ${DOCK_DATA}/dockhand:/app/data
     networks:
       security:
-        ipv4_address: 10.0.13.23
+        ipv4_address: 192.0.2.10
     mem_limit: ${DOCKHAND_MEM_LIMIT:-256m}
     security_opt:
       - no-new-privileges:true
@@ -1797,6 +2026,7 @@ services:
   # Gates on Authentik forward-auth at sec.{PUBLIC_FQDN}.
   # ==========================================================
   falcosidekick:
+    profiles: [runtime-sec, falcosidekick]
     image: falcosecurity/falcosidekick:latest
     container_name: falcosidekick
     depends_on:
@@ -1805,9 +2035,15 @@ services:
       WEBUI_URL: https://${FALCO_SUBDOMAIN:-sec}.${PUBLIC_FQDN}
       KAFKA_HOSTPORT: redpanda:9092
       KAFKA_TOPIC: falco.alerts
+      NTFY_HOSTPORT: "ntfy:80"
+      NTFY_TOPIC: "falco"
+      NTFY_CHECKCERT: "false"
+      NTFY_MINIMUMPRIORITY: "warning"
     networks:
       security:
-        ipv4_address: 10.0.13.25
+        ipv4_address: 192.0.2.10
+      apps:
+        ipv4_address: 192.0.2.10
     mem_limit: 256m
     security_opt:
       - no-new-privileges:true
@@ -1823,13 +2059,16 @@ services:
     logging: *default-logging
 
   redis-falco:
+    profiles: [runtime-sec, redis-falco]
     image: redis/redis-stack-server:latest
     container_name: redis-falco
+    labels:
+      - autoheal=true
     volumes:
       - ${DOCK_DATA}/redis-falco:/data
     networks:
       security:
-        ipv4_address: 10.0.13.28
+        ipv4_address: 192.0.2.10
     mem_limit: 128m
     security_opt:
       - no-new-privileges:true
@@ -1843,6 +2082,7 @@ services:
     logging: *default-logging
 
   falcosidekick-ui:
+    profiles: [runtime-sec, falcosidekick-ui]
     image: falcosecurity/falcosidekick-ui:latest
     container_name: falcosidekick-ui
     depends_on:
@@ -1856,7 +2096,7 @@ services:
       FALCOSIDEKICK_UI_DISABLEAUTH: "true"
     networks:
       security:
-        ipv4_address: 10.0.13.26
+        ipv4_address: 192.0.2.10
     mem_limit: 256m
     security_opt:
       - no-new-privileges:true
@@ -1874,17 +2114,21 @@ services:
   # ==========================================================
   # Zeek log browser — filebrowser serving Zeek TSV log files
   # at net.{PUBLIC_FQDN}. Auth disabled (Authentik gates it).
-  # Mounts Zeek's log directory read-only.
+  # Runs as svc-user:media (1010:1010) so it can traverse /dock/conf/zeek/logs
+  # which is owned 1010:1010 mode 770. Database is persisted to /dock/data/zeek-logs.
   # ==========================================================
   zeek-logs:
-    image: filebrowser/filebrowser:latest
+    profiles: [netmon, zeek-logs]
+    image: filebrowser/filebrowser:${FILEBROWSER_VERSION:-v2.63.2}
     container_name: zeek-logs
+    user: "1010:1010"
     command: ["--noauth", "--root", "/srv", "--port", "80"]
     volumes:
       - ${DOCK_CONF}/zeek/logs:/srv:ro
+      - ${DOCK_DATA}/zeek-logs:/database
     networks:
       security:
-        ipv4_address: 10.0.13.27
+        ipv4_address: 192.0.2.10
     mem_limit: 128m
     security_opt:
       - no-new-privileges:true
@@ -1908,6 +2152,7 @@ services:
   # Prometheus metrics: http://redpanda:9644/public_metrics
   # ==========================================================
   redpanda:
+    profiles: [streaming, redpanda]
     image: docker.redpanda.com/redpandadata/redpanda:latest
     container_name: redpanda
     command:
@@ -1926,7 +2171,7 @@ services:
       - ${DOCK_DATA}/redpanda:/var/lib/redpanda/data
     networks:
       security:
-        ipv4_address: 10.0.13.36
+        ipv4_address: 192.0.2.10
     mem_limit: 512m
     cpus: 1
     security_opt:
@@ -1943,6 +2188,7 @@ services:
     logging: *default-logging
 
   redpanda-init:
+    profiles: [streaming, redpanda-init]
     image: docker.redpanda.com/redpandadata/redpanda:latest
     container_name: redpanda-init
     depends_on:
@@ -1962,6 +2208,7 @@ services:
     logging: *default-logging
 
   redpanda-console:
+    profiles: [streaming, redpanda-console]
     image: docker.redpanda.com/redpandadata/console:latest
     container_name: redpanda-console
     depends_on:
@@ -1972,7 +2219,7 @@ services:
       KAFKA_SCHEMAREGISTRY_ENABLED: "false"
     networks:
       security:
-        ipv4_address: 10.0.13.37
+        ipv4_address: 192.0.2.10
     mem_limit: 256m
     security_opt:
       - no-new-privileges:true
@@ -1995,9 +2242,9 @@ services:
   # immich-machine-learning: face recognition + CLIP search
   # ==========================================================
   immich-server:
-    image: ghcr.io/immich-app/immich-server:${IMMICH_VERSION:-release}
+    profiles: [photos, immich-server]
+    image: ghcr.io/immich-app/immich-server:${IMMICH_VERSION:-v2.7.5}
     container_name: immich-server
-    profiles: [apps]
     depends_on:
       postgres:
         condition: service_healthy
@@ -2019,10 +2266,10 @@ services:
       - /etc/localtime:/etc/localtime:ro
     networks:
       apps:
-        ipv4_address: 10.0.15.24
+        ipv4_address: 192.0.2.10
       data:
       oidc-clients:
-        ipv4_address: 10.0.17.24
+        ipv4_address: 192.0.2.10
     mem_limit: ${IMMICH_SERVER_MEM_LIMIT:-2g}
     security_opt:
       - no-new-privileges:true
@@ -2038,9 +2285,9 @@ services:
     logging: *default-logging
 
   immich-machine-learning:
-    image: ghcr.io/immich-app/immich-machine-learning:${IMMICH_VERSION:-release}
+    profiles: [photos, immich-machine-learning]
+    image: ghcr.io/immich-app/immich-machine-learning:${IMMICH_VERSION:-v2.7.5}
     container_name: immich-machine-learning
-    profiles: [apps]
     volumes:
       - ${DOCK_DATA}/immich/model-cache:/cache
     networks:
@@ -2049,7 +2296,7 @@ services:
     security_opt:
       - no-new-privileges:true
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:3003/ping | grep -q pong"]
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:3003/ping')"]
       interval: 30s
       timeout: 10s
       retries: 5
@@ -2066,9 +2313,13 @@ services:
   # breaks all stored credentials. gen-secrets.sh never overwrites it.
   # ==========================================================
   n8n:
-    image: docker.n8n.io/n8nio/n8n:latest
+    profiles: [automation, n8n]
+    # Pinned (was :latest): an unpinned latest shipped a node binary with a
+    # libstdc++ ABI mismatch ("Error relocating /usr/local/bin/node: symbol
+    # not found", exit 127) that crash-looped 2000+ times. Pin a known-good
+    # version; bump N8N_VERSION in .env after testing a new release.
+    image: docker.n8n.io/n8nio/n8n:${N8N_VERSION:-2.21.7}
     container_name: n8n
-    profiles: [apps]
     depends_on:
       postgres:
         condition: service_healthy
@@ -2085,15 +2336,15 @@ services:
       WEBHOOK_URL: https://${N8N_SUBDOMAIN:-soar}.${PUBLIC_FQDN}/
       N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
       GENERIC_TIMEZONE: ${TZ}
-      N8N_RUNNERS_ENABLED: "true"
+      N8N_TRUST_PROXY: "true"
     volumes:
       - ${DOCK_DATA}/n8n:/home/node/.n8n
     networks:
       apps:
-        ipv4_address: 10.0.15.25
+        ipv4_address: 192.0.2.10
       data:
       security:
-        ipv4_address: 10.0.13.40
+        ipv4_address: 192.0.2.10
     mem_limit: ${N8N_MEM_LIMIT:-1g}
     security_opt:
       - no-new-privileges:true
@@ -2105,6 +2356,477 @@ services:
       timeout: 10s
       retries: 5
       start_period: 60s
+    restart: unless-stopped
+    labels:
+      - autoheal=true
+    logging: *default-logging
+
+  # ==========================================================
+  # Dashy — home launcher served at the apex example.com domain.
+  # Config at ${DOCK_CONF}/dashy/conf.yml — regenerate with:
+  #   python3 scripts/gen-dashy-config.py
+  # Docs: https://dashy.to/docs
+  # ==========================================================
+  dashy:
+    profiles: [home, dashy]
+    image: lissy93/dashy:${DASHY_VERSION:-latest}
+    container_name: dashy
+    volumes:
+      - ${DOCK_CONF}/dashy:/app/user-data
+    environment:
+      NODE_ENV: production
+    networks:
+      apps:
+        ipv4_address: 192.0.2.10
+    mem_limit: ${DASHY_MEM_LIMIT:-256m}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qSO /dev/null http://127.0.0.1:8080/ 2>&1 | grep -q '200'"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+    labels:
+      - autoheal=true
+    logging: *default-logging
+
+  # ==========================================================
+  # ClickHouse — columnar OLAP store for security analytics.
+  # Schema: templates/clickhouse/init/ (auto-loaded on first start)
+  # Native protocol: 9000 (Vector sink), HTTP: 8123 (Grafana plugin)
+  # ==========================================================
+  clickhouse:
+    profiles: [analytics, clickhouse]
+    image: clickhouse/clickhouse-server:24-alpine
+    container_name: clickhouse
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_DB: your-org
+      CLICKHOUSE_USER: your-org
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    volumes:
+      - ${DOCK_DATA}/clickhouse:/var/lib/clickhouse
+      - ${DOCK_CONF}/clickhouse/init:/docker-entrypoint-initdb.d:ro
+    networks:
+      security:
+        ipv4_address: 192.0.2.10
+      monitoring:
+        ipv4_address: 192.0.2.10
+    mem_limit: ${CLICKHOUSE_MEM_LIMIT:-4g}
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client --query 'SELECT 1' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    labels:
+      - autoheal=true
+    logging: *default-logging
+
+  # ==========================================================
+  # Vector — log ingestion agent: Caddy access + Coraza → ClickHouse
+  # Config: templates/vector/vector.toml (mounted read-only)
+  # ==========================================================
+  vector:
+    profiles: [analytics, vector]
+    image: timberio/vector:latest-alpine
+    container_name: vector
+    restart: unless-stopped
+    command: ["--config", "/etc/vector/vector.toml"]
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    environment:
+      CLICKHOUSE_VECTOR_PASSWORD: ${CLICKHOUSE_VECTOR_PASSWORD}
+    volumes:
+      - ${DOCK_CONF}/vector/vector.toml:/etc/vector/vector.toml:ro
+      - ${DOCK_CONF}/caddy/logs:/var/log/caddy:ro
+      - ${DOCK_DATA}/vector:/var/lib/vector
+    networks:
+      security:
+        ipv4_address: 192.0.2.10
+    mem_limit: ${VECTOR_MEM_LIMIT:-512m}
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:8686/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    logging: *default-logging
+
+  # ==========================================================
+  # Grafana — metrics visualization + health monitoring dashboards.
+  # SSO via Authentik header proxy (X-Authentik-Username).
+  # Provisioning: ${DOCK_CONF}/grafana/provisioning/
+  # Docs: https://grafana.com/docs/grafana/latest
+  # ==========================================================
+  grafana:
+    profiles: [viz, grafana]
+    image: grafana/grafana-oss:${GRAFANA_VERSION:-latest}
+    container_name: grafana
+    depends_on:
+      prometheus:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    environment:
+      GF_INSTALL_PLUGINS: "grafana-clickhouse-datasource"
+      GF_SERVER_ROOT_URL: https://${GRAFANA_SUBDOMAIN:-dash}.${PUBLIC_FQDN}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
+      GF_SECURITY_ADMIN_USER: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      # SSO-only: hide the local user/pass form; auth comes from Authentik via
+      # the auth-proxy header below. Break-glass: set "false" + recreate, or use
+      # the Tailnet URL. See docs/runbooks/local-login-recovery.md.
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_AUTH_PROXY_ENABLED: "true"
+      GF_AUTH_PROXY_HEADER_NAME: X-Authentik-Username
+      GF_AUTH_PROXY_HEADER_PROPERTY: username
+      GF_AUTH_PROXY_AUTO_SIGN_UP: "true"
+      GF_USERS_DEFAULT_THEME: dark
+      GF_PATHS_PROVISIONING: /etc/grafana/provisioning
+    volumes:
+      - ${DOCK_DATA}/grafana:/var/lib/grafana
+      - ${DOCK_CONF}/grafana/provisioning:/etc/grafana/provisioning:ro
+    networks:
+      monitoring:
+        ipv4_address: 192.0.2.10
+      apps:
+        ipv4_address: 192.0.2.10
+    mem_limit: ${GRAFANA_MEM_LIMIT:-512m}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/api/health | grep -q database"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+    labels:
+      - autoheal=true
+    logging: *default-logging
+
+  # ==========================================================
+  # Prometheus — metrics collection, storage, and querying.
+  # Config: ${DOCK_CONF}/prometheus/prometheus.yml
+  # 30-day retention (~5-10 GB); set PROMETHEUS_RETENTION to override.
+  # Docs: https://prometheus.io/docs
+  # ==========================================================
+  prometheus:
+    profiles: [metrics, prometheus]
+    image: prom/prometheus:${PROMETHEUS_VERSION:-latest}
+    container_name: prometheus
+    labels:
+      - autoheal=true
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=${PROMETHEUS_RETENTION:-30d}
+      - --web.enable-admin-api
+      - --web.enable-lifecycle
+    volumes:
+      - ${DOCK_CONF}/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ${DOCK_CONF}/prometheus/alerts:/etc/prometheus/alerts:ro
+      - ${DOCK_DATA}/prometheus:/prometheus
+    networks:
+      monitoring:
+        ipv4_address: 192.0.2.10
+      security:
+        ipv4_address: 192.0.2.10
+      ingress:
+        ipv4_address: 192.0.2.10
+    mem_limit: ${PROMETHEUS_MEM_LIMIT:-1g}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9090/-/healthy | grep -q Healthy"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+    logging: *default-logging
+
+  # ==========================================================
+  # cAdvisor — per-container CPU, memory, network metrics.
+  # Privileged: required to read cgroup and /sys data.
+  # Docs: https://github.com/google/cadvisor
+  # ==========================================================
+  cadvisor:
+    profiles: [exporters, cadvisor]
+    image: gcr.io/cadvisor/cadvisor:latest
+    container_name: cadvisor
+    labels:
+      - autoheal=true
+    privileged: true
+    # --docker_only: report only docker containers (+ root), via the docker
+    # factory, so metrics carry the friendly name="<container>" label. Without
+    # it, on cgroup v2 the systemd/raw-cgroup view claims /system.slice/
+    # docker-*.scope first and emits only the opaque cgroup `id`, breaking
+    # per-container dashboards. (Appended to the image entrypoint; containerd
+    # stays at its default socket — the docker factory depends on it.)
+    command:
+      - --docker_only=true
+    devices:
+      - /dev/kmsg:/dev/kmsg
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    networks:
+      monitoring:
+        ipv4_address: 192.0.2.10
+    mem_limit: ${CADVISOR_MEM_LIMIT:-256m}
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/healthz | grep -q ok"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+    logging: *default-logging
+
+  # ==========================================================
+  # Node Exporter — host hardware and OS metrics.
+  # pid: host + proc bind mounts required for real CPU/memory data.
+  # Docs: https://github.com/prometheus/node_exporter
+  # ==========================================================
+  node-exporter:
+    profiles: [exporters, node-exporter]
+    image: prom/node-exporter:latest
+    container_name: node-exporter
+    labels:
+      - autoheal=true
+    command:
+      - --path.procfs=/host/proc
+      - --path.rootfs=/rootfs
+      - --path.sysfs=/host/sys
+      - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)
+    pid: host
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    networks:
+      monitoring:
+        ipv4_address: 192.0.2.10
+    mem_limit: ${NODE_EXPORTER_MEM_LIMIT:-128m}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO /dev/null http://localhost:9100/metrics"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+    logging: *default-logging
+
+  # ==========================================================
+  # PostgreSQL Exporter — database metrics for Prometheus.
+  # Docs: https://github.com/prometheus-community/postgres_exporter
+  # ==========================================================
+  postgres-exporter:
+    profiles: [exporters, postgres-exporter]
+    image: prometheuscommunity/postgres-exporter:latest
+    container_name: postgres-exporter
+    labels:
+      - autoheal=true
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATA_SOURCE_NAME: "postgresql://${POSTGRES_SUPERUSER:-postgres}:${POSTGRES_SUPERUSER_PASSWORD}@postgres:5432/postgres?sslmode=disable"
+    networks:
+      monitoring:
+        ipv4_address: 192.0.2.10
+      data:
+        ipv4_address: 192.0.2.10
+    mem_limit: 128m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9187/metrics | grep -q pg_up"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+    logging: *default-logging
+
+  # ==========================================================
+  # Redis Exporter — Redis metrics for Prometheus.
+  # Docs: https://github.com/oliver006/redis_exporter
+  # ==========================================================
+  redis-exporter:
+    profiles: [exporters, redis-exporter]
+    image: oliver006/redis_exporter:${REDIS_EXPORTER_VERSION:-v1.83.0}
+    container_name: redis-exporter
+    labels:
+      - autoheal=true
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      REDIS_ADDR: "redis://redis:6379"
+      REDIS_PASSWORD: "${REDIS_PASSWORD}"
+    networks:
+      monitoring:
+        ipv4_address: 192.0.2.10
+      data:
+        ipv4_address: 192.0.2.10
+    mem_limit: 128m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      # Distroless/scratch image — no shell or utilities available.
+      # Health is monitored via Prometheus scraping instead.
+      disable: true
+    restart: unless-stopped
+    logging: *default-logging
+
+  # ==========================================================
+  # Alertmanager — routes Prometheus alerts to ntfy (push).
+  # Receives alerts from Prometheus on port 9093 and forwards
+  # them as webhooks to ntfy for push notification delivery.
+  # SETUP: after first deploy, run:
+  #   docker exec ntfy ntfy access '*' alerts write-only
+  # Docs: https://prometheus.io/docs/alerting/latest/alertmanager/
+  # ==========================================================
+  alertmanager:
+    profiles: [metrics, alertmanager]
+    image: prom/alertmanager:${ALERTMANAGER_VERSION:-v0.28.0}
+    container_name: alertmanager
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+      - --web.listen-address=0.0.0.0:9093
+    volumes:
+      - ${DOCK_CONF}/alertmanager:/etc/alertmanager:ro
+      - ${DOCK_DATA}/alertmanager:/alertmanager
+    networks:
+      monitoring:
+        ipv4_address: 192.0.2.10
+      apps:
+        ipv4_address: 192.0.2.10
+    mem_limit: ${ALERTMANAGER_MEM_LIMIT:-128m}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9093/-/healthy | grep -qi ok"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+    labels:
+      - autoheal=true
+    logging: *default-logging
+
+  # ==========================================================
+  # Loki — log aggregation and storage backend.
+  # Logs are collected by Alloy and queryable in Grafana.
+  # Retention: 30d, enforced by compactor.
+  # Config: ${DOCK_CONF}/loki/loki.yml
+  # Docs: https://grafana.com/docs/loki/latest/
+  # ==========================================================
+  loki:
+    profiles: [logs, loki]
+    image: grafana/loki:${LOKI_VERSION:-3.5.0}
+    container_name: loki
+    command: -config.file=/etc/loki/loki.yml
+    user: "10001:10001"
+    volumes:
+      - ${DOCK_CONF}/loki/loki.yml:/etc/loki/loki.yml:ro
+      - ${DOCK_DATA}/loki:/loki
+    networks:
+      monitoring:
+        ipv4_address: 192.0.2.10
+    mem_limit: ${LOKI_MEM_LIMIT:-512m}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3100/ready | grep -q ready"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+    labels:
+      - autoheal=true
+    logging: *default-logging
+
+  # ==========================================================
+  # Alloy — log collection agent (Grafana's Prometheus Agent
+  # successor). Discovers all Docker containers via the socket
+  # and tails their logs to Loki.
+  # ${DOCKER_GID}: GID of the host 'docker' group — set by gen-secrets.py so the
+  # correct GID is captured at setup time regardless of distro or installer.
+  # Config: ${DOCK_CONF}/alloy/config.alloy
+  # Docs: https://grafana.com/docs/alloy/latest/
+  # ==========================================================
+  alloy:
+    profiles: [logs, alloy]
+    image: grafana/alloy:${ALLOY_VERSION:-v1.9.1}
+    container_name: alloy
+    command:
+      - run
+      - /etc/alloy/config.alloy
+      - --storage.path=/var/lib/alloy/data
+      - --server.http.listen-addr=0.0.0.0:12345
+    user: "473:473"
+    group_add:
+      - "${DOCKER_GID:-983}"
+    volumes:
+      - ${DOCK_CONF}/alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # check-versions.py writes image-update JSONL here; Alloy tails it → Loki.
+      - ${DOCK_CONF}/version-check:/var/log/version-check:ro
+    depends_on:
+      loki:
+        condition: service_healthy
+    networks:
+      monitoring:
+        ipv4_address: 192.0.2.10
+    mem_limit: ${ALLOY_MEM_LIMIT:-256m}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/12345' 2>/dev/null"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
     restart: unless-stopped
     labels:
       - autoheal=true

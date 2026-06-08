@@ -1,0 +1,177 @@
+# profiles.toml — data for unified-stack/scripts/profiles.py
+#
+# Single source of truth for the stack's deployment profiles, RBAC categories,
+# and cross-profile dependency map. profiles.py loads this at import time and
+# exposes the Python API; consumers (run.sh, utils_entra.py, tests) import
+# through profiles.py — they never read this file directly.
+
+# Coarse RBAC categories. Sub-project B (Entra → Authentik nesting) groups
+# access by these, NOT by fine deployment profile.
+categories = ["netsec", "edr", "health", "admin", "notifications", "life", "media"]
+
+# RBAC category overrides for services whose DEPLOYMENT profile differs from
+# the coarse category that should govern their UI access. crowdsec deploys
+# with `core` (caddy hard-dependency) but its UI belongs to the netsec access
+# category.
+[overrides]
+crowdsec = "netsec"
+# torproxy deploys with `core` (always-on outbound-anon proxy) but its
+# UI / control surface belongs to the netsec access category.
+torproxy = "netsec"
+# openbao deploys with `core` (secrets backend — required before stack starts) but its
+# UI / control surface belongs to the admin access category.
+openbao = "admin"
+
+# ── Profiles ────────────────────────────────────────────────────────────────
+# Each profile: optional `category` (coarse, for RBAC) + required `services`.
+# `core` omits `category` — it is always-on infrastructure (no RBAC category).
+
+# core = always-on infrastructure. crowdsec lives here (NOT in a security
+# profile) because caddy hard-depends on it: the static Caddyfile
+# `import crowdsec` bouncer middleware requires the crowdsec LAPI, so caddy
+# (ingress) won't start without it. Its UI access is still governed by the
+# netsec RBAC category via [overrides] above.
+[profiles.core]
+services = [
+  "tailscale-ingress", "caddy", "crowdsec", "torproxy",
+  "authentik-server", "authentik-worker", "authentik-proxy", "authentik-migration",
+  "postgres", "redis",
+  "socket-proxy-ro", "socket-proxy-rw", "autoheal",
+  "openbao",
+]
+
+# Security — network
+[profiles.netmon]
+category = "netsec"
+services = ["zeek", "zeek-logs"]
+
+[profiles.streaming]
+category = "netsec"
+services = ["redpanda", "redpanda-console", "redpanda-init"]
+
+# Security — endpoint
+[profiles.siem]
+category = "edr"
+services = [
+  "wazuh-manager", "wazuh-indexer-1", "wazuh-indexer-2", "wazuh-indexer-3",
+  "wazuh-dashboard", "wazuh-init", "wazuh-security-init",
+]
+
+[profiles.runtime-sec]
+category = "edr"
+services = ["falco", "falcosidekick", "falcosidekick-ui", "redis-falco"]
+
+# Observability
+[profiles.metrics]
+category = "health"
+services = ["prometheus", "alertmanager"]
+
+[profiles.exporters]
+category = "health"
+services = ["cadvisor", "node-exporter", "postgres-exporter", "redis-exporter"]
+
+[profiles.logs]
+category = "health"
+services = ["loki", "alloy"]
+
+[profiles.viz]
+category = "health"
+services = ["grafana"]
+
+[profiles.analytics]
+category = "health"
+services = ["clickhouse", "vector"]
+
+# Admin
+[profiles.container-mgmt]
+category = "admin"
+services = ["dockhand"]
+
+[profiles.home]
+category = "admin"
+services = ["dashy"]
+
+[profiles.automation]
+category = "admin"
+services = ["n8n"]
+
+# Notifications
+[profiles.notify]
+category = "notifications"
+services = ["ntfy"]
+
+# Productivity (life)
+[profiles.files]
+category = "life"
+services = ["nextcloud", "notify-push"]
+
+[profiles.talk]
+category = "life"
+services = ["spreed-signaling", "janus", "coturn"]
+
+[profiles.photos]
+category = "life"
+services = ["immich-server", "immich-machine-learning"]
+
+[profiles.notes]
+category = "life"
+services = ["affine", "redis-affine"]
+
+[profiles.tasks]
+category = "life"
+services = ["vikunja"]
+
+[profiles.recipes]
+category = "life"
+services = ["tandoor"]
+
+# Media
+[profiles.vpn]
+category = "media"
+services = ["gluetun"]
+
+[profiles.downloads]
+category = "media"
+services = ["qbittorrent"]
+
+[profiles.video]
+category = "media"
+services = ["sonarr", "radarr", "prowlarr"]
+
+[profiles.audio]
+category = "media"
+services = ["lidarr"]
+
+[profiles.stream]
+category = "media"
+services = ["jellyfin"]
+
+[profiles.requests]
+category = "media"
+services = ["jellyseerr"]
+
+[profiles.captcha]
+category = "media"
+services = ["flaresolverr"]
+
+# ── Cross-profile dependencies ──────────────────────────────────────────────
+# HARD = target CANNOT START without the dep (`network_mode: service:` or
+# `depends_on` spanning profiles).
+[hard_deps]
+downloads = ["vpn"]      # qbittorrent  network_mode: service:gluetun
+video     = ["vpn"]      # *arr         network_mode: service:gluetun
+audio     = ["vpn"]      # lidarr       network_mode: service:gluetun
+captcha   = ["vpn"]      # flaresolverr network_mode: service:gluetun
+talk      = ["files"]    # spreed-signaling depends_on nextcloud
+requests  = ["stream"]   # jellyseerr   depends_on jellyfin
+viz       = ["metrics"]  # grafana      depends_on prometheus
+
+# SOFT = starts but degraded / no data.
+[soft_deps]
+viz       = ["logs"]         # grafana has no Loki datasource data
+exporters = ["metrics"]      # nobody scrapes the exporters
+metrics   = ["notify"]       # alertmanager can't reach ntfy
+requests  = ["video"]        # jellyseerr has no *arr to drive
+video     = ["captcha"]      # some indexers need flaresolverr
+siem      = ["streaming"]    # security-telemetry pipeline incomplete
+streaming = ["runtime-sec"]  # nothing feeding the stream

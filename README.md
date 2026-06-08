@@ -1,6 +1,6 @@
 # Unified Stack
 
-Single-command self-hosted foundation: one `docker compose up` brings up Caddy (custom build with Crowdsec, Coraza WAF, forward-auth, Souin cache, Brotli, L4 proxy), a Tailscale ingress sidecar, shared Postgres + Redis, Wazuh SIEM, Crowdsec LAPI, Falco runtime-security monitoring, Zeek network-security monitoring, Authentik SSO, Nextcloud, and optional media + productivity stacks — all accessible on both `*.secop.dev` (public, via Cloudflare) and `*.neon-lenok.ts.net` (Tailnet).
+Single-command self-hosted foundation: one `docker compose up` brings up Caddy (custom build with Crowdsec, Coraza WAF, forward-auth, Souin cache, Brotli, L4 proxy), a Tailscale ingress sidecar, shared Postgres + Redis, Wazuh SIEM, Crowdsec LAPI, Falco runtime-security monitoring, Zeek network-security monitoring, Authentik SSO, Nextcloud, and optional media + productivity stacks — all accessible on both `*.example.com` (public, via Cloudflare) and `*.your-tailnet.example` (Tailnet).
 
 **Priority order:** Functionality > Security > Efficiency > Stability.
 
@@ -22,23 +22,23 @@ flowchart TB
         TN[Tailnet peers]
     end
     subgraph host["Docker host (Ubuntu)"]
-        subgraph ingress["ingress 10.0.10.0/24"]
-            TS[tailscale-ingress<br/>10.0.10.200 ★multi-homed]
+        subgraph ingress["ingress 192.0.2.10/24"]
+            TS[tailscale-ingress<br/>192.0.2.10 ★multi-homed]
             CADDY[caddy<br/>shares netns]
-            CS1[crowdsec alias<br/>10.0.10.21]
+            CS1[crowdsec alias<br/>192.0.2.10]
             AUTH_P[authentik-proxy<br/>.22]
             AUTH_S_ING[authentik-server<br/>.50]
         end
-        subgraph auth_int["auth-internal 10.0.11.0/24"]
+        subgraph auth_int["auth-internal 192.0.2.10/24"]
             AUTH_S[authentik-server<br/>.20]
             AUTH_W[authentik-worker<br/>.21]
         end
-        subgraph data["data 10.0.12.0/24"]
+        subgraph data["data 192.0.2.10/24"]
             PG[postgres<br/>.30]
             RD[redis<br/>.31]
             TS_DATA[tailscale-ingress<br/>.200]
         end
-        subgraph sec["security 10.0.13.0/24"]
+        subgraph sec["security 192.0.2.10/24"]
             CS2[crowdsec<br/>.20]
             SPRO2[socket-proxy-ro<br/>.21]
             SPRW[socket-proxy-rw<br/>.22]
@@ -48,19 +48,19 @@ flowchart TB
             WI[wazuh-indexer<br/>.31]
             WD[wazuh-dashboard<br/>.32]
         end
-        subgraph media["media 10.0.14.0/24"]
+        subgraph media["media 192.0.2.10/24"]
             JF[jellyfin<br/>.21]
             JS[jellyseerr<br/>.22]
             GT[gluetun<br/>.30 ProtonVPN WG]
         end
-        subgraph apps["apps 10.0.15.0/24"]
+        subgraph apps["apps 192.0.2.10/24"]
             NC[nextcloud<br/>.26]
             NT[ntfy<br/>.20]
             TD[tandoor<br/>.21]
             VK[vikunja<br/>.22]
             AF[affine<br/>.23]
         end
-        subgraph oidcc["oidc-clients 10.0.17.0/24"]
+        subgraph oidcc["oidc-clients 192.0.2.10/24"]
             AUTH_S_OC[authentik-server<br/>.10]
         end
         ZK[zeek<br/>host netns]
@@ -108,7 +108,7 @@ sequenceDiagram
     participant CRZ as Coraza WAF
     participant AK as Authentik
     participant APP as Target app
-    C->>CF: HTTPS request (app.secop.dev)
+    C->>CF: HTTPS request (example.com)
     CF->>UFW: forwarded (CF IP → 443)
     UFW->>CAD: ACCEPT (CF IP, 443)
     CAD->>CAD: CF allowlist check
@@ -125,20 +125,20 @@ sequenceDiagram
 
 > **OIDC exception:** Nextcloud, Vikunja, and AFFiNE skip step 8. Caddy proxies the
 > request directly to the app; if the user has no session the app itself redirects to
-> Authentik (`auth.secop.dev`) for OIDC login, then back to the original URL.
+> Authentik (`example.com`) for OIDC login, then back to the original URL.
 
 ### Authentik integration modes
 
-Each service uses one of two auth models. `setup-oidc.py` provisions **all** OIDC services automatically; the chart notes where a manual step is still needed after the script runs.
+Each service uses one of two auth models. `set-auth.py oidc` provisions **all** OIDC services automatically; the chart notes where a manual step is still needed after the script runs.
 
 ```mermaid
 flowchart TD
-    subgraph optional["Optional · setup-entra.py"]
+    subgraph optional["Optional · set-auth.py entra-*"]
         direction TB
         EntraID["Microsoft Entra ID<br/>(exclusive upstream IdP)"]
     end
 
-    subgraph auth["Authentik (setup-oidc.py)"]
+    subgraph auth["Authentik (set-auth.py oidc)"]
         direction TB
         A["Authentik"]
     end
@@ -161,7 +161,7 @@ flowchart TD
     A --> NC & TD & VK & JF & IM & AF
 ```
 
-> **Legend:**  `✓` = `setup-oidc.py` completes configuration end-to-end.  `⚙` = script provisions the Authentik provider/app and writes credentials to `.env`; one in-app step remains.
+> **Legend:**  `✓` = `set-auth.py oidc` completes configuration end-to-end.  `⚙` = script provisions the Authentik provider/app and writes credentials to `.env`; one in-app step remains.
 
 ### Bootstrap order
 
@@ -191,7 +191,7 @@ flowchart LR
     ZK[zeek<br/>conn/dns/ssl/notice .log JSON] --> WA
     WA[Wazuh Agent<br/>host-level, file tail] --> WM[wazuh-manager]
     WM --> WI[wazuh-indexer]
-    WI --> WD[wazuh-dashboard<br/>UI @ wazuh.secop.dev]
+    WI --> WD[wazuh-dashboard<br/>UI @ example.com]
 ```
 
 ---
@@ -230,7 +230,7 @@ flowchart LR
     └── redis/
 ```
 
-All paths owned `docktaetor:media (1010:1010)`, mode `770` (DB dirs `700`).
+All paths owned `svc-user:media (1010:1010)`, mode `770` (DB dirs `700`).
 
 ---
 
@@ -271,14 +271,14 @@ Parallel observation: Falco (runtime) + Zeek (network)
 
 ## Quickstart
 
-**Prerequisites** (Ubuntu 22.04+, 2+ cores, 8+ GB RAM):
+**Prerequisites** (Ubuntu 24.04+, 2+ cores, 8+ GB RAM):
 - Cloudflare account managing your `PUBLIC_FQDN` zone; API token with `Zone:Read` + `DNS:Edit`.
 - Tailscale account with the host already enrolled; authkey from the admin console.
 - Router port-forwards to the host (see [Port Forward](#port-forward) below).
 
 ### Port Forward
 
-Forward these ports at your router to streamer's LAN IP:
+Forward these ports at your router to prod-host's LAN IP:
 
 | Port(s) | Protocol | Service | Why |
 |---------|----------|---------|-----|
@@ -299,13 +299,13 @@ Forward these ports at your router to streamer's LAN IP:
 
 1. Clone and run the host bootstrap (creates `/dock/` tree, installs Docker, sets ownership):
    ```bash
-   git clone <repo-url> ~/git/finnsbeincaddy
-   sudo ~/git/finnsbeincaddy/unified-stack/docker-host-config.sh
+   git clone <repo-url> ~/git/openirvana
+   sudo ~/git/openirvana/unified-stack/docker-host-config.sh
    ```
 
 2. Create `.env` from the example and set the two external keys:
    ```bash
-   cd ~/git/finnsbeincaddy/unified-stack
+   cd ~/git/openirvana/unified-stack
    cp .env.example .env
    # Edit .env — set TAILSCALE_AUTHKEY and CLOUDFLARE_API_TOKEN.
    # All other secrets are generated in the next step.
@@ -316,7 +316,7 @@ Forward these ports at your router to streamer's LAN IP:
    ```bash
    python3 scripts/gen-secrets.py .env
    ```
-   Two secrets cannot be generated until the stack is running — `CROWDSEC_BOUNCER_KEY`
+   Two secrets cannot be generated until the stack is running — `CROWDSEC_BOUNCER_API_KEY`
    (issued by CrowdSec) and `AUTHENTIK_OUTPOST_TOKEN` (issued by Authentik). Both are
    fetched automatically in step 5.
 
@@ -340,10 +340,10 @@ Forward these ports at your router to streamer's LAN IP:
    then the recreate picks them up. Re-run with `--apply` after any secret rotation to
    also sync Postgres passwords and re-seed the Wazuh OpenSearch security index.
 
-6. Visit (replace `secop.dev` with your `PUBLIC_FQDN`):
-   - `https://auth.secop.dev` — Authentik (first run: set MFA, create users)
-   - `https://wazuh.secop.dev` — Wazuh (gated by Authentik forward-auth)
-   - `https://cloud.secop.dev` — Nextcloud (OIDC login via Authentik — see step 6)
+6. Visit (replace `example.com` with your `PUBLIC_FQDN`):
+   - `https://example.com` — Authentik (first run: set MFA, create users)
+   - `https://example.com` — Wazuh (gated by Authentik forward-auth)
+   - `https://example.com` — Nextcloud (OIDC login via Authentik — see step 6)
 
 **Boot persistence:** `sudo systemctl enable --now compose-stack.service`
 
@@ -356,14 +356,14 @@ Forward these ports at your router to streamer's LAN IP:
    docker compose up -d --no-deps --force-recreate authentik-proxy
    ```
 
-   **OIDC setup** (`scripts/setup-oidc.py`) — provisions Authentik OAuth2/OIDC providers for Nextcloud, Tandoor, AFFiNE, Jellyfin, Immich, and Vikunja; writes all credentials into `.env`; restarts running containers; and outputs `/dock/conf/oidc-setup-output.txt` with any remaining manual steps.
+   **OIDC setup** (`scripts/set-auth.py oidc`) — provisions Authentik OAuth2/OIDC providers for Nextcloud, Tandoor, AFFiNE, Jellyfin, Immich, and Vikunja; writes all credentials into `.env`; restarts running containers; and outputs `/dock/conf/oidc-setup-output.txt` with any remaining manual steps.
 
    **Before running:**
 
    | Requirement | How to satisfy |
    |---|---|
    | Authentik running and healthy | `docker compose up -d` — wait for healthcheck green |
-   | At least one Authentik user created | `auth.secop.dev` → Admin → Users → Create |
+   | At least one Authentik user created | `example.com` → Admin → Users → Create |
    | Jellyfin SSO plugin installed | Jellyfin admin → Plugins → Catalog → **SSO Authentication** → Install, then restart Jellyfin |
    | `JELLYFIN_API_KEY` in `.env` | Jellyfin admin → Dashboard → API Keys → New Key — paste into `.env` |
    | `IMMICH_API_KEY` in `.env` | Immich → Account Settings → API Keys → New Key — paste into `.env` |
@@ -371,7 +371,7 @@ Forward these ports at your router to streamer's LAN IP:
    The last two are optional — the script prompts `[y/N]` and skips auto-config for the affected service if either key is absent. Re-run the script any time after adding missing keys.
 
    ```bash
-   sudo python3 scripts/setup-oidc.py
+   sudo python3 scripts/set-auth.py oidc
    ```
 
    **After running:**
@@ -386,6 +386,10 @@ Forward these ports at your router to streamer's LAN IP:
    | AFFiNE | Provider + app provisioned, credentials in `.env` | Paste the JSON block from `oidc-setup-output.txt` into **AFFiNE Admin Panel → Settings → OAuth → OIDC OAuth provider config** |
 
    The output file contains exact commands and credentials for every manual step and is safe to re-generate at any time.
+
+   > **Harden AFFiNE after deployment:** AFFiNE allows anyone to sign up and access
+   > the demo workspace by default. Once SSO is configured, disable open registration:
+   > **AFFiNE Admin Panel → Settings → Auth → "Whether allow new registrations" → Disable.**
 
 ### Step 8 (optional) — Entra ID federation
 
@@ -407,7 +411,7 @@ Gates every service behind a Microsoft Entra ID group. Skip entirely if you want
 # ENTRA_TENANT_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
 
 pip install msal
-python3 scripts/setup-entra.py --setup .env
+python3 scripts/set-auth.py entra-setup .env
 # Follow the device-code prompt to sign in with a Global Admin account
 ```
 
@@ -416,7 +420,7 @@ python3 scripts/setup-entra.py --setup .env
 **Sync group members (run on cron or manually):**
 
 ```bash
-python3 scripts/setup-entra.py --sync .env
+python3 scripts/set-auth.py entra-sync .env
 ```
 
 **Restore local logins (recovery):**
@@ -515,8 +519,8 @@ All scripts live in `unified-stack/scripts/`. Run them from the `unified-stack/`
 | Script | Purpose | When to run | Idempotent | Root/sudo |
 |--------|---------|-------------|:----------:|:---------:|
 | `gen-secrets.py` | Fill blank secrets in `.env`; fetch container-issued keys on second pass | (1) Before `compose up`; (2) after stack is running; (3) after any secret rotation | Yes | No |
-| `setup-oidc.py` | Provision Authentik OIDC providers for all apps; write credentials to `.env`; optionally create paired Entra/Authentik security groups and sync membership (`--sync`) | After Authentik is healthy and users exist; re-run to add missing services | Yes | No |
-| `setup-entra.py` | Federate Authentik with Microsoft Entra ID; gate all logins on an Entra group | `--setup` once to enable; `--sync` on cron for membership updates | Yes | No |
+| `set-auth.py oidc` | Provision Authentik OIDC providers for all apps; write credentials to `.env`; optionally create paired Entra/Authentik security groups and sync membership (`--sync`) | After Authentik is healthy and users exist; re-run to add missing services | Yes | No |
+| `set-auth.py entra-*` | Federate Authentik with Microsoft Entra ID; gate all logins on an Entra group | `--setup` once to enable; `--sync` on cron for membership updates | Yes | No |
 | `undo-entra.py` | Disable Entra ID federation; restore local password login | Entra lockout recovery or to roll back federation | Yes | No |
 | `maintain.py` | Postgres backup, Zeek intel refresh, and Wazuh agent sync — unified daily maintenance | Nightly via cron; individually as needed | Yes | Docker socket / **Yes** (wazuh) |
 | `fix-permissions.sh` | Fix bind-mount ownership for services that run as a non-standard UID with `cap_drop:ALL` | After adding a new service; after an `EACCES` error on a bind-mount path | Yes | **Yes** |
@@ -532,7 +536,7 @@ All scripts live in `unified-stack/scripts/`. Run them from the `unified-stack/`
 
 **Pass 1 — before `docker compose up`:** Generates random values for every blank secret: Postgres superuser and per-app DB passwords, Redis auth token, Wazuh API and indexer passwords, Authentik bootstrap token and secret key, Nextcloud admin password, coturn HMAC secret, and more.
 
-**Pass 2 — after the stack is running:** Queries the running CrowdSec container for a bouncer API key (`CROWDSEC_BOUNCER_KEY`) and the Authentik container for the embedded outpost token (`AUTHENTIK_OUTPOST_TOKEN`). Both are required by Caddy and `authentik-proxy` respectively and cannot be generated until their issuing containers are healthy.
+**Pass 2 — after the stack is running:** Queries the running CrowdSec container for a bouncer API key (`CROWDSEC_BOUNCER_API_KEY`) and the Authentik container for the embedded outpost token (`AUTHENTIK_OUTPOST_TOKEN`). Both are required by Caddy and `authentik-proxy` respectively and cannot be generated until their issuing containers are healthy.
 
 ```bash
 # Pass 1 — fill random secrets before first launch
@@ -553,7 +557,7 @@ Idempotent: any variable that is already non-empty is printed as `skip` and left
 
 ---
 
-### `setup-oidc.py`
+### `set-auth.py oidc`
 
 **Why:** Each OIDC-capable app requires a registered OAuth2 provider in Authentik (with a generated client ID and secret) *and* the credentials written into the app's own config. Doing this manually means eight Authentik API calls per service plus editing `.env` by hand. This script automates all of it end-to-end.
 
@@ -563,14 +567,14 @@ Services covered: **Nextcloud, Tandoor, Vikunja, AFFiNE, Jellyfin** (requires `J
 
 ```bash
 # Authentik must be healthy and at least one user must exist
-sudo python3 scripts/setup-oidc.py
+sudo python3 scripts/set-auth.py oidc
 
 # Also provision Entra + Authentik security groups and bind OIDC access policies
 # (requires OIDC_ENTRA_* vars in .env — see "Entra App Registration" section below)
-python3 scripts/setup-oidc.py
+python3 scripts/set-auth.py oidc
 
 # Provision + sync Entra group members into Authentik users/groups
-python3 scripts/setup-oidc.py --sync
+python3 scripts/set-auth.py oidc --sync
 
 # Re-run at any time; services with an existing CLIENT_ID are skipped
 ```
@@ -583,11 +587,11 @@ Idempotent: any service whose `_CLIENT_ID` variable is already populated is skip
 
 **What this App Registration does**
 
-Creates per-service security groups in Microsoft Entra (Azure AD) and mirrors their membership into Authentik. This is separate from `setup-entra.py`'s `Authentik-Sync` App Registration (which federates *authentication*). This registration is only about *authorisation groups* — it lets you control which users can access which services by managing Entra group membership.
+Creates per-service security groups in Microsoft Entra (Azure AD) and mirrors their membership into Authentik. This is separate from `set-auth.py entra-*`'s `Authentik-Sync` App Registration (which federates *authentication*). This registration is only about *authorisation groups* — it lets you control which users can access which services by managing Entra group membership.
 
 **Pre-requisites**
 
-- `setup-oidc.py` has already run successfully (Authentik OIDC providers exist).
+- `set-auth.py oidc` has already run successfully (Authentik OIDC providers exist).
 - An Azure account with permission to create App Registrations and grant admin consent.
 
 **Step-by-step: create the App Registration**
@@ -624,52 +628,70 @@ AUTHENTIK_GROUP_PREFIX=entra
 
 ```bash
 # Provision OIDC providers and create/bind groups (no member sync)
-python3 scripts/setup-oidc.py
+python3 scripts/set-auth.py oidc
 
 # Provision + sync Entra group members into Authentik users/groups
-python3 scripts/setup-oidc.py --sync
+python3 scripts/set-auth.py oidc --sync
 ```
 
 Without `--sync`, only group creation and policy binding run. With `--sync`, provisioning runs first then member sync follows. Add `--sync` to the daily cron in `docker-host-config.sh` to keep group membership current.
 
 ---
 
-### `setup-entra.py`
+### `set-auth.py entra-*`
 
 **Why:** Centralises identity management in Microsoft Entra ID so that user provisioning and deprovisioning are managed once in your Microsoft tenant. All stack services automatically enforce Entra group membership through Authentik, with zero per-app changes.
 
 **What `--setup` does:**
-1. Opens a device-code browser session (Global Admin sign-in — credentials are never stored)
-2. Creates an App Registration in Entra with the correct OIDC reply URL
-3. Generates a client secret and writes it to `.env`
-4. Creates a security group for homelab access in Entra
-5. Creates an Authentik OIDC source pointing at the Entra tenant
-6. Creates an Authentik expression policy that denies login to anyone not in the Entra group
-7. Binds the policy to the Authentik default authentication flow
-8. Verifies a break-glass superuser account exists in Authentik (exits with an error if not — prevents self-lockout)
+1. Opens a device-code browser session — always required so the script can read and patch the App Registration (Application.* Graph permissions are not available to client credentials)
+2. Creates or finds the App Registration and reconciles redirect URIs
+3. Generates a client secret and writes it to `.env` (first run only; existing secret is preserved on re-run)
+4. Creates per-service Entra security groups and Authentik groups with access policy bindings
+5. Creates an Authentik OIDC source pointing at the Entra tenant with the correct authentication and enrollment flows
+6. Creates an expression policy that gates all logins on Entra group membership
+7. Enforces Entra-only login (removes local password form; preserves break-glass admin at `/if/admin/`)
+8. Verifies a break-glass superuser account exists in Authentik before enforcing (prevents self-lockout)
 
-**What `--sync` does:** Reads current group members from Entra and creates or deactivates matching Authentik users. Run on a schedule to keep membership current.
+**What `--sync` does:** Reads transitive group members from Entra and upserts matching Authentik users (create, update, or deactivate). Uses client credentials — no browser required.
+
+**Required App Registration permissions** (Application type, admin consent required):
+
+| Permission | Used by | Purpose |
+|---|---|---|
+| `Application.Read.All` | `--setup` | Look up App Registration by appId to check redirect URIs |
+| `Application.ReadWrite.OwnedBy` | `--setup` | Patch missing redirect URIs on re-runs |
+| `Group.ReadWrite.All` | `--setup` | Create and manage per-service Entra security groups |
+| `GroupMember.Read.All` | `--sync` | Read transitive group membership |
+| `User.Read.All` | `--sync` | Read user profiles (email, display name, enabled state) |
+
+`--setup` automatically grants admin consent for all five during initial setup (phase 1). If consent was granted manually in the portal, re-running `--setup` skips already-granted roles.
+
+**Application owner:** `Application.ReadWrite.OwnedBy` only allows the service principal to manage App Registrations it *owns*. After initial setup, add the app's service principal as an owner of its own App Registration so this permission is effective:
+
+> Azure Portal → **App registrations** → [your app] → **Owners** → **Add owners** → search the app's display name → select the **service principal** entry → Save.
+
+This is a one-time step. Without it, redirect URI updates during re-runs will return 403 even with the permission granted.
 
 ```bash
 # Prerequisites: set ENTRA_TENANT_ID in .env, then:
 pip install msal
-python3 scripts/setup-entra.py --setup .env
+python3 scripts/set-auth.py entra-setup .env
 # Follow the device-code prompt — sign in with a Global Admin account
 
 # Sync group membership (run on cron):
-python3 scripts/setup-entra.py --sync .env
+python3 scripts/set-auth.py entra-sync .env
 
 # Cron example (daily at 5 AM — run from unified-stack/ to print the entry):
-#   echo "0 5 * * * root cd $(realpath .) && python3 scripts/setup-entra.py --sync .env"
+#   echo "0 5 * * * root cd $(realpath .) && python3 scripts/set-auth.py entra-sync .env"
 ```
 
-Idempotent: existing App Registration, group, and Authentik source are detected and reused on re-run. `--sync` is always safe to run multiple times.
+Idempotent: existing App Registration, groups, and Authentik source are detected and reused on re-run. `--sync` is always safe to run multiple times.
 
 ---
 
 ### `undo-entra.py`
 
-**Why:** If Entra ID becomes unavailable or misconfigured after running `setup-entra.py`, local Authentik logins are blocked. This script restores the password login form without touching your Entra tenant and without destroying synced user accounts.
+**Why:** If Entra ID becomes unavailable or misconfigured after running `set-auth.py entra-*`, local Authentik logins are blocked. This script restores the password login form without touching your Entra tenant and without destroying synced user accounts.
 
 **What it does:** Disables the `entra-id` Authentik source (stops Entra-federated logins) and removes the expression policy that was gating logins on group membership. Synced user accounts and the App Registration in Entra are left untouched.
 
@@ -677,7 +699,7 @@ Idempotent: existing App Registration, group, and Authentik source are detected 
 python3 scripts/undo-entra.py .env
 ```
 
-Idempotent: disabling an already-disabled source is a no-op. Re-run `setup-entra.py --setup` to re-enable federation.
+Idempotent: disabling an already-disabled source is a no-op. Re-run `set-auth.py entra-setup` to re-enable federation.
 
 > **Note:** This script only modifies Authentik. To delete the App Registration from Entra itself, remove it manually in the Azure portal.
 
@@ -740,7 +762,7 @@ zstd -d /dock/backups/postgres/dump-YYYYMMDD-HHMMSS.sql.zst --stdout \
 
 **Why:** Docker containers that use `cap_drop: ALL` lose the `DAC_OVERRIDE` capability. This means their root user (UID 0) is bound by normal Unix permission checks and cannot access directories it does not own — unlike a full-privilege root that bypasses DAC entirely. Services in this category fail at startup with `EACCES` on their bind-mount paths, even though the container is running as root.
 
-The standard `docker-host-config.sh` creates all `/dock/conf/<svc>` and `/dock/data/<svc>` directories as `docktaetor:media` (1010:1010). That works for most containers. Containers that run as UID 0 with `cap_drop: ALL` need their directories owned by `root:root` instead.
+The standard `docker-host-config.sh` creates all `/dock/conf/<svc>` and `/dock/data/<svc>` directories as `svc-user:media` (1010:1010). That works for most containers. Containers that run as UID 0 with `cap_drop: ALL` need their directories owned by `root:root` instead.
 
 **Currently patched services:**
 
@@ -748,7 +770,7 @@ The standard `docker-host-config.sh` creates all `/dock/conf/<svc>` and `/dock/d
 |---------|:---:|---|
 | AFFiNE | 0 (root) | Runs as root with `cap_drop: ALL` — restricted root cannot traverse `1010:1010 770` storage directory |
 
-**What it does:** Applies `docktaetor:media` to all standard service directories, then overrides known exceptions to the correct UID:GID for that service.
+**What it does:** Applies `svc-user:media` to all standard service directories, then overrides known exceptions to the correct UID:GID for that service.
 
 ```bash
 sudo bash scripts/fix-permissions.sh
@@ -808,7 +830,7 @@ python3 scripts/check-stack.py --no-color | tee audit.txt
 - **Authentik admin lockout**: `docker exec -it authentik-server ak shell` → `from authentik.core.models import User; u = User.objects.get(username='akadmin'); u.set_password('newpass'); u.save()`. If locked out via Entra ID (not local password), run `python3 scripts/undo-entra.py .env` to restore the password login form without touching Entra or synced users.
 - **Postgres backup failed alert**: check `/var/log/pg-backup.log`; pruning is paused until next success.
 - **Zeek not logging**: `docker exec zeek zeekctl status`; if `crashed`, check `/dock/conf/zeek/logs/current/stderr.log`.
-- **GlueTUN not connecting**: check `docker logs gluetun`; verify `PROTONVPN_WIREGUARD_PRIVATE_KEY` is the raw base64 key (not a config file path). If connecting but leaking: confirm `FIREWALL_OUTBOUND_SUBNETS=10.0.0.0/8` is set.
+- **GlueTUN not connecting**: check `docker logs gluetun`; verify `PROTONVPN_WIREGUARD_PRIVATE_KEY` is the raw base64 key (not a config file path). If connecting but leaking: confirm `FIREWALL_OUTBOUND_SUBNETS=192.0.2.10/8` is set.
 - **\*arr can't reach indexers / qBittorrent not seeding**: VPN tunnel may be down. Run `docker exec gluetun wget -qO- https://ifconfig.io` — if it returns your ISP's IP instead of the VPN IP, GlueTUN needs to reconnect.
 - **Nextcloud Talk TURN test fails**: confirm 3478/UDP+TCP and 49152–49200/UDP are port-forwarded at the router to the host IP. Check `docker logs coturn` for authentication errors. Verify `COTURN_SECRET` in `.env` matches the secret entered in Talk admin settings.
 - **Jellyfin no GPU transcoding**: ensure the host has `/dev/dri` (Intel: `intel-media-va-driver`, AMD: `mesa-va-drivers`). Check `docker logs jellyfin` for permission errors on `/dev/dri/renderD128`.
@@ -819,13 +841,13 @@ python3 scripts/check-stack.py --no-color | tee audit.txt
 
 #### Entra ID lockout (can't sign in via Microsoft)
 
-If Entra ID is unavailable or misconfigured after running `setup-entra.py --setup`, restore local logins without touching Entra:
+If Entra ID is unavailable or misconfigured after running `set-auth.py entra-setup`, restore local logins without touching Entra:
 
 ```bash
 python3 scripts/undo-entra.py .env
 ```
 
-This disables the `entra-id` Authentik source and restores the password login form. Synced users are preserved; the App Registration in Entra is untouched. Re-run `setup-entra.py --setup` to re-enable federation.
+This disables the `entra-id` Authentik source and restores the password login form. Synced users are preserved; the App Registration in Entra is untouched. Re-run `set-auth.py entra-setup` to re-enable federation.
 
 #### `check-stack.py`
 
@@ -835,7 +857,7 @@ This disables the `entra-id` Authentik source and restores the password login fo
 | All services show `UNAUTH: skipped` | `AUTHENTIK_BOOTSTRAP_TOKEN` blank in `.env` | Run `python3 scripts/gen-secrets.py .env` to generate the token |
 | DNS column shows `skipped` for all rows | `CLOUDFLARE_API_TOKEN` not set in `.env` | Set it, or use `--no-probe` for a config-only run |
 | Forward-auth service shows `200 OPEN` | Auth gate not firing — request reaching the app without authentication | Check that the service subdomain is **not** listed in the `@requires-auth-pub` exclusion block in the Caddyfile |
-| All services show `unreachable (0)` | Stack not running, or script run from a machine with no internet access | Script probes public `*.secop.dev` URLs — run from a machine that can reach them; or run on streamer with `--no-probe` for config-only |
+| All services show `unreachable (0)` | Stack not running, or script run from a machine with no internet access | Script probes public `*.example.com` URLs — run from a machine that can reach them; or run on prod-host with `--no-probe` for config-only |
 | Service shows `502` on authed probe | Service container is down or misconfigured | Rerun with `--logs <service>` to see the container crash reason |
 | `AUTHED: 401` | Bootstrap token rejected | Token may have been rotated; re-run `python3 scripts/gen-secrets.py .env` to refresh |
 | Orphan DNS records listed at the bottom | Stale Cloudflare records from removed services, or records that pre-date `.env` vars | Delete stale records in the Cloudflare dashboard, or add the matching `_SUBDOMAIN` var to `.env` |
@@ -864,8 +886,8 @@ python3 -m pytest tests/test_setup_entra.py::test_msal_guard_exits_when_missing 
 | `No module named pytest` | pytest not installed | `sudo apt-get install python3-pytest` or `pip install pytest` |
 | `ModuleNotFoundError: No module named 'scripts.setup_entra'` | Test run from wrong directory | Run from `unified-stack/`, not from repo root |
 | `collected 0 items` | pytest cannot find tests | Verify test function names start with `test_`; check for syntax errors in the test file |
-| `AttributeError: module has no attribute 'X'` | A function in `setup-entra.py` was renamed | Check `setup-entra.py` for the current function name and update the corresponding `@patch` target in the test |
-| `SystemExit not raised` | Script guard condition changed | The test asserts `pytest.raises(SystemExit, match=...)` — verify the guard in `setup-entra.py` still calls `sys.exit(1)` on the expected condition |
+| `AttributeError: module has no attribute 'X'` | A function in `set-auth.py entra-*` was renamed | Check `set-auth.py entra-*` for the current function name and update the corresponding `@patch` target in the test |
+| `SystemExit not raised` | Script guard condition changed | The test asserts `pytest.raises(SystemExit, match=...)` — verify the guard in `set-auth.py entra-*` still calls `sys.exit(1)` on the expected condition |
 | msal-related test fails despite msal being installed | Import path in `@patch` does not match the import in the script | The patch target must be `scripts.setup_entra.msal`, not `msal` — match the module path where msal is imported, not where it is defined |
 
 ---
@@ -897,7 +919,7 @@ python3 -m pytest tests/test_setup_entra.py::test_msal_guard_exits_when_missing 
    and `@requires-auth-ts` matchers, and configure OIDC inside the app itself.
 
 3. Add the app's service in `docker-compose.yml`. Join its own layer (create one if needed:
-   `10.0.14.0/24` for media, `10.0.15.0/24` for apps, etc.) + `data` for
+   `192.0.2.10/24` for media, `192.0.2.10/24` for apps, etc.) + `data` for
    Postgres/Redis access. For native-OIDC apps also add the `oidc-clients` network so the
    app can reach `authentik-server:9000` for token validation without exposing authentik-worker.
 4. Add tailscale-ingress multi-home: add the new layer to its `networks:` list.
@@ -924,13 +946,13 @@ python add-service.py <name> [options]
 | `--type {standalone,unified}` | `standalone` | `standalone` = dev/ Tailscale-sidecar; `unified` = Caddy + Authentik |
 | `--auth {authentik,native-oidc,none}` | `authentik` | Auth gate for unified type |
 | `--db {none,postgres,redis,both}` | `none` | Add local DB sidecar(s) — standalone only |
-| `--subdomain SLUG` | service name | External subdomain slug (e.g. `hoard` → `hoard.secop.dev`) |
+| `--subdomain SLUG` | service name | External subdomain slug (e.g. `hoard` → `example.com`) |
 | `--out DIR` | `./dev/<name>` or `./unified-stack/services/<name>` | Output base directory |
 | `--dry-run` | off | Print what would happen without writing files or calling external APIs |
 | `--no-host-setup` | off | Skip SSH host provisioning (print manual commands instead) |
-| `--ssh-host USER@HOST` | `rooter@streamer` | SSH target for host provisioning |
-| `--ssh-key PATH` | `~/.ssh/streamer` | SSH identity file |
-| `--repo-path PATH` | `/home/rooter/git/finnsbeincaddy` | Repo path on the Docker host |
+| `--ssh-host USER@HOST` | `admin@prod-host` | SSH target for host provisioning |
+| `--ssh-key PATH` | `~/.ssh/prod-host` | SSH identity file |
+| `--repo-path PATH` | `/home/admin/openirvana` | Repo path on the Docker host |
 
 ### Prerequisites for cloud provisioning
 
@@ -941,7 +963,7 @@ For `--type unified --auth authentik` the script reads these vars from `unified-
 | `CLOUDFLARE_API_TOKEN` | Create the public CNAME record for the service |
 | `AUTHENTIK_BOOTSTRAP_TOKEN` | Register the proxy provider + application in Authentik |
 | `AUTHENTIK_SUBDOMAIN` | Authentik's own subdomain (used to build the API base URL) |
-| `PUBLIC_FQDN` | Root domain (e.g. `secop.dev`) |
+| `PUBLIC_FQDN` | Root domain (e.g. `example.com`) |
 | `TAILNET_FQDN` | Tailnet FQDN for Caddy's tailnet site block |
 
 These are already present for normal stack operation; no extra setup is required.
@@ -952,7 +974,7 @@ These are already present for normal stack operation; no extra setup is required
 
 - Generates service files in `unified-stack/services/<name>/` (unified) or `dev/<name>/` (standalone)
 - SSHes to the Docker host and runs `fix-permissions.sh --service <name>` to create
-  `/dock/conf/<name>` and `/dock/data/<name>` with `docktaetor:media 770`
+  `/dock/conf/<name>` and `/dock/data/<name>` with `svc-user:media 770`
 
 **Additionally for `--type unified --auth authentik`**, the following 7 provisioning steps run
 automatically after scaffold. Each step is idempotent — re-running skips anything already done:
@@ -975,7 +997,7 @@ automatically after scaffold. Each step is idempotent — re-running skips anyth
 | Set the Tailscale auth key | Edit `TS_AUTHKEY` in `dev/<name>/.env` | N/A — unified uses the shared ingress |
 | Add service block to compose | N/A | Paste the printed block into `unified-stack/docker-compose.yml` |
 | Start the service | `docker compose --env-file dev/<name>/.env -f dev/<name>/docker-compose.yml up -d` | `docker compose up -d <name>` |
-| OIDC integration | N/A | If the service uses Authentik SSO, run `python3 scripts/setup-oidc.py` after start |
+| OIDC integration | N/A | If the service uses Authentik SSO, run `python3 scripts/set-auth.py oidc` after start |
 | Special UID permissions | N/A | If the service runs as a non-standard UID with `cap_drop:ALL`, add it to `fix-permissions.sh` and re-run |
 
 ### Re-provisioning an existing service

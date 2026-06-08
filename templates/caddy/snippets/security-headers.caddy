@@ -1,12 +1,20 @@
-(security-headers) {
+# Base security headers WITHOUT a Content-Security-Policy. Use this for apps
+# that emit their own (richer, nonce-based) CSP — e.g. Nextcloud — where layering
+# Caddy's strict default-src 'self' on top blocks the app's inline styles/scripts.
+(security-headers-base) {
     header {
         Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"
         X-Frame-Options "SAMEORIGIN"
         X-Content-Type-Options "nosniff"
         Referrer-Policy "strict-origin-when-cross-origin"
         Permissions-Policy "camera=(), microphone=(), geolocation=(), interest-cohort=()"
-        Content-Security-Policy "default-src 'self'; frame-ancestors 'self'; upgrade-insecure-requests"
         -Server
         -X-Powered-By
     }
+}
+
+# Full set: base + a strict default CSP, for services that don't ship their own.
+(security-headers) {
+    import security-headers-base
+    header Content-Security-Policy "default-src 'self'; frame-ancestors 'self'; upgrade-insecure-requests"
 }

@@ -1,0 +1,42 @@
+# Alertmanager configuration for unified-stack.
+#
+# Delivers alerts to ntfy (push notifications) via webhook.
+#
+# SETUP: Before alerts can be delivered, grant ntfy publish access:
+#   docker exec ntfy ntfy access '*' alerts write-only
+#   docker exec ntfy ntfy access '*' falco write-only
+#
+# Install: copy this file to ${DOCK_CONF}/alertmanager/alertmanager.yml
+# then: docker compose exec prometheus kill -HUP 1  (reload Prometheus rules)
+
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: ntfy
+  group_by: ['alertname', 'severity']
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    - matchers:
+        - severity = critical
+      group_wait: 10s
+      repeat_interval: 1h
+      receiver: ntfy
+
+receivers:
+  - name: ntfy
+    webhook_configs:
+      - url: 'http://ntfy:80/alerts'
+        send_resolved: true
+        max_alerts: 10
+
+# Suppress warning-level alerts when the same alertname+instance already
+# has a firing critical alert to avoid duplicate notifications.
+inhibit_rules:
+  - source_matchers:
+      - severity = critical
+    target_matchers:
+      - severity = warning
+    equal: ['alertname', 'instance']

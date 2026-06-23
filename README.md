@@ -1,3 +1,22 @@
+<!--kb:start-->
+# OpeNirvana
+
+> Unified self-hosted homelab stack — one `docker compose up` launches ingress hardening, SSO, SIEM, runtime security, network monitoring, shared data layer, and optional media/productivity profiles.
+
+## Knowledge base — docs/kb/
+
+- [Overview](docs/kb/overview.md) — purpose, motivation, architecture summary, key constraints
+- [CLI reference](docs/kb/cli.md) — all operator scripts: validate.py, gen-secrets.py, check-stack.py, set-auth.py, maintain.py, profiles.py, undo-entra.py, add-service.py
+- [Errors](docs/kb/errors.md) — exit code table (0–3) with triggers and fixes
+- [Config](docs/kb/config.md) — .env variables, config files, Docker Compose profiles, host directory layout
+- [Architecture](docs/kb/architecture.md) — modules, network topology, request/logging data flow, security model
+- [Dev loop](docs/kb/dev-loop.md) — validation gate, test, lint/type-check, preferred agentic loop
+
+## Vault card
+
+- [OpeNirvana project card](Q:\knowledge-base\02-projects\OpeNirvana.md) — Obsidian hub card with Dataview rollups and wikilink graph
+<!--kb:end-->
+
 # Unified Stack
 
 A profile-gated, self-hosted **security + productivity** stack for a single Ubuntu host.

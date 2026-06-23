@@ -1,7 +1,11 @@
 """bao-bootstrap.py — initialize, escrow, unseal, and provision OpenBao. Idempotent (hvac client)."""
-import json, os, shutil, stat, subprocess, sys, tempfile
+from __future__ import annotations
+
+import argparse
+import json, os, shutil, stat, subprocess, sys, tempfile  # nosec B404
 from pathlib import Path
 from bao_client import BaoClient
+from cred_store import CredStore, KeyringStore, auto_select_store
 from utils import EnvFile, red, green, yellow, step
 
 _ENV_SYNC_POLICY = '''
@@ -26,7 +30,7 @@ def _escrow(init_path: Path, age_recipient: str) -> None:
     if shutil.which("age") is None:
         yellow(f"  age not installed — cannot write {init_path}.age escrow copy"); return
     enc = init_path.with_suffix(".json.age")
-    subprocess.run(["age", "-r", age_recipient, "-o", str(enc), str(init_path)], check=True)
+    subprocess.run(["age", "-r", age_recipient, "-o", str(enc), str(init_path)], check=True)  # noqa: S603,S607  # nosec
     os.chmod(enc, 0o600)
     green(f"  escrow written: {enc}")
 
@@ -41,16 +45,27 @@ def _warn_no_escrow() -> None:
     red("  └─────────────────────────────────────────────────────────────┘")
 
 
-def bootstrap(addr: str, env: EnvFile, conf_dir: Path) -> None:
+def bootstrap(
+    addr: str,
+    env: EnvFile,
+    conf_dir: Path,
+    escrow_store: CredStore | None = None,
+) -> None:
     bao = BaoClient(addr)
     init_path = conf_dir / "openbao" / "init.json"
     status = bao.seal_status()
+    fresh_init = not status.get("initialized")
 
-    if not status.get("initialized"):
+    if fresh_init:
         step("Initializing OpenBao (first run)")
         res = bao.init(shares=1, threshold=1)        # Shamir 1/1; AKV seal supersedes if configured
         _atomic_secret_write(init_path, json.dumps(res, indent=2))
         green(f"  init material stored: {init_path} (0600)")
+        if escrow_store is not None:
+            escrow_store.store("root_token", res["root_token"])
+            for i, key in enumerate(res.get("keys_base64") or res.get("keys") or []):
+                escrow_store.store(f"unseal_key_{i}", key)
+            green("  init material escrowed in credential store")
         _escrow(init_path, env.get("BAO_ESCROW_AGE_RECIPIENT"))
         if not env.get("BAO_ESCROW_AGE_RECIPIENT") and not env.get("BAO_AKV_VAULT_NAME"):
             _warn_no_escrow()
@@ -97,23 +112,52 @@ def bootstrap(addr: str, env: EnvFile, conf_dir: Path) -> None:
     role = env.get("BAO_APPROLE_NAME") or "env-sync"
     bao.put_policy("env-sync", _ENV_SYNC_POLICY)
     bao.create_approle(role, ["env-sync"])
-    if not env.get("BAO_SYNC_ROLE_ID"):
-        env.set_if_blank("BAO_SYNC_ROLE_ID", bao.read_role_id(role))
+    # A fresh vault init invalidates any AppRole creds a prior vault instance left
+    # in .env (e.g. after a `/dock` wipe + redeploy): set_if_blank would skip them
+    # and bao-sync would approle_login against a role_id THIS vault never issued
+    # (the same .env-outlives-the-backend desync class as AUTHENTIK_BOOTSTRAP_TOKEN,
+    # ADR-0017). Force-refresh on a fresh init; otherwise write only if blank.
+    if fresh_init or not env.get("BAO_SYNC_ROLE_ID"):
+        (env.force_set if fresh_init else env.set_if_blank)("BAO_SYNC_ROLE_ID", bao.read_role_id(role))
+        print(f"  set    BAO_SYNC_ROLE_ID{' (force-refreshed: fresh vault init)' if fresh_init else ''}")
     else:
         print("  skip   BAO_SYNC_ROLE_ID (already set)")
-    if not env.get("BAO_SYNC_SECRET_ID"):
-        env.set_if_blank("BAO_SYNC_SECRET_ID", bao.gen_secret_id(role))
+    if fresh_init or not env.get("BAO_SYNC_SECRET_ID"):
+        (env.force_set if fresh_init else env.set_if_blank)("BAO_SYNC_SECRET_ID", bao.gen_secret_id(role))
+        print(f"  set    BAO_SYNC_SECRET_ID{' (force-refreshed: fresh vault init)' if fresh_init else ''}")
     else:
         print("  skip   BAO_SYNC_SECRET_ID (already set)")
-    green("  AppRole 'env-sync' provisioned; creds written to .env (if blank)")
+    green("  AppRole 'env-sync' provisioned; creds written to .env")
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(
+        prog="bao-bootstrap.py",
+        description="Initialize, escrow, unseal, and provision OpenBao.",
+    )
+    parser.add_argument(
+        "--store",
+        choices=["env", "keyring", "auto"],
+        default="env",
+        help=(
+            "Credential store for escrowing root_token + unseal keys: "
+            "env=no keyring escrow (default), keyring=Windows DPAPI, auto=platform-select."
+        ),
+    )
+    args = parser.parse_args()
+
     base = Path(__file__).resolve().parent.parent
     env = EnvFile(base / ".env")
     addr = os.environ.get("BAO_ADDR", "http://127.0.0.1:8200")
     conf = Path(env.get("DOCK_CONF") or "/dock/conf")
-    bootstrap(addr, env, conf)
+
+    escrow: CredStore | None = None
+    if args.store == "keyring":
+        escrow = KeyringStore("openbao-bootstrap")
+    elif args.store == "auto":
+        escrow = auto_select_store("openbao-bootstrap")
+
+    bootstrap(addr, env, conf, escrow_store=escrow)
 
 
 if __name__ == "__main__":

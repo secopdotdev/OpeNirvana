@@ -1,3 +1,0 @@
-<decoder name="zeek-notice">
-  <prematch>^{"ts":.+"note":</prematch>
-</decoder>

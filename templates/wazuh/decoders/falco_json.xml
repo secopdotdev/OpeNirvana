@@ -1,3 +1,0 @@
-<decoder name="falco-json">
-  <prematch>^{"output":</prematch>
-</decoder>

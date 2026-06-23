@@ -93,7 +93,9 @@ import snippets/*.caddy
 
 # Authentik SSO — the identity provider itself; exempt from the global gate.
 (backend-authentik) {
-    reverse_proxy authentik-server:9000
+    reverse_proxy authentik-server:9000 {
+        flush_interval -1
+    }
 }
 
 # Dashy — home launcher served at the apex domain.
@@ -105,15 +107,6 @@ import snippets/*.caddy
 (backend-grafana) {
     reverse_proxy grafana:3000 {
         flush_interval -1
-    }
-}
-
-# Wazuh dashboard — OpenSearch Dashboards with self-signed cert.
-(backend-wazuh) {
-    reverse_proxy https://wazuh-dashboard:5601 {
-        transport http {
-            tls_insecure_skip_verify
-        }
     }
 }
 
@@ -179,11 +172,6 @@ import snippets/*.caddy
     reverse_proxy falcosidekick-ui:2802
 }
 
-# Redpanda Console — Kafka topic inspector for Falco security events.
-(backend-redpanda-console) {
-    reverse_proxy redpanda-console:8080
-}
-
 # ClickHouse — analytics database. HTTP interface on :8123 serves both the
 # /play web UI (interactive SQL) and the query API. External traffic is
 # human/UI only — Vector and other internal writers connect directly via
@@ -197,9 +185,9 @@ import snippets/*.caddy
     reverse_proxy zeek-logs:80
 }
 
-# Dockhand — container monitoring dashboard.
-(backend-dockhand) {
-    reverse_proxy dockhand:3000
+# Komodo — Docker Compose management UI.
+(backend-komodo) {
+    reverse_proxy komodo-core:9120
 }
 
 # Immich — photo/video library (SSE for upload progress).
@@ -228,9 +216,12 @@ import snippets/*.caddy
     reverse_proxy vikunja:3456
 }
 
-# AFFiNE — collaborative workspace.
-(backend-affine) {
-    reverse_proxy affine:3010
+# CouchDB — Obsidian livesync sync server. The sync API uses CouchDB native
+# account auth (no Authentik forward-auth — livesync clients are native apps,
+# not browsers, and cannot complete an SSO redirect). The /_utils Fauxton admin
+# UI IS gated by Authentik in the site handles below.
+(backend-couchdb) {
+    reverse_proxy couchdb:5984
 }
 
 # n8n — workflow automation (SSE for live execution logs).
@@ -266,6 +257,7 @@ import snippets/*.caddy
 # ==============================================================
 
 (public-policy) {
+    import cloudflare-allowlist
     import crowdsec
     import coraza
     import security-headers
@@ -289,6 +281,7 @@ import snippets/*.caddy
     tls {
         dns cloudflare {$CLOUDFLARE_API_TOKEN}
         resolvers 1.1.1.1
+        import cf-origin-mtls
     }
     # crowdsec http wraps every ResponseWriter to check IPs against LAPI;
     # like the other instrumenting modules it breaks Hijack() on a WS 101
@@ -302,6 +295,59 @@ import snippets/*.caddy
         get_certificate tailscale
     }
     import backend-spreed-signaling
+}
+
+# ==============================================================
+# OpenBao secrets backend — dedicated site blocks (inline, like talk.* above).
+# Admin-only: every request goes through Authentik forward-auth, no exclusions.
+# Inlined here rather than as a snippets/*.caddy file because it imports the
+# (public-policy)/(tailnet-policy) snippets defined just above — a site block
+# pulled in by the early `import snippets/*.caddy` would reference those
+# snippets before they are defined (Caddy: "File to import not found").
+# ==============================================================
+{$BAO_SUBDOMAIN}.{$PUBLIC_FQDN} {
+    tls {
+        dns cloudflare {$CLOUDFLARE_API_TOKEN}
+        resolvers 1.1.1.1
+        import cf-origin-mtls
+    }
+
+    import public-policy
+
+    # Authentik outpost callback paths must reach authentik-proxy directly to
+    # complete the OAuth/OIDC login flow before the user is redirected back.
+    @outpost-bao-pub {
+        path /outpost.goauthentik.io/*
+    }
+    handle @outpost-bao-pub {
+        reverse_proxy authentik-proxy:9000
+    }
+
+    # All remaining traffic requires a valid Authentik session.
+    forward_auth authentik-proxy:9000 {
+        uri /outpost.goauthentik.io/auth/caddy
+        copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid X-Authentik-Jwt X-Authentik-Meta-Jwks X-Authentik-Meta-Outpost X-Authentik-Meta-Provider X-Authentik-Meta-App X-Authentik-Meta-Version
+    }
+
+    reverse_proxy openbao:8200
+}
+
+http://{$BAO_SUBDOMAIN}.{$TAILNET_FQDN} {
+    import tailnet-policy
+
+    @outpost-bao-ts {
+        path /outpost.goauthentik.io/*
+    }
+    handle @outpost-bao-ts {
+        reverse_proxy authentik-proxy:9000
+    }
+
+    forward_auth authentik-proxy:9000 {
+        uri /outpost.goauthentik.io/auth/caddy
+        copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid X-Authentik-Jwt X-Authentik-Meta-Jwks X-Authentik-Meta-Outpost X-Authentik-Meta-Provider X-Authentik-Meta-App X-Authentik-Meta-Version
+    }
+
+    reverse_proxy openbao:8200
 }
 
 # ==============================================================
@@ -320,6 +366,7 @@ import snippets/*.caddy
     tls {
         dns cloudflare {$CLOUDFLARE_API_TOKEN}
         resolvers 1.1.1.1
+        import cf-origin-mtls
     }
 
     handle_path /push/* {
@@ -359,6 +406,20 @@ import snippets/*.caddy
 }
 
 # ==============================================================
+# Authentik SSO server - dedicated site to avoid Coraza WAF /
+# CrowdSec ResponseWriter wrapping which breaks WebSocket hijack
+# on /ws/outpost/*. See comments at talk.* block for rationale.
+# ==============================================================
+{$AUTHENTIK_SUBDOMAIN}.{$PUBLIC_FQDN} {
+    tls {
+        dns cloudflare {$CLOUDFLARE_API_TOKEN}
+        resolvers 1.1.1.1
+        import cf-origin-mtls
+    }
+    import backend-authentik
+}
+
+# ==============================================================
 # Public ingress: *.{$PUBLIC_FQDN}   (e.g. *.example.com)
 # TLS via Cloudflare DNS-01 challenge — single wildcard cert.
 # All unmatched hosts abort (no default backend).
@@ -369,9 +430,8 @@ import snippets/*.caddy
     # Services that set their own richer CSP — strip ours so it doesn't
     # override theirs. Must be at site level (after the import) so it
     # runs after security-headers adds the header.
-    header @authentik    -Content-Security-Policy
     header @jellyfin-pub -Content-Security-Policy
-    header @affine-pub   -Content-Security-Policy
+    header @couchdb-pub  -Content-Security-Policy
     header @vikunja-pub  -Content-Security-Policy
     header @tandoor-pub  -Content-Security-Policy
     header @immich       -Content-Security-Policy
@@ -383,18 +443,13 @@ import snippets/*.caddy
     # <script> that sets window.FileBrowser; the global default-src 'self'
     # CSP blocks it, leaving the config undefined and the page fully blank.
     # Dedicated matcher (not the @zeek routing matcher) so the strip also
-    # applies to the forward_auth response — mirrors @wazuh-pub below.
+    # applies to the forward_auth response.
     @zeek-pub host {$ZEEK_SUBDOMAIN}.{$PUBLIC_FQDN}
     header @zeek-pub -Content-Security-Policy
 
-    # Wazuh (OpenSearch Dashboards) bundles use Function() constructor.
-    @wazuh-pub host {$WAZUH_SUBDOMAIN}.{$PUBLIC_FQDN}
-    header @wazuh-pub -Content-Security-Policy
-
-    # Dockhand SPA bootstraps from an inline <script>; same CSP issue as zeek.
-    # Dedicated matcher so the strip applies to the forward_auth response too.
-    @dockhand-pub host {$DOCKHAND_SUBDOMAIN}.{$PUBLIC_FQDN}
-    header @dockhand-pub -Content-Security-Policy
+    # Komodo SPA uses inline scripts/styles for dashboard panels.
+    @komodo-pub host {$KOMODO_SUBDOMAIN}.{$PUBLIC_FQDN}
+    header @komodo-pub -Content-Security-Policy
 
     # Grafana uses inline scripts/styles in dashboard panels.
     @grafana-pub host {$GRAFANA_SUBDOMAIN}.{$PUBLIC_FQDN}
@@ -411,6 +466,7 @@ import snippets/*.caddy
     tls {
         dns cloudflare {$CLOUDFLARE_API_TOKEN}
         resolvers 1.1.1.1
+        import cf-origin-mtls
     }
 
     # ── Global Authentik gate ──────────────────────────────────────────────
@@ -433,7 +489,7 @@ import snippets/*.caddy
         not host {$AUTHENTIK_SUBDOMAIN}.{$PUBLIC_FQDN}
         not host {$NEXTCLOUD_SUBDOMAIN}.{$PUBLIC_FQDN}
         not host {$VIKUNJA_SUBDOMAIN}.{$PUBLIC_FQDN}
-        not host {$AFFINE_SUBDOMAIN}.{$PUBLIC_FQDN}
+        not host {$COUCHDB_SUBDOMAIN}.{$PUBLIC_FQDN}
         not host {$TANDOOR_SUBDOMAIN}.{$PUBLIC_FQDN}
         not host {$TALK_SUBDOMAIN}.{$PUBLIC_FQDN}
         # Native OIDC + mobile/API clients — app owns its own login page.
@@ -448,15 +504,6 @@ import snippets/*.caddy
     }
     # ──────────────────────────────────────────────────────────────────────
 
-    @authentik host {$AUTHENTIK_SUBDOMAIN}.{$PUBLIC_FQDN}
-    handle @authentik {
-        import backend-authentik
-    }
-
-    @wazuh host {$WAZUH_SUBDOMAIN}.{$PUBLIC_FQDN}
-    handle @wazuh {
-        import backend-wazuh
-    }
 
     # cloud.{$PUBLIC_FQDN} is handled by its dedicated site block above (so the
     # notify_push /push/* WebSocket can bypass response middleware) — the
@@ -519,9 +566,17 @@ import snippets/*.caddy
         import backend-vikunja
     }
 
-    @affine-pub host {$AFFINE_SUBDOMAIN}.{$PUBLIC_FQDN}
-    handle @affine-pub {
-        import backend-affine
+    @couchdb-pub host {$COUCHDB_SUBDOMAIN}.{$PUBLIC_FQDN}
+    handle @couchdb-pub {
+        # Fauxton admin UI is browser-accessible -> gate it with Authentik.
+        # The sync API (everything else on this host) is intentionally NOT
+        # forward-auth'd — obsidian-livesync uses CouchDB native account auth.
+        @fauxton-pub path /_utils /_utils/*
+        forward_auth @fauxton-pub authentik-proxy:9000 {
+            uri /outpost.goauthentik.io/auth/caddy
+            copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid
+        }
+        import backend-couchdb
     }
 
     @flaresolverr host {$FLARESOLVERR_SUBDOMAIN}.{$PUBLIC_FQDN}
@@ -532,11 +587,6 @@ import snippets/*.caddy
     @crowdsec host {$CROWDSEC_SUBDOMAIN}.{$PUBLIC_FQDN}
     handle @crowdsec {
         import backend-crowdsec
-    }
-
-    @dockhand host {$DOCKHAND_SUBDOMAIN}.{$PUBLIC_FQDN}
-    handle @dockhand {
-        import backend-dockhand
     }
 
     @immich host {$IMMICH_SUBDOMAIN}.{$PUBLIC_FQDN}
@@ -567,11 +617,6 @@ import snippets/*.caddy
         import backend-janus
     }
 
-    @redpanda-console host {$KAFKA_SUBDOMAIN}.{$PUBLIC_FQDN}
-    handle @redpanda-console {
-        import backend-redpanda-console
-    }
-
     @grafana host {$GRAFANA_SUBDOMAIN}.{$PUBLIC_FQDN}
     handle @grafana {
         import backend-grafana
@@ -580,6 +625,11 @@ import snippets/*.caddy
     @clickhouse host {$CLICKHOUSE_SUBDOMAIN}.{$PUBLIC_FQDN}
     handle @clickhouse {
         import backend-clickhouse
+    }
+
+    @komodo host {$KOMODO_SUBDOMAIN}.{$PUBLIC_FQDN}
+    handle @komodo {
+        import backend-komodo
     }
 
     # Catch-all: reject any subdomain not explicitly matched above.
@@ -600,7 +650,7 @@ http://*.{$TAILNET_FQDN} {
 
     header @authentik    -Content-Security-Policy
     header @jellyfin-ts  -Content-Security-Policy
-    header @affine-ts    -Content-Security-Policy
+    header @couchdb-ts   -Content-Security-Policy
     header @vikunja-ts   -Content-Security-Policy
     header @tandoor-ts   -Content-Security-Policy
     header @immich-ts    -Content-Security-Policy
@@ -610,11 +660,8 @@ http://*.{$TAILNET_FQDN} {
     @zeek-ts-pub host {$ZEEK_SUBDOMAIN}.{$TAILNET_FQDN}
     header @zeek-ts-pub -Content-Security-Policy
 
-    @wazuh-ts host {$WAZUH_SUBDOMAIN}.{$TAILNET_FQDN}
-    header @wazuh-ts -Content-Security-Policy
-
-    @dockhand-ts-pub host {$DOCKHAND_SUBDOMAIN}.{$TAILNET_FQDN}
-    header @dockhand-ts-pub -Content-Security-Policy
+    @komodo-ts-pub host {$KOMODO_SUBDOMAIN}.{$TAILNET_FQDN}
+    header @komodo-ts-pub -Content-Security-Policy
 
     @grafana-ts-pub host {$GRAFANA_SUBDOMAIN}.{$TAILNET_FQDN}
     header @grafana-ts-pub -Content-Security-Policy
@@ -638,7 +685,7 @@ http://*.{$TAILNET_FQDN} {
         not host {$AUTHENTIK_SUBDOMAIN}.{$TAILNET_FQDN}
         not host {$NEXTCLOUD_SUBDOMAIN}.{$TAILNET_FQDN}
         not host {$VIKUNJA_SUBDOMAIN}.{$TAILNET_FQDN}
-        not host {$AFFINE_SUBDOMAIN}.{$TAILNET_FQDN}
+        not host {$COUCHDB_SUBDOMAIN}.{$TAILNET_FQDN}
         not host {$TANDOOR_SUBDOMAIN}.{$TAILNET_FQDN}
         not host {$TALK_SUBDOMAIN}.{$TAILNET_FQDN}
         # Native OIDC + mobile/API clients — app owns its own login page.
@@ -656,11 +703,6 @@ http://*.{$TAILNET_FQDN} {
     @authentik host {$AUTHENTIK_SUBDOMAIN}.{$TAILNET_FQDN}
     handle @authentik {
         import backend-authentik
-    }
-
-    @wazuh host {$WAZUH_SUBDOMAIN}.{$TAILNET_FQDN}
-    handle @wazuh {
-        import backend-wazuh
     }
 
     # cloud.{$TAILNET_FQDN} is handled by its dedicated site block above (so the
@@ -722,9 +764,14 @@ http://*.{$TAILNET_FQDN} {
         import backend-vikunja
     }
 
-    @affine-ts host {$AFFINE_SUBDOMAIN}.{$TAILNET_FQDN}
-    handle @affine-ts {
-        import backend-affine
+    @couchdb-ts host {$COUCHDB_SUBDOMAIN}.{$TAILNET_FQDN}
+    handle @couchdb-ts {
+        @fauxton-ts path /_utils /_utils/*
+        forward_auth @fauxton-ts authentik-proxy:9000 {
+            uri /outpost.goauthentik.io/auth/caddy
+            copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid
+        }
+        import backend-couchdb
     }
 
     @flaresolverr-ts host {$FLARESOLVERR_SUBDOMAIN}.{$TAILNET_FQDN}
@@ -735,11 +782,6 @@ http://*.{$TAILNET_FQDN} {
     @crowdsec-ts host {$CROWDSEC_SUBDOMAIN}.{$TAILNET_FQDN}
     handle @crowdsec-ts {
         import backend-crowdsec
-    }
-
-    @dockhand-ts host {$DOCKHAND_SUBDOMAIN}.{$TAILNET_FQDN}
-    handle @dockhand-ts {
-        import backend-dockhand
     }
 
     @immich-ts host {$IMMICH_SUBDOMAIN}.{$TAILNET_FQDN}
@@ -771,11 +813,6 @@ http://*.{$TAILNET_FQDN} {
         import backend-janus
     }
 
-    @redpanda-console-ts host {$KAFKA_SUBDOMAIN}.{$TAILNET_FQDN}
-    handle @redpanda-console-ts {
-        import backend-redpanda-console
-    }
-
     @grafana-ts host {$GRAFANA_SUBDOMAIN}.{$TAILNET_FQDN}
     handle @grafana-ts {
         import backend-grafana
@@ -784,6 +821,11 @@ http://*.{$TAILNET_FQDN} {
     @clickhouse-ts host {$CLICKHOUSE_SUBDOMAIN}.{$TAILNET_FQDN}
     handle @clickhouse-ts {
         import backend-clickhouse
+    }
+
+    @komodo-ts host {$KOMODO_SUBDOMAIN}.{$TAILNET_FQDN}
+    handle @komodo-ts {
+        import backend-komodo
     }
 
     # Catch-all: reject any subdomain not explicitly matched above.
@@ -804,6 +846,7 @@ http://*.{$TAILNET_FQDN} {
     tls {
         dns cloudflare {$CLOUDFLARE_API_TOKEN}
         resolvers 1.1.1.1
+        import cf-origin-mtls
     }
 
     @outpost-apex {

@@ -1,17 +1,387 @@
 # Unified Stack
 
-Single-command self-hosted foundation: one `docker compose up` brings up Caddy (custom build with Crowdsec, Coraza WAF, forward-auth, Souin cache, Brotli, L4 proxy), a Tailscale ingress sidecar, shared Postgres + Redis, Wazuh SIEM, Crowdsec LAPI, Falco runtime-security monitoring, Zeek network-security monitoring, Authentik SSO, Nextcloud, and optional media + productivity stacks — all accessible on both `*.example.com` (public, via Cloudflare) and `*.your-tailnet.example` (Tailnet).
+A profile-gated, self-hosted **security + productivity** stack for a single Ubuntu host.
+One command brings up the whole thing:
 
-**Priority order:** Functionality > Security > Efficiency > Stability.
+```bash
+bash <(curl -fsSL https://example.com)
+```
 
-**Profiles:**
-- *(no profile)* — Core stack: Authentik, Nextcloud, Wazuh, Falco, Zeek, Crowdsec, Caddy
-- `--profile media` — Jellyfin, Jellyseerr, Prowlarr, Radarr, Sonarr, Lidarr, qBittorrent, FlareSolverr (all via ProtonVPN)
-- `--profile apps` — ntfy, Tandoor, Vikunja, AFFiNE
+**What it does, in three lines:**
+
+- **Caddy** (custom build: CrowdSec bouncer, Coraza WAF, forward-auth, Souin cache, Brotli, L4) terminates TLS and is the only ingress.
+- **Authentik** provides SSO — forward-auth for services with no native login, native OIDC for the rest (optionally federated to Microsoft Entra ID).
+- **Tailscale** gives every service a second, private door, so each UI is reachable on both `*.example.com` (public, via Cloudflare) and `*.your-tailnet.example` (Tailnet) — and **never** directly on the internet.
+
+Everything past the always-on `core` is opt-in: pick **profiles** or **bundles**, then fine-tune
+with per-service toggles. The host's RAM picks a **resource tier** automatically.
+
+**Priority order:** Security > Functionality > Stability > Efficiency.
 
 ---
 
-## Architectural diagrams
+## Quickstart
+
+**Prerequisites** (Ubuntu 24.04+, see [Resource requirements](#resource-requirements) for sizing):
+
+- Cloudflare account managing your `PUBLIC_FQDN` zone; API token with `Zone:Read` + `DNS:Edit`.
+- Tailscale account with the host enrolled; an authkey from the admin console.
+- Router port-forwards to the host (see [Port forward](#port-forward)).
+
+### Zero-touch (recommended)
+
+```bash
+bash <(curl -fsSL https://example.com)
+```
+
+`run.sh` clones the repo, runs `docker-host-config.sh` (creates the `/dock/` tree, installs
+Docker, fixes ownership, installs the controlled PyPI deps), generates secrets, detects the
+host's RAM to set `RESOURCE_TIER`, computes the service set from your profiles, and brings the
+stack up. It is idempotent — safe to re-run on a live host.
+
+### Manual (step-by-step)
+
+1. **Host bootstrap** — creates `/dock/`, installs Docker, sets ownership:
+   ```bash
+   git clone <repo-url> ~/openirvana
+   sudo ~/openirvana/unified-stack/docker-host-config.sh
+   ```
+
+2. **Configure `.env`** — set the two external keys and choose what to deploy:
+   ```bash
+   cd ~/openirvana/unified-stack
+   cp .env.example .env
+   # Required: TAILSCALE_AUTHKEY and CLOUDFLARE_API_TOKEN.
+   # Choose deployment: STACK_PROFILES, optional SERVICE_ENABLE / SERVICE_DISABLE.
+   # RESOURCE_TIER is auto-detected by run.sh if left blank.
+   ```
+
+3. **Generate secrets** (pre-launch pass — Postgres, Redis, Authentik, Nextcloud, OpenBao, …):
+   ```bash
+   python3 scripts/gen-secrets.py .env
+   ```
+   Two secrets cannot exist until the stack is running — `CROWDSEC_BOUNCER_API_KEY` (issued by
+   CrowdSec) and `AUTHENTIK_OUTPOST_TOKEN` (issued by Authentik). Both are fetched in step 5.
+
+4. **Bring up the stack:**
+   ```bash
+   bash run.sh        # interactive — confirms the resolved service set
+   bash run.sh -y     # unattended (CI / cron)
+   ```
+   `run.sh` reads `STACK_PROFILES` (+ toggles) from `.env`, always forces `core` on, and starts
+   exactly the resolved service set.
+
+5. **Fetch container-issued secrets and restart the affected services:**
+   ```bash
+   python3 scripts/gen-secrets.py .env
+   docker compose up -d --no-deps --force-recreate authentik-proxy caddy
+   ```
+   `gen-secrets.py` is idempotent. The second pass queries the running CrowdSec and Authentik
+   containers for the two remaining secrets; the recreate picks them up. Add `--apply` after a
+   rotation to also sync Postgres passwords.
+
+6. **Visit** (replace `example.com` with your `PUBLIC_FQDN`):
+   - `https://example.com` — Authentik (first run: set MFA, create users)
+   - `https://example.com` — Nextcloud, if the `files` profile is enabled (OIDC login via Authentik)
+   - `https://example.com` — Dashy landing page, if the `home` profile is enabled
+
+**Boot persistence:** `sudo systemctl enable --now compose-stack.service`
+
+Then configure SSO ([OIDC](#set-authpy-oidc) and optional [Entra federation](#entra-id-federation)).
+
+### Port forward
+
+A forwarded router port is the **only** way the public internet reaches this host, so forward the
+*minimum*. **Tailscale needs none** — it punches out via NAT traversal, so everything reachable
+over the Tailnet works with zero open ports. The list splits into a **web tier** (the public
+`*.example.com` UIs) and a **WebRTC tier** (Nextcloud Talk calls — needed *only* if a caller is ever
+off-Tailnet; see the decision box). Then read **[Minimizing forwarded-port
+exposure](#minimizing-forwarded-port-exposure)** — every entry here is attack surface that skips
+Tailscale's identity layer.
+
+**Web tier — forward to the host's LAN IP:**
+
+| Port | Proto | → | Why | Forward? |
+|------|-------|---|-----|----------|
+| 443 | TCP | Caddy (in `tailscale-ingress` netns) | Cloudflare connects to the origin here for every proxied request | **Required** |
+| 80 | TCP | Caddy | HTTP→HTTPS redirect. Certs use **DNS-01**, so 80 is *not* needed for ACME; Cloudflare "Always Use HTTPS" can also redirect at the edge | Recommended |
+| 443 | UDP | Caddy | HTTP/3 / QUIC. **Not needed behind the Cloudflare proxy** — CF terminates HTTP/3 at its edge and reaches the origin over TCP 443. Forward only for direct (non-CF) HTTP/3 | Optional — skip |
+
+**WebRTC tier — Nextcloud Talk audio/video (`talk` profile only).** Media never traverses the
+Cloudflare proxy (CF does not relay arbitrary UDP), so these point **directly** at the host, on
+**DNS-only / grey-cloud** records, validated by coturn's time-limited HMAC credentials:
+
+| Port(s) | Proto | Service | Why |
+|---------|-------|---------|-----|
+| 3478 | TCP + UDP | coturn | STUN/TURN — NAT discovery + TURN control |
+| 49152–49200 | UDP | coturn | TURN relayed media (fallback when peer-to-peer fails) |
+| 20000–20049 | UDP | janus | WebRTC SFU media for group video *(narrowed from 20000–20100 — see Minimizing exposure)* |
+
+> **Do you need the WebRTC tier? — decision procedure.** Forward it **only if a call will ever
+> include a participant who is *not* on your Tailnet** (a public/guest browser, a phone on
+> cellular, an external colleague). To decide:
+> 1. **List who joins Talk calls.** If every participant's device is enrolled in your Tailnet,
+>    the Tailnet carries the media end-to-end — **forward nothing**, leave these closed.
+> 2. **If any caller is off-Tailnet** (you share a public Talk link, guests dial in, you join from
+>    a device you can't enroll), external clients can't reach a Tailnet-only media path, so you
+>    must forward the WebRTC tier — or relay through a public TURN such as **Cloudflare Realtime**
+>    (Minimizing exposure, method #5).
+> 3. **Test it empirically.** With these ports *not* forwarded, place a call between two Tailnet
+>    devices (should work), then from a phone on cellular with Wi-Fi/VPN **off** (fails *only* if a
+>    forward is genuinely required). If the cellular test succeeds, you don't need the forward.
+>
+> **Default to closed.** This stack assumes Tailnet-only calls; opening the WebRTC tier is an
+> explicit opt-in costing ≈90 UDP ports of exposure — minimize it per method #5 if you must.
+
+> **80 / 443 source-IP restriction:** restricting these at the router to
+> [Cloudflare's IP ranges](https://www.cloudflare.com/ips/) is good defence-in-depth, but note it
+> is **coarse** (those ranges are shared by every Cloudflare tenant). In-stack, the equivalent L3
+> kernel allowlist is implemented in the `DOCKER-USER` chain (auto-applied on deploy — the ufw
+> `INPUT` rule cannot reach Docker's DNAT'd ports), the L2 Caddy `remote_ip` allowlist is disabled
+> pending redesign (PR #63), and the real origin control — **Authenticated Origin Pulls (AOP)
+> mTLS** — is an explicit post-deploy operator step. See **Minimizing forwarded-port exposure**
+> below and **Origin lockdown** under [Security model](#security-model).
+
+### Minimizing forwarded-port exposure
+
+Treat the forward list as a budget to drive toward zero. Two facts shape the strategy:
+
+**1. Published *container* ports bypass UFW.** Docker publishes a port by inserting a `DNAT` rule
+evaluated in the kernel's `PREROUTING`/`FORWARD` path — *before* UFW's `INPUT` chain. So
+`ufw allow from <cidr> to any port 443` does **not** filter traffic to a published container port;
+it only filters the host's own listening sockets. On this host:
+
+- **80 / 443** (DNAT'd into the `tailscale-ingress` netns where Caddy runs) and **janus
+  20000–20049** (DNAT'd to the janus container) are **not** constrained by the rules you see in
+  `ufw status` — that traffic never enters the `INPUT` chain those rules live in.
+- **coturn (3478, 49152–49200)** and **Zeek (9991–9997)** use `network_mode: host`, so they *do*
+  hit `INPUT` and UFW governs them correctly (coturn is intentionally open; Zeek's ports are
+  default-denied and never forwarded — internal cluster comms only).
+
+This is exactly why the L3 CF-CIDR lock is programmed in the **`DOCKER-USER`** chain (evaluated on
+`FORWARD`, where DNAT'd traffic actually flows), not via `ufw allow` — see [Origin
+lockdown](#origin-lockdown--cloudflare-only-ingress--origin-mtls-adr-0020) L3.
+
+**2. The Cloudflare-only origin lock — layer status:** L3 (kernel CF-CIDR in `DOCKER-USER`)
+auto-applies on deploy; L2 (Caddy `remote_ip`) is disabled after a boot-crash (PR #63); **L1 (AOP
+mTLS) is the real control and is an explicit post-deploy step** (staged off until activated).
+**What this does and doesn't mean:** Caddy still terminates TLS and Authentik still gates every
+forward-auth'd app even on a direct origin hit — so this is **not** open data access. Until L1 is
+activated, the real
+exposure is (a) the origin IP is reachable directly → Cloudflare's WAF, rate-limiting and
+bot-management can be bypassed and the origin can be DDoS'd directly, and (b) any route *not* behind
+forward-auth (native-OIDC apps, health endpoints) is reachable without the edge in front.
+
+#### Methods, ordered by security value
+
+| # | Method | Effort | Effect | Trade-off |
+|---|--------|--------|--------|-----------|
+| 1 | **Activate AOP origin mTLS (L1)** — follow the 7-step [Provisioning AOP](#provisioning-aop) runbook (generate cert → provision → verify CF presents it → stage `CLOUDFLARE_MTLS_MODE` `request`→`require_and_verify`) | Low, one-time | **The real origin authentication** — Caddy rejects any TLS not presenting Cloudflare's client cert, so only the CF edge reaches the origin regardless of IP | Stage carefully (lock-out risk); zero end-user impact |
+| 2 | **Cloudflare Tunnel (`cloudflared`)** for the web tier | Medium | Eliminates the **80/443 inbound forward entirely** — the tunnel dials *out*, so there is no origin IP to scan or DDoS and nothing to port-forward | Adds a daemon; **HTTP(S) only — does not carry WebRTC UDP**; must point at **Caddy**, not at backends, or Authentik forward-auth is bypassed |
+| 3 | **L3 CF-CIDR lock in `DOCKER-USER`** *(implemented — auto-applies on deploy)* — see [Activating the L3 DOCKER-USER lock](#activating-the-l3-docker-user-lock-kernel-cf-cidr-pre-filter) | Low (automatic) | Kernel pre-filter drops non-Cloudflare traffic to DNAT'd 80/443 — where the ufw `INPUT` rule could not reach | **Coarse, not auth** — CF's CIDRs are shared across all tenants, so it only stops non-CF scanners; #1 is the control |
+| 4 | **Close the WebRTC tier (Tailnet-only calls)** | None (config) | Removes ≈90 UDP forwarded ports — the single largest surface | Only valid if no off-Tailnet participants (decision box above) |
+| 5 | **Collapse WebRTC to TURN-over-TLS** — force-relay all media through coturn on TCP **5349/443** and drop the wide UDP ranges; or offload to **Cloudflare Realtime** TURN | Medium | One TCP port instead of ≈90 UDP, or zero origin UDP | Higher latency/CPU (all media relayed); CF Realtime is an external/paid dependency |
+| 6 | **Narrow + bind what remains** — janus range cut to real concurrency; drop the unused origin UDP 443 publish; keep internal listeners off `0.0.0.0` | Low | Smaller surface and blast radius | Caps max concurrent call-media streams (generous for a homelab) |
+
+**Recommended path:** **#1 (AOP) is the origin authentication — do it first**; it makes the
+IP-reachability concerns moot. Layer **#3** beneath it as a cheap pre-filter and **#6** as routine
+hygiene. Keep calls **Tailnet-only (#4)** unless you've confirmed external participants; if you
+need them, prefer **#5** over opening raw UDP ranges. **#2 (Tunnel)** is the strongest web-tier
+answer if you want zero inbound forwards — but it solves *only* the web tier; the WebRTC decision is
+independent.
+
+> **Already applied in this repo (low-risk hygiene, #6):** the janus media range is narrowed
+> `20000–20100` → `20000–20049` (compose + `janus.jcfg`), halving the DNAT'd UDP surface while
+> leaving generous group-call capacity (~1 port per concurrent stream). The architectural options
+> (#1, #2, #5) and the live firewall change (#3) are **operator decisions** — apply them via a
+> staged change, not silently, since each is a live, externally-visible modification of the origin.
+
+---
+
+## Choose your deployment
+
+The stack selects services from three layered controls, all in `.env`. `profiles.toml` is the
+single source of truth for what each profile contains; `profiles.py` is its only reader; `run.sh`
+resolves the final list (governed by **ADR-0015**).
+
+### 1. `RESOURCE_TIER` — how big your limits are
+
+`run.sh` reads `/proc/meminfo` and writes `RESOURCE_TIER` **only if it is blank** (a human value
+always wins). The tier is **advisory**: it does **not** change *which* services run, and it is
+**not** auto-applied to memory limits. Each tier maps to an **optional** per-service `*_MEM_LIMIT`
+preset block in `.env` (the `PERFORMANCE TIERING` section) that you uncomment; on a small host
+`run.sh` warns when you are still on the generous default limits.
+
+| Tier | Host RAM | `.env` preset block to use | Intent |
+|------|----------|----------------------------|--------|
+| `MICRO` | ≤ 12 GB | uncomment `LOW` block + trim `STACK_PROFILES` to ~core | `core` only, or core + a sliver of observability |
+| `LOW` | ≤ 20 GB | uncomment `LOW` block | core + the `observability` bundle |
+| `MED` | ≤ 44 GB | uncomment `MED` block | core + observability + productivity |
+| `HIGH` | ≤ 96 GB | keep the active (default) block | full stack minus the heaviest media |
+| `MAX` | > 96 GB | keep the active (default) block | everything |
+
+The active (uncommented) `*_MEM_LIMIT` block in `.env` is the baseline — it ships at the `HIGH`
+preset; swap in a smaller block for a smaller host. Set `RESOURCE_TIER` by hand to override the
+auto-detect.
+
+### 2. `STACK_PROFILES` — what to deploy
+
+A comma-separated list of **fine profile names** *or* **bundle names**. `core` is always forced on
+and cannot be listed away. Bundles expand to their fine profiles before resolution.
+
+```bash
+# Casual: bundles
+STACK_PROFILES=observability,media
+
+# Power user: fine profiles
+STACK_PROFILES=metrics,viz,logs,netmon,files,tasks
+```
+
+**Bundles** (convenience meta-groups; see [Service catalog](#service-catalog) for members):
+
+| Bundle | Expands to |
+|--------|-----------|
+| `observability` | `metrics`, `exporters`, `logs`, `viz` |
+| `security` | `netmon`, `runtime-sec`, `tor` |
+| `productivity` | `files`, `talk`, `photos`, `notes`, `tasks`, `recipes` |
+| `media` | `vpn`, `downloads`, `indexers`, `movies`, `tv`, `audio`, `stream`, `requests`, `captcha` |
+
+### 3. `SERVICE_ENABLE` / `SERVICE_DISABLE` — per-service surgery
+
+Two comma-separated lists for adding or removing individual services on top of the selected
+profiles/bundles. The resolver computes `(union of profiles ∪ core) + SERVICE_ENABLE − SERVICE_DISABLE`.
+
+```bash
+STACK_PROFILES=observability,media
+SERVICE_DISABLE=lidarr            # want all media except the music *arr
+SERVICE_ENABLE=dashy              # add the landing page without enabling the whole `home` profile
+```
+
+**Rules (fail-closed):**
+
+- **`core` is irreducible** — `SERVICE_DISABLE` may not remove `caddy`, `authentik-*`, `postgres`,
+  `redis`, `crowdsec`, `openbao`, the socket-proxies, `autoheal`, or `tailscale-ingress`. Attempting
+  it is an error.
+- **HARD dependency violated → abort.** Disabling a service that an enabled service hard-depends on
+  (e.g. `SERVICE_DISABLE=gluetun` while any *arr is enabled) errors out before any compose action.
+- **SOFT dependency gap → warn and proceed** (e.g. `viz` without `logs` — Grafana starts but has no
+  Loki data). See [Dependencies](#dependencies).
+
+Validate a selection offline before deploying:
+
+```bash
+python3 scripts/profiles.py --list                                   # full catalog
+python3 scripts/profiles.py --check --profiles "observability,media" # dependency doctor (exits ≠0 on HARD violation)
+```
+
+---
+
+## Resource requirements
+
+All figures are **approximate** per-service `mem_limit` ceilings at the shipped (`HIGH`) preset;
+smaller tiers have optional lower preset blocks you uncomment in `.env`. The full stack's memory
+ceiling is **~46 GB**; `core` alone is **~15 GB**.
+
+### Per tier
+
+| Tier | Host RAM | Practical ceiling | Typical `STACK_PROFILES` |
+|------|----------|-------------------|--------------------------|
+| `MICRO` | 8 GB | ~6 GB (core, `LOW` preset + trim) | *(none — core only)* |
+| `LOW` | 16 GB | ~12 GB | `observability,home,notify` |
+| `MED` | 32 GB | ~28 GB | `observability,security,home,notify,automation,files,tasks,recipes` |
+| `HIGH` | 64 GB | ~45 GB | most profiles, light media |
+| `MAX` | 128 GB+ | ~46 GB + headroom | all profiles / bundles |
+
+> `MICRO` runs `core` only — uncomment the `LOW` preset block and trim `STACK_PROFILES` toward
+> core so the baseline fits a small host with swap headroom. Add observability/productivity only
+> as RAM allows.
+
+### Per group (RAM ceiling, compose defaults)
+
+CPU is governed by a shared `cpus: ${DEFAULT_CPU_LIMIT:-2}` anchor on every long-running service,
+with explicit 2-vCPU overrides on `caddy` and `postgres`. Plan ~1–2 vCPU per active service group;
+ingress + auth + Postgres are the busiest.
+
+| Profile / bundle | Services | RAM ceiling |
+|------------------|----------|:-----------:|
+| **`core`** *(always on)* | tailscale-ingress, caddy, crowdsec, authentik ×4, postgres, redis, socket-proxy ×2, autoheal, openbao | **~15 GB** |
+| `netmon` | zeek, zeek-logs | ~1.1 GB |
+| `runtime-sec` | falco, falcosidekick, falcosidekick-ui, redis-falco | ~1.1 GB |
+| `tor` | torproxy | ~0.25 GB |
+| **`security`** *(bundle)* | netmon + runtime-sec + tor | **~2.5 GB** |
+| `metrics` | prometheus, alertmanager | ~1.1 GB |
+| `exporters` | cadvisor, node-exporter, postgres-exporter, redis-exporter | ~0.6 GB |
+| `logs` | loki, alloy | ~0.75 GB |
+| `viz` | grafana | ~0.5 GB |
+| **`observability`** *(bundle)* | metrics + exporters + logs + viz | **~3 GB** |
+| `analytics` | clickhouse, vector | ~4.5 GB |
+| `container-mgmt` | komodo (core+mongo+periphery) | ~1.0 GB |
+| `home` | dashy | ~0.25 GB |
+| `automation` | n8n | ~1 GB |
+| `notify` | ntfy | ~0.25 GB |
+| `files` | nextcloud, notify-push | ~2.2 GB |
+| `talk` | spreed-signaling, janus, coturn | ~1 GB |
+| `photos` | immich-server, immich-machine-learning | ~4 GB |
+| `notes` | couchdb | ~0.5 GB |
+| `tasks` | vikunja | ~0.5 GB |
+| `recipes` | tandoor | ~0.5 GB |
+| **`productivity`** *(bundle)* | files + talk + photos + notes + tasks + recipes | **~8.6 GB** |
+| `vpn` | gluetun | ~0.25 GB |
+| `downloads` | qbittorrent | ~1 GB |
+| `indexers` | prowlarr | ~0.5 GB |
+| `movies` / `tv` / `audio` | radarr / sonarr / lidarr | ~0.5 GB each |
+| `stream` | jellyfin | ~4 GB |
+| `requests` | jellyseerr | ~0.5 GB |
+| `captcha` | flaresolverr | ~0.5 GB |
+| **`media`** *(bundle)* | vpn + downloads + indexers + movies + tv + audio + stream + requests + captcha | **~8.25 GB** |
+
+### Storage
+
+There is no single storage number — it depends on what you run and how much data you keep:
+
+- **Baseline:** the OS, Docker, and pulled images (~10–20 GB depending on profiles).
+- **Stateful volumes** under `/dock/`: Postgres, Redis, Authentik, Loki and Prometheus retention,
+  ClickHouse (analytics), Nextcloud, and Immich grow with use — provision generously and monitor.
+- **Media:** `MEDIA_PATH` and `DOWNLOADS_PATH` are operator-mounted (often a separate large disk or
+  NAS). Size these to your library, not to the stack.
+
+---
+
+## Dependencies
+
+Resolved centrally in `profiles.toml` and enforced by `run.sh` (fail-closed on HARD, warn on SOFT).
+Ordered roughly universal → niche.
+
+### HARD (target cannot start without the dependency)
+
+| If you enable… | You must also have… | Why |
+|----------------|---------------------|-----|
+| `viz` (grafana) | `metrics` (prometheus) | `depends_on` — Grafana's required datasource |
+| `talk` (spreed-signaling) | `files` (nextcloud) | signaling server `depends_on` nextcloud |
+| `requests` (jellyseerr) | `stream` (jellyfin) | jellyseerr `depends_on` jellyfin (healthy) |
+| `downloads` (qbittorrent) | `vpn` (gluetun) | `network_mode: service:gluetun` |
+| `indexers` (prowlarr) | `vpn` (gluetun) | `network_mode: service:gluetun` |
+| `movies` (radarr) | `vpn` (gluetun) | `network_mode: service:gluetun` |
+| `tv` (sonarr) | `vpn` (gluetun) | `network_mode: service:gluetun` |
+| `captcha` (flaresolverr) | `vpn` (gluetun) | `network_mode: service:gluetun` |
+
+> `lidarr` (`audio`) also routes through `gluetun` at the service level — it carries the same HARD
+> edge even though `audio` is not listed as a profile-level `hard_dep`. The resolver knows this from
+> the service-level dependency map.
+
+### SOFT (starts, but degraded or no data)
+
+| If you enable… | Consider also… | Otherwise |
+|----------------|----------------|-----------|
+| `viz` (grafana) | `logs` (loki) | Grafana has no Loki datasource data |
+| `exporters` | `metrics` (prometheus) | nothing scrapes the exporters |
+| `metrics` (alertmanager) | `notify` (ntfy) | Alertmanager can't deliver to ntfy |
+| `requests` (jellyseerr) | `movies`, `tv` | jellyseerr has no *arr to drive |
+| `indexers` (prowlarr) | `captcha` (flaresolverr) | some indexers can't solve Cloudflare challenges |
+
+---
+
+## Architecture
 
 ### Network topology
 
@@ -27,7 +397,6 @@ flowchart TB
             CADDY[caddy<br/>shares netns]
             CS1[crowdsec alias<br/>192.0.2.10]
             AUTH_P[authentik-proxy<br/>.22]
-            AUTH_S_ING[authentik-server<br/>.50]
         end
         subgraph auth_int["auth-internal 192.0.2.10/24"]
             AUTH_S[authentik-server<br/>.20]
@@ -36,64 +405,61 @@ flowchart TB
         subgraph data["data 192.0.2.10/24"]
             PG[postgres<br/>.30]
             RD[redis<br/>.31]
-            TS_DATA[tailscale-ingress<br/>.200]
         end
         subgraph sec["security 192.0.2.10/24"]
             CS2[crowdsec<br/>.20]
-            SPRO2[socket-proxy-ro<br/>.21]
-            SPRW[socket-proxy-rw<br/>.22]
-            AH[autoheal<br/>.23]
-            FL[falco<br/>.24]
-            WM[wazuh-manager<br/>.30]
-            WI[wazuh-indexer<br/>.31]
-            WD[wazuh-dashboard<br/>.32]
+            BAO[openbao<br/>.41]
+            SPRO[socket-proxy-ro]
+            SPRW[socket-proxy-rw]
+            AH[autoheal]
+            FL[falco<br/>.24 ·runtime-sec]
+            FSK[falcosidekick + ui<br/>·runtime-sec]
+        end
+        subgraph mon["monitoring 192.0.2.10/24"]
+            PROM[prometheus]
+            GRAF[grafana]
+            LOKI[loki]
+            ALLOY[alloy]
         end
         subgraph media["media 192.0.2.10/24"]
-            JF[jellyfin<br/>.21]
-            JS[jellyseerr<br/>.22]
-            GT[gluetun<br/>.30 ProtonVPN WG]
+            JF[jellyfin ·stream]
+            JS[jellyseerr ·requests]
+            GT[gluetun<br/>·vpn ProtonVPN WG]
         end
         subgraph apps["apps 192.0.2.10/24"]
-            NC[nextcloud<br/>.26]
-            NT[ntfy<br/>.20]
-            TD[tandoor<br/>.21]
-            VK[vikunja<br/>.22]
-            AF[affine<br/>.23]
+            NC[nextcloud ·files]
+            NT[ntfy ·notify]
+            CB[couchdb ·notes]
         end
-        subgraph oidcc["oidc-clients 192.0.2.10/24"]
-            AUTH_S_OC[authentik-server<br/>.10]
-        end
-        ZK[zeek<br/>host netns]
-        CT[coturn<br/>host netns]
+        ZK[zeek<br/>host netns ·netmon]
+        CT[coturn<br/>host netns ·talk]
     end
     CF --> TS
     TN --> TS
     TS --- CADDY
-    CADDY --> AUTH_P & WD & NC & JF & JS
-    CADDY --> NT & TD & VK & AF
-    CADDY --> GT
+    CADDY --> AUTH_P & NC & JF & JS & GRAF
+    CADDY --> NT & CB
     AUTH_P --> AUTH_S
     AUTH_S --> PG & RD
     AUTH_W --> PG & RD
-    AUTH_P --> RD
+    AUTH_S --> BAO
     NC --> PG & RD
-    NC --> AUTH_S_OC
-    TD --> PG & RD
-    TD --> AUTH_S_OC
-    VK --> PG & RD
-    VK --> AUTH_S_OC
     AF --> PG & RD
-    AF --> AUTH_S_OC
-    JF --> AUTH_S_OC
-    CADDY --> RD
     CADDY --> CS1
     CS1 -.same process.- CS2
-    FL -.docker API.-> SPRO2
+    FL --> FSK
+    FL -.docker API.-> SPRO
     AH --> SPRW
+    ALLOY -.docker logs.-> LOKI
+    LOKI --> GRAF
+    PROM --> GRAF
     ZK -.taps all networks.-> host
-    CT -.TURN/STUN 3478.-> Internet
     GT -.WireGuard tunnel.-> Internet
 ```
+
+> Services tagged `·<profile>` are opt-in (only present when their profile is selected). `core`
+> services carry no tag. Not every container is drawn — see the [Service catalog](#service-catalog)
+> for the full list.
 
 ### Request flow (public)
 
@@ -104,7 +470,7 @@ sequenceDiagram
     participant CF as Cloudflare edge
     participant UFW as Host UFW
     participant CAD as Caddy
-    participant CS as Crowdsec
+    participant CS as CrowdSec
     participant CRZ as Coraza WAF
     participant AK as Authentik
     participant APP as Target app
@@ -114,7 +480,7 @@ sequenceDiagram
     CAD->>CAD: CF allowlist check
     CAD->>CS: bouncer: is this IP banned?
     CS-->>CAD: allowed
-    CAD->>CRZ: WAF inspection (CRS rules)
+    CAD->>CRZ: WAF inspection (OWASP CRS)
     CRZ-->>CAD: anomaly score under threshold
     CAD->>AK: forward-auth: session valid?
     AK-->>CAD: 200 + headers
@@ -123,114 +489,89 @@ sequenceDiagram
     CAD-->>C: HTTPS response
 ```
 
-> **OIDC exception:** Nextcloud, Vikunja, and AFFiNE skip step 8. Caddy proxies the
-> request directly to the app; if the user has no session the app itself redirects to
-> Authentik (`example.com`) for OIDC login, then back to the original URL.
+> **OIDC exception:** Nextcloud, Tandoor, and Vikunja skip the forward-auth step. Caddy
+> proxies straight to the app; with no session the app itself redirects to Authentik
+> (`example.com`) for OIDC login, then back to the original URL.
 
 ### Authentik integration modes
 
-Each service uses one of two auth models. `set-auth.py oidc` provisions **all** OIDC services automatically; the chart notes where a manual step is still needed after the script runs.
+Each service uses one of two auth models. `set-auth.py oidc` provisions **all** OIDC services
+automatically.
 
 ```mermaid
 flowchart TD
     subgraph optional["Optional · set-auth.py entra-*"]
-        direction TB
-        EntraID["Microsoft Entra ID<br/>(exclusive upstream IdP)"]
+        EntraID["Microsoft Entra ID<br/>(upstream IdP)"]
     end
-
     subgraph auth["Authentik (set-auth.py oidc)"]
-        direction TB
         A["Authentik"]
     end
-
     subgraph forward-auth["Forward-auth (Caddy)"]
-        Wazuh["Wazuh"]
+        FA["Dashy · falcosidekick-ui · *arr<br/>· qBittorrent · …"]
     end
-
     subgraph native-oidc["Native OIDC"]
         NC["Nextcloud ✓"]
         TD["Tandoor ✓"]
         VK["Vikunja ✓"]
         JF["Jellyfin ⚙"]
         IM["Immich ⚙"]
-        AF["AFFiNE ⚙"]
     end
-
-    EntraID -. "entra-id source<br/>(OIDC federation)" .-> A
-    A --> Wazuh
-    A --> NC & TD & VK & JF & IM & AF
+    EntraID -. "entra-id source (OIDC federation)" .-> A
+    A --> FA
+    A --> NC & TD & VK & JF & IM
 ```
 
-> **Legend:**  `✓` = `set-auth.py oidc` completes configuration end-to-end.  `⚙` = script provisions the Authentik provider/app and writes credentials to `.env`; one in-app step remains.
+> **Legend:** `✓` = `set-auth.py oidc` completes configuration end-to-end. `⚙` = the script
+> provisions the Authentik provider/app and writes credentials to `.env`; one in-app step remains.
+
+### Logging & telemetry pipeline
+
+Two independent paths — operational logs to Loki/Grafana, high-volume HTTP/WAF events to
+ClickHouse — plus runtime security alerts from Falco.
+
+```mermaid
+flowchart LR
+    subgraph sources["log sources"]
+        ANY[all containers<br/>stdout/stderr]
+        CAD[caddy access.log + Coraza audit.log]
+        FL[falco events]
+        ZK[zeek conn/dns/ssl/notice]
+        CSL[crowdsec decisions]
+    end
+    ANY --> ALLOY[alloy<br/>·logs]
+    ALLOY --> LOKI[loki ·logs]
+    LOKI --> GRAF[grafana ·viz]
+    PROM[prometheus ·metrics] --> GRAF
+    CAD --> VEC[vector ·analytics]
+    VEC --> CH[clickhouse ·analytics]
+    FL --> FSK[falcosidekick] --> FUI[falcosidekick-ui ·runtime-sec]
+    FSK -.alerts.-> NTFY[ntfy ·notify]
+    CSL -.bans.-> CAD2[caddy bouncer]
+    ZK -.JSON logs.-> ZKL[zeek-logs UI ·netmon]
+    GRAF -.dashboards.-> OPS[operator]
+    CH -.SQL.-> OPS
+```
+
+> Alloy and Loki ship with the `logs` profile; Grafana with `viz`; Prometheus with `metrics`;
+> ClickHouse + Vector with `analytics`; Falco's pipeline with `runtime-sec`; Zeek with `netmon`.
+> CrowdSec is `core` (Caddy's bouncer hard-depends on it).
 
 ### Bootstrap order
 
 ```mermaid
 flowchart LR
-    subgraph init["Bootstrap (docker compose up --build)"]
+    subgraph init["Bootstrap (run.sh → docker compose up)"]
         TS[tailscale-ingress] --> CAD
+        BAO[openbao] --> AKM
         PG[postgres + initdb hook<br/>provisions app DBs] --> AKM
         RD[redis] --> AKM
         AKM[authentik-migration] --> AKS
         AKS[authentik-server] --> AKW[authentik-worker]
         AKS --> CAD[caddy]
-        WI[wazuh-indexer] --> WM[wazuh-manager]
-        WM --> WDB[wazuh-dashboard]
         SPR[socket-proxy-rw] --> AH[autoheal]
         CSC[crowdsec] --> CAD
     end
 ```
-
-### Logging pipeline
-
-```mermaid
-flowchart LR
-    CAD[caddy<br/>access.log JSON] --> WA
-    CS[crowdsec<br/>decisions.log JSONL] --> WA
-    FL[falco<br/>events.log JSON] --> WA
-    ZK[zeek<br/>conn/dns/ssl/notice .log JSON] --> WA
-    WA[Wazuh Agent<br/>host-level, file tail] --> WM[wazuh-manager]
-    WM --> WI[wazuh-indexer]
-    WI --> WD[wazuh-dashboard<br/>UI @ example.com]
-```
-
----
-
-## Host directory layout
-
-```
-/dock/
-├── conf/                    # configuration (RO in most containers)
-│   ├── caddy/{Caddyfile, snippets/, coraza/, data/, logs/, souin/}
-│   ├── crowdsec/{config.yaml, acquis.yaml, profiles.yaml, notifications/, db/}
-│   ├── authentik/{media/, custom-templates/, certs/}
-│   ├── wazuh/{manager/, indexer/, dashboard/, certs/, decoders/, rules/}
-│   ├── falco/{falco.yaml, rules.d/, events.log}
-│   ├── zeek/{local.zeek, node.cfg, networks.cfg, intel/, logs/current/}
-│   ├── jellyfin/            # (profile: media)
-│   ├── jellyseerr/          # (profile: media)
-│   ├── qbittorrent/qBittorrent/qBittorrent.conf   # pre-seeds LocalHostAuth=false
-│   └── ntfy/                # (profile: apps)
-├── data/                    # application data (non-DB)
-│   ├── authentik/
-│   ├── nextcloud/               # owned 33:33 (www-data inside container)
-│   ├── wazuh/{indexer/, manager/}
-│   ├── jellyfin/            # (profile: media)
-│   ├── ntfy/{cache/, data/} # (profile: apps)
-│   ├── tandoor/{media/, static/}  # owned 1000:1000 (profile: apps)
-│   ├── vikunja/             # owned 1000:1000 (profile: apps)
-│   └── affine/{config/, storage/}   # (profile: apps)
-├── db/                      # databases
-│   ├── postgres/{data/, init.d/}
-│   └── redis/
-├── tail/
-│   └── ingress/
-└── backups/
-    ├── postgres/            # maintain.py backup output
-    └── redis/
-```
-
-All paths owned `svc-user:media (1010:1010)`, mode `770` (DB dirs `700`).
 
 ---
 
@@ -238,798 +579,607 @@ All paths owned `svc-user:media (1010:1010)`, mode `770` (DB dirs `700`).
 
 ### Ingress path
 
+```text
+Internet → Cloudflare → [origin lock: AOP mTLS / CF-CIDR — see Origin lockdown] → Caddy (via Tailscale netns)
+       → @cloudflare matcher → CrowdSec bouncer → Coraza WAF
+       → Authentik forward-auth → App container          (Dashy, *arr, qBittorrent, …)
+       → App container (native OIDC redirect to Authentik)  (Nextcloud, Tandoor, Vikunja)
+Parallel observation: Falco (runtime, ·runtime-sec) + Zeek (network, ·netmon)
 ```
-Internet → Cloudflare → Host UFW → Caddy (via Tailscale netns)
-       → @cloudflare matcher → Crowdsec bouncer → Coraza WAF
-       → Authentik forward-auth → App container          (Wazuh, *arr, qBittorrent, …)
-       → App container (native OIDC redirect to Authentik)  (Nextcloud, Tandoor, Vikunja, AFFiNE)
-Parallel observation: Falco (runtime) + Zeek (network)
+
+### Origin lockdown — Cloudflare-only ingress + origin mTLS (ADR-0020)
+
+ADR-0020 specifies three stacked layers intended to make the Cloudflare edge the *only* path to the
+public origin. **Each is annotated with its status. L3 auto-applies on deploy; L1 (the real control)
+is an explicit post-deploy operator step (the runbook below); L2 is disabled pending redesign — so
+until L1 is activated the origin IP is still reachable directly.** Impact is bounded: Caddy still
+terminates TLS and Authentik still forward-auths protected apps even on a direct hit, so this is
+**not** open data access — the real exposure is Cloudflare WAF/rate-limit/bot-management bypass,
+direct origin DDoS, and any non-forward-auth route. See **[Minimizing forwarded-port
+exposure](#minimizing-forwarded-port-exposure)** for the remediation path.
+
+1. **Authenticated Origin Pulls (AOP, zone-level mTLS)** — Cloudflare's edge presents
+   *our* client certificate; Caddy `client_auth` verifies it against our CA. Zone-level
+   (own CA) defeats the orange-cloud bypass. Zero end-user device impact. **This is the real
+   origin authentication.** *Status: **staged off by default** (no-op snippet,
+   `CLOUDFLARE_MTLS_MODE=request`) — activate via Provisioning AOP, below.*
+2. **Caddy `remote_ip` allowlist** — only Cloudflare's published CIDRs (+ optional
+   `EXTRA_ALLOWED_IP`) may reach the public site blocks. *Status: **disabled** after a boot-crash
+   (PR #63); the `remote_ip` redesign is an open follow-up. Coarse regardless — CF CIDRs are shared
+   across all CF tenants.*
+3. **Kernel CF-CIDR allowlist** — 80/443 open only from Cloudflare CIDRs (weekly refresh).
+   Implemented in the **`DOCKER-USER`** chain (`FORWARD`): Docker publishes 80/443 via
+   `DNAT`/`FORWARD`, bypassing the ufw `INPUT` chain where `ufw allow` rules live, so the lock is
+   programmed where the DNAT'd traffic actually flows. Auto-applied by `harden_ufw` on every deploy.
+   *Status: **applies automatically on deploy** — see [Activating the L3 DOCKER-USER
+   lock](#activating-the-l3-docker-user-lock-kernel-cf-cidr-pre-filter). A coarse pre-filter (CF
+   CIDRs are shared across all CF tenants), not auth — L1 is the control.*
+
+#### Provisioning AOP
+
+AOP is provisioned with the vendored, project-agnostic **`scripts/cf-origin-pull.py`**
+(canonical home: the private `cloudflare-toolkit`; vendored here so the deploy — and the
+public OpeNirvana mirror — is self-contained, per toolkit ADR-0001). During a live deploy
+it reads the token straight from `.env` — no keyring needed on the host.
+
+AOP is **deliberately not auto-enabled** by `run.sh`/host-config — it is a lockout-capable,
+externally-visible Cloudflare mutation, so it is an explicit post-deploy operator step with a
+staged `request → require_and_verify` rollout. Run these on the host, in order. **Recovery is
+always available** throughout: `:22`, Tailscale, and the Tailnet (`*.TAILNET_FQDN`) site blocks are
+never gated by AOP, and the host is vCenter-snapshot-capable — a mistaken flip is reverted in
+seconds (Step 7).
+
+**Prerequisite:** the AOP token is in `.env` — `CLOUDFLARE_ORIGIN_TLS_RW_TOKEN` (or the
+`CLOUDFLARE_API_TOKEN` fallback) carrying `Zone:Read` + `SSL and Certificates:Edit`. See the token
+sections below.
+
+**Step 1 — Generate a self-signed origin-pull client cert and place it where provision reads it**
+(root-owned, 0600). One self-signed leaf is sufficient: Caddy trusts that exact cert as its own
+anchor. *(A separate CA is optional — only if you want to rotate client certs without re-touching
+Caddy; place its `ca.pem` in the same dir and it becomes the trust anchor instead. The anchor is
+read from `/dock/conf/cloudflare/origin-pull/` — `ca.pem` if present, else `client.pem` — NOT from
+`templates/`.)*
+
+```bash
+sudo install -d -m 700 /dock/conf/cloudflare/origin-pull
+tmp=$(mktemp -d); cd "$tmp"
+openssl genrsa -out client.key 2048
+openssl req -x509 -new -nodes -key client.key -sha256 -days 1825 \
+    -subj "/CN=$PUBLIC_FQDN origin pull" -out client.pem
+sudo install -m 600 client.key client.pem /dock/conf/cloudflare/origin-pull/
+cd /; rm -rf "$tmp"
 ```
+
+**Step 2 — Provision:** upload the cert to the zone, enable zone-level AOP, render the Caddy
+`(cf-origin-mtls)` snippet active. `provision_origin_pull` reads the token from `.env`
+(fall-through `CLOUDFLARE_ORIGIN_TLS_RW_TOKEN → CLOUDFLARE_API_TOKEN`) and, on success, calls
+`render_cf_origin_mtls` (installs the trust anchor into the snippets dir, recreates Caddy). The
+snippet stays in `request` mode (compose default) — **no enforcement yet, zero ingress risk.**
+
+```bash
+cd ~/openirvana/unified-stack
+sudo bash scripts/docker-host-config.sh provision_origin_pull
+```
+
+A `403` means the token lacks `SSL and Certificates:Edit` — fix the token (sections below) and
+re-run; the cert files persist, so a re-run completes the whole chain.
+
+**Step 3 — Confirm AOP is enabled at Cloudflare** (read-only probe — `aop_enabled:true` + a
+non-empty `cert_ids` proves the upload + enable worked):
+
+```bash
+python3 scripts/cf-origin-pull.py --store env --env-path .env --fqdn "$PUBLIC_FQDN" --status
+```
+
+**Step 4 — Empirically verify Cloudflare presents OUR cert — the gate that makes the flip safe.**
+`aop_enabled:true` is necessary but **not** sufficient: it does not prove the cert CF presents
+matches Caddy's trust anchor, and `request` mode requests-but-skips-verification so a working
+`curl` does not prove it either. Confirm the actual handshake before flipping. The active snippet
+in `request` mode lets Caddy log the presented client-cert subject — drive a request through CF and
+read it back:
+
+```bash
+curl -sS -o /dev/null https://<any-public-host>.$PUBLIC_FQDN/
+docker logs caddy --since 30s 2>&1 | grep -i "client.*subject" | tail -3
+```
+
+You must see the subject `CN = $PUBLIC_FQDN origin pull` (the Step-1 cert). No client subject, or a
+different one → **do not flip** (CF is not presenting our cert — AOP not applied to this hostname,
+or a cert mismatch); resolve first. *(If Caddy does not surface the subject, temporarily add a
+`log` directive with a `{http.request.tls.client.subject}` field to one public site block,
+`docker compose up -d caddy`, re-curl, then revert.)*
+
+**Step 5 — Flip to enforcement.** Set `CLOUDFLARE_MTLS_MODE=require_and_verify` in `.env` and **recreate**
+Caddy. Use `compose up -d`, **not** `docker restart` — a restart keeps the old container env, so
+the mode would silently stay `request` (a false "I flipped it").
+
+```bash
+grep -q '^CLOUDFLARE_MTLS_MODE=' .env \
+    && sed -i 's/^CLOUDFLARE_MTLS_MODE=.*/CLOUDFLARE_MTLS_MODE=require_and_verify/' .env \
+    || printf '\nCLOUDFLARE_MTLS_MODE=require_and_verify\n' >> .env
+docker compose up -d caddy
+```
+
+**Step 6 — Verify enforcement end-to-end.** Ingress through Cloudflare still works; a direct
+non-CF hit to the origin IP is now rejected at the TLS layer:
+
+```bash
+curl -sI https://<public-host>.$PUBLIC_FQDN/ | head -1                       # via CF → 200/302
+curl -skI --resolve <public-host>.$PUBLIC_FQDN:443:<ORIGIN_IP> \
+    https://<public-host>.$PUBLIC_FQDN/                                      # direct → TLS error
+```
+
+Tailnet (`*.$TAILNET_FQDN`) and SSH are unaffected — they never traverse the AOP'd public blocks.
+
+**Step 7 — Rollback** (if anything breaks): revert the mode and recreate. This fully restores
+ingress regardless of CF-side AOP state, because Caddy stops *requiring* the cert:
+
+```bash
+sed -i 's/^CLOUDFLARE_MTLS_MODE=.*/CLOUDFLARE_MTLS_MODE=request/' .env && docker compose up -d caddy
+```
+
+#### Token: scopes + fall-through
+
+`cf-origin-pull` resolves its token by **fall-through** — a dedicated least-privilege token
+first, then the monolithic one — so either model works:
+
+| `.env` key | Role | Required scope |
+|---|---|---|
+| `CLOUDFLARE_ORIGIN_TLS_RW_TOKEN` *(preferred)* | Dedicated AOP token, distinct from the DNS/ACME token | `Zone · SSL and Certificates · Edit` + `Zone · Zone · Read` |
+| `CLOUDFLARE_API_TOKEN` *(fallback)* | Monolithic token carrying every scope the deploy needs | the above **plus** the ACME `Zone · DNS · Edit` |
+
+Override the order/keys with `--token-key KEY` (repeatable) for any other project.
+
+> **Add the operator key to `.env`** (the harness cannot edit `.env`/`.env.example`):
+> append `CLOUDFLARE_ORIGIN_TLS_RW_TOKEN=""` (leave blank to fall back to `CLOUDFLARE_API_TOKEN`).
+
+#### Token *kind*: user-owned vs account-owned
+
+The scopes above are identical regardless of token *kind*. `cf-origin-pull` works with
+**either** kind — it only sends a bearer token to zone-scoped endpoints and never
+introspects it, so the kind is transparent to the tool. Cloudflare offers two:
+
+| Kind | Created at | Best for | Trade-off |
+|---|---|---|---|
+| **Account-owned** *(recommended)* — secret prefixed `cfat_` | **Manage Account → Account API Tokens** (Superadmin only) | Unattended services — decoupled from any one person; survives offboarding / permission changes | Account context only: cannot call `/user/*` endpoints (irrelevant here — AOP is entirely zone-scoped) |
+| **User-owned** | **My Profile → API Tokens** | A token tied to your own login | Inherits your max permissions; revoked if your user is removed |
+
+**Recommendation — least privilege on both axes:** a **dedicated, account-owned token
+scoped to the single `PUBLIC_FQDN` zone**, carrying *only* `Zone:Read` +
+`SSL and Certificates:Edit`, stored in `CLOUDFLARE_ORIGIN_TLS_RW_TOKEN`. That satisfies the
+RO/RW split (distinct from the DNS/ACME `CLOUDFLARE_API_TOKEN`) and the service-credential
+model (no human identity in the loop).
+
+**Least-friction alternative:** add `SSL and Certificates:Edit` (and `Zone:Read` if
+absent) to the existing `CLOUDFLARE_API_TOKEN`; the fall-through lands on it as the
+fallback. Simpler, but the AOP credential is then neither least-privilege nor RO/RW-split.
+
+Verification is the same `cf-origin-pull … --status` capability probe for either kind.
+
+#### Manual token creation (Cloudflare dashboard)
+
+1. **Start a Custom Token.** Account-owned *(recommended, secret prefixed `cfat_`)*: **Manage
+   Account → Account API Tokens → Create Token**. User-owned (equally valid — identical least
+   privilege, just tied to your login): **My Profile → API Tokens → Create Token**. Either way,
+   choose **Create Custom Token**. Both permissions below are **Zone-category** and available to
+   *both* token kinds — the kind is not the constraint, the permission group + zone scope are.
+2. **Permissions — add exactly these two rows, nothing else:**
+   - **`SSL and Certificates`** · **Edit**  ← authorizes the cert upload + AOP enable
+   - **`Zone`** · **Read**  ← lets the tool resolve the zone ID
+   **Do NOT pick a `DNS …` row** (`DNS`, `DNS Firewall`, `DNS Views`, `Account DNS Settings`) —
+   those are a different group, grant **no** zone visibility and **no** SSL write, and are the
+   common mis-pick. There is no *account*-level AOP permission; `SSL and Certificates` is Zone-scoped.
+3. **Zone Resources — the step that's easy to miss:** **`Include` · `Specific zone` · `example.com`**.
+   This is what makes the zone *visible* to the token. **Without a zone in scope the token lists
+   zero zones and provisioning fails at `resolve_zone_id` ("No Cloudflare zone found") even with the
+   right permissions.** For an account-owned token, its account must be the one that holds the zone.
+4. **Continue → Create → copy the token.** Store it securely on the host (next subsection) — do
+   **not** paste it into a chat/ticket or commit it.
+
+> **Verify capability, don't read the token's scopes.** `cf-origin-pull … --status` is the probe:
+> a clean JSON with a `zone_id` proves resolve + SSL read; the upload's `SSL:Edit` is then exercised
+> by `provision_origin_pull`. Reading a token's own permission groups (`GET /user/tokens/{id}`)
+> needs `User API Tokens Read` — which an AOP-only token must not have, and an account-owned token
+> *structurally* cannot (no user context). Scope intent lives in the `cloudflare-toolkit`
+> (`cf-token-audit.py` `REQUIRED_SCOPES["aop"]`, `docs/aop-origin-pull.md`).
+
+#### Storing the AOP token securely on the host
+
+The token is a **write-capable secret** — it lives only in the host `.env` (read by
+`cf-origin-pull --store env`), never in git, a chat transcript, or a ticket. SSH to the host and set
+it there yourself so the value never leaves the host:
+
+```bash
+ssh -i ~/.ssh/prod-host admin@prod-host
+cd ~/openirvana/unified-stack
+# append the key (or edit the existing line); the value stays on the host:
+printf '\n# AOP origin mTLS (ADR-0020 L1) — Zone:Read + SSL:Edit, example.com only\nCLOUDFLARE_ORIGIN_TLS_RW_TOKEN="cfat_…"\n' >> .env
+# confirm it resolves the zone + has SSL read (clean JSON, no 403):
+python3 scripts/cf-origin-pull.py --store env --env-path .env --fqdn "$PUBLIC_FQDN" --status
+```
+
+Leave `CLOUDFLARE_ORIGIN_TLS_RW_TOKEN` blank to fall back to `CLOUDFLARE_API_TOKEN` (which then needs
+`SSL:Edit` added). If the token ever leaks, **rotate it in the dashboard first**, then update `.env`.
+
+#### Activating the L3 DOCKER-USER lock (kernel CF-CIDR pre-filter)
+
+Layer 3 drops non-Cloudflare traffic to the DNAT-published 80/443 at the kernel, in the
+**`DOCKER-USER`** chain — the ufw `INPUT` allowlist cannot, because Docker-published ports traverse
+`FORWARD`, not `INPUT`. **This is automatic on every deploy:** `harden_ufw` (host-prep) and the
+weekly `refresh_cf_ufw` cron both call `_docker_user_lock_cf_origin`, keyed on the WAN interface so
+it is container-IP-agnostic and never touches Tailnet/inter-container traffic. **No manual step is
+needed for a fresh deploy.** It is a **coarse pre-filter, not authentication** — CF CIDRs are
+shared across all CF tenants; L1 AOP mTLS is the control.
+
+Operator commands (inspection / manual re-apply on a running host):
+
+```bash
+cd ~/openirvana/unified-stack
+# Preview the exact rules without mutating (auto-detects the WAN iface + reads the live CF CIDRs):
+CF_L3_DRYRUN=1 sudo -E bash scripts/docker-host-config.sh lock_cf_origin_forward
+# Apply / re-apply now (idempotent — strips prior cf-origin-l3 rules, re-adds the current set):
+sudo bash scripts/docker-host-config.sh lock_cf_origin_forward
+# Verify the rules are live:
+sudo iptables -L DOCKER-USER -n --line-numbers | grep cf-origin-l3
+```
+
+Verify no legitimate path breaks: `curl -sI https://<public-host>.$PUBLIC_FQDN/` (via CF) still
+succeeds, Tailnet `*.$TAILNET_FQDN` still loads, SSH is unaffected, and janus WebRTC UDP stays
+open. **Fail-open by design:** if the CF CIDR list is empty/missing the `DROP` rules are skipped
+(origin stays reachable) rather than locking out — a pre-filter must never be the layer that severs
+ingress. **Reboot caveat:** Docker recreates `DOCKER-USER` empty on `dockerd` restart; the rules
+re-apply on the next deploy / weekly cron (fail-open until then). IPv6 is skipped (origin is
+IPv4-only); a public AAAA origin would need an `ip6tables` variant (ADR-0020 re-eval trigger).
 
 ### Threat × mitigation matrix
 
 | Threat | Primary mitigation | Backup |
 |---|---|---|
-| Public DDoS | Cloudflare edge | CF allowlist drops non-CF traffic |
-| Credential stuffing | Authentik rate-limit + MFA | Crowdsec auth-brute scenarios |
+| Public DDoS | Cloudflare edge (proxied DNS) | AOP origin mTLS *once activated* — the CF-CIDR allowlist is coarse and currently bypassed (see Origin lockdown) |
+| Credential stuffing | Authentik rate-limit + MFA | CrowdSec auth-brute scenarios |
 | Zero-day web exploit | Coraza OWASP CRS | Egress isolation (data + app layers separate) |
 | Container escape (unknown) | Falco: terminal-shell, write-below-root, unexpected-privileged | Host UFW + kernel hardening |
-| Malicious DNS exfiltration | Zeek dns.log + Intel hits → Wazuh correlation | Crowdsec egress blocklist scenarios |
-| TLS-fingerprint C2 beaconing | Zeek ssl.log JA3/JA4 anomalies | Cloudflare WAF on ingress |
-| Supply-chain (post-install) | Falco: execution from /tmp, unexpected outbound | Image pinning, review updates |
+| Malicious DNS exfiltration | Zeek `dns.log` + Intel hits → Grafana/Loki correlation | CrowdSec egress blocklist scenarios |
+| TLS-fingerprint C2 beaconing | Zeek `ssl.log` JA3/JA4 anomalies | Cloudflare WAF on ingress |
+| Supply-chain (post-install) | Falco: execution from /tmp, unexpected outbound | Image pinning, version-check alerts |
 | Socket-proxy abuse | Falco: unauthorized Docker API; RO/RW proxy split | Proxy permission env vars |
-| Leaked .env in git | .gitignore .env + CI secret scanning | Keys regenerable by docker-host-config.sh |
-| Container escape (generic) | user:1010:1010, read_only, cap_drop ALL, no-new-privileges, seccomp | Falco + host UFW |
-| DB exfiltration | data layer isolation, per-app DB/role, no published ports | Wazuh rule on external :5432 |
-| Lateral movement | Apps never share layers; only Caddy multi-homes | Crowdsec intra-network + Zeek conn.log |
-| Log tampering | Logs bind-mounted to host, Wazuh Agent reads outside Docker | Append-only from host |
-| Silent backup failure | pg-backup.sh level-12 alert; skips pruning on fail | Retention floor = manual delete only |
-| Tailscale key leak | Ephemeral + reusable-disabled keys | Re-issue + bounce sidecar |
-| Authentik outage locks out admins | AUTHENTIK_BOOTSTRAP_TOKEN via API | Direct psql reset procedure |
+| Leaked .env in git | `.gitignore .env` + CI secret scanning | Keys regenerable by `gen-secrets.py` |
+| Container escape (generic) | `user:1010:1010`, `read_only`, `cap_drop: ALL`, `no-new-privileges`, seccomp | Falco + host UFW |
+| DB exfiltration | data-layer isolation, per-app DB/role, no published ports | postgres-exporter + Prometheus alert on external `:5432` |
+| Lateral movement | apps never share layers; only Caddy multi-homes | CrowdSec intra-network + Zeek `conn.log` |
+| Log tampering | container logs shipped to Loki by Alloy; Caddy/Coraza to ClickHouse by Vector | append-only retention; off-host export |
+| Silent backup failure | `maintain.py backup` CRITICAL alert; skips pruning on failure | retention floor = manual delete only |
+| Secret sprawl | OpenBao backend (sealed at rest) | secrets never baked into images |
+| Tailscale key leak | ephemeral + reusable-disabled keys | re-issue + bounce sidecar |
+| Authentik outage locks out admins | `AUTHENTIK_BOOTSTRAP_TOKEN` via API | direct `psql` reset procedure |
 
 ---
 
-## Quickstart
+## Host directory layout
 
-**Prerequisites** (Ubuntu 24.04+, 2+ cores, 8+ GB RAM):
-- Cloudflare account managing your `PUBLIC_FQDN` zone; API token with `Zone:Read` + `DNS:Edit`.
-- Tailscale account with the host already enrolled; authkey from the admin console.
-- Router port-forwards to the host (see [Port Forward](#port-forward) below).
-
-### Port Forward
-
-Forward these ports at your router to prod-host's LAN IP:
-
-| Port(s) | Protocol | Service | Why |
-|---------|----------|---------|-----|
-| 80 | TCP | Caddy | HTTP → HTTPS redirect + ACME HTTP-01 fallback |
-| 443 | TCP + UDP | Caddy | HTTPS (TLS) + HTTP/3 (QUIC) |
-| 3478 | TCP + UDP | coturn | STUN signaling for Nextcloud Talk WebRTC |
-| 5349 | TCP + UDP | coturn | TURN over TLS (STUNS/TURNS) |
-| 49152–49200 | UDP | coturn | TURN relay media range |
-| 20000–20100 | UDP | Janus Gateway | WebRTC media for Nextcloud Talk video |
-
-> **Tailscale** punches its own hole — no port forward needed for Tailnet access.
->
-> **80 / 443** — if your router supports source-IP rules, restrict these to [Cloudflare's IP ranges](https://www.cloudflare.com/ips/). The `@cloudflare` matcher in the Caddyfile already enforces this at the application layer.
->
-> **TURN / WebRTC ports** (3478, 5349, 49152–49200, 20000–20100) must point **directly** at the host — do not proxy them through Cloudflare. Cloudflare does not relay UDP, and these ports require a direct path for WebRTC media. coturn validates callers with time-limited HMAC credentials; no unauthenticated relay is possible.
-
-**Steps:**
-
-1. Clone and run the host bootstrap (creates `/dock/` tree, installs Docker, sets ownership):
-   ```bash
-   git clone <repo-url> ~/git/openirvana
-   sudo ~/git/openirvana/unified-stack/docker-host-config.sh
-   ```
-
-2. Create `.env` from the example and set the two external keys:
-   ```bash
-   cd ~/git/openirvana/unified-stack
-   cp .env.example .env
-   # Edit .env — set TAILSCALE_AUTHKEY and CLOUDFLARE_API_TOKEN.
-   # All other secrets are generated in the next step.
-   # Uncomment the resource-limit tier block that matches your host.
-   ```
-
-3. Generate random secrets (pre-launch pass — Postgres, Redis, Wazuh, Authentik, Nextcloud):
-   ```bash
-   python3 scripts/gen-secrets.py .env
-   ```
-   Two secrets cannot be generated until the stack is running — `CROWDSEC_BOUNCER_API_KEY`
-   (issued by CrowdSec) and `AUTHENTIK_OUTPOST_TOKEN` (issued by Authentik). Both are
-   fetched automatically in step 5.
-
-4. Bring up the stack:
-   ```bash
-   # Core stack only (Authentik, Nextcloud, Wazuh, Caddy, etc.):
-   docker compose up -d
-
-   # All profiles — core + media + productivity apps:
-   # Requires PROTONVPN_WIREGUARD_PRIVATE_KEY in .env for --profile media.
-   docker compose --profile media --profile apps up -d
-   ```
-
-5. Fetch container-issued secrets and restart the affected services:
-   ```bash
-   python3 scripts/gen-secrets.py .env
-   docker compose up -d --no-deps --force-recreate authentik-proxy caddy
-   ```
-   `gen-secrets.py` is idempotent — re-run safely at any time. The second pass queries
-   the running CrowdSec and Authentik containers to fill in the two remaining secrets,
-   then the recreate picks them up. Re-run with `--apply` after any secret rotation to
-   also sync Postgres passwords and re-seed the Wazuh OpenSearch security index.
-
-6. Visit (replace `example.com` with your `PUBLIC_FQDN`):
-   - `https://example.com` — Authentik (first run: set MFA, create users)
-   - `https://example.com` — Wazuh (gated by Authentik forward-auth)
-   - `https://example.com` — Nextcloud (OIDC login via Authentik — see step 6)
-
-**Boot persistence:** `sudo systemctl enable --now compose-stack.service`
-
-7. **Post-deploy SSO configuration** (after Authentik is reachable and users are created):
-
-   **Authentik outpost token** — fetched automatically by `gen-secrets.py` in step 5. If
-   `authentik-proxy` is still restarting after step 5, re-run:
-   ```bash
-   python3 scripts/gen-secrets.py .env
-   docker compose up -d --no-deps --force-recreate authentik-proxy
-   ```
-
-   **OIDC setup** (`scripts/set-auth.py oidc`) — provisions Authentik OAuth2/OIDC providers for Nextcloud, Tandoor, AFFiNE, Jellyfin, Immich, and Vikunja; writes all credentials into `.env`; restarts running containers; and outputs `/dock/conf/oidc-setup-output.txt` with any remaining manual steps.
-
-   **Before running:**
-
-   | Requirement | How to satisfy |
-   |---|---|
-   | Authentik running and healthy | `docker compose up -d` — wait for healthcheck green |
-   | At least one Authentik user created | `example.com` → Admin → Users → Create |
-   | Jellyfin SSO plugin installed | Jellyfin admin → Plugins → Catalog → **SSO Authentication** → Install, then restart Jellyfin |
-   | `JELLYFIN_API_KEY` in `.env` | Jellyfin admin → Dashboard → API Keys → New Key — paste into `.env` |
-   | `IMMICH_API_KEY` in `.env` | Immich → Account Settings → API Keys → New Key — paste into `.env` |
-
-   The last two are optional — the script prompts `[y/N]` and skips auto-config for the affected service if either key is absent. Re-run the script any time after adding missing keys.
-
-   ```bash
-   sudo python3 scripts/set-auth.py oidc
-   ```
-
-   **After running:**
-
-   | Service | Automated? | Remaining manual step |
-   |---|---|---|
-   | Nextcloud | Provider + app provisioned, credentials in `.env` | Install the **OpenID Connect user backend** (`user_oidc`) app in Nextcloud admin → Apps, then run the `occ` command from `oidc-setup-output.txt` |
-   | Tandoor | **Fully automatic** | None — credentials written, container restarted |
-   | Vikunja | **Fully automatic** | None — credentials written, container restarted |
-   | Jellyfin | **Automatic** if `JELLYFIN_API_KEY` was set | If key was missing: install SSO plugin, add key to `.env`, re-run script; or follow the `curl` command in `oidc-setup-output.txt` |
-   | Immich | **Automatic** if `IMMICH_API_KEY` was set | If key was missing: add key to `.env`, re-run script; or follow the `curl` command in `oidc-setup-output.txt` |
-   | AFFiNE | Provider + app provisioned, credentials in `.env` | Paste the JSON block from `oidc-setup-output.txt` into **AFFiNE Admin Panel → Settings → OAuth → OIDC OAuth provider config** |
-
-   The output file contains exact commands and credentials for every manual step and is safe to re-generate at any time.
-
-   > **Harden AFFiNE after deployment:** AFFiNE allows anyone to sign up and access
-   > the demo workspace by default. Once SSO is configured, disable open registration:
-   > **AFFiNE Admin Panel → Settings → Auth → "Whether allow new registrations" → Disable.**
-
-### Step 8 (optional) — Entra ID federation
-
-Gates every service behind a Microsoft Entra ID group. Skip entirely if you want Authentik local accounts only.
-
-**Prerequisites:**
-
-| Requirement | Notes |
-|-------------|-------|
-| `ENTRA_TENANT_ID` in `.env` | Azure portal → Entra ID → Overview → Tenant ID |
-| Microsoft account with **Global Admin** or **Application Administrator** role | Needed during `--setup` only; used interactively via device-code, never stored |
-| `pip install msal` | Only third-party dependency |
-| Authentik running with break-glass local admin account active | Verified automatically by the script |
-
-**Setup:**
-
-```bash
-# Set your tenant ID in .env first:
-# ENTRA_TENANT_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-
-pip install msal
-python3 scripts/set-auth.py entra-setup .env
-# Follow the device-code prompt to sign in with a Global Admin account
+```text
+/dock/
+├── conf/                    # configuration (RO in most containers)
+│   ├── caddy/{Caddyfile, snippets/, coraza/, data/, logs/, souin/}
+│   ├── crowdsec/{config.yaml, acquis.yaml, profiles.yaml, notifications/, db/}
+│   ├── authentik/{media/, custom-templates/, certs/}
+│   ├── openbao/config/
+│   ├── falco/{falco.yaml, rules.d/, events.log}          # profile: runtime-sec
+│   ├── zeek/{local.zeek, node.cfg, networks.cfg, intel/, logs/current/}  # profile: netmon
+│   ├── loki/loki.yml · alloy/config.alloy · grafana/provisioning/    # observability
+│   ├── prometheus/ · alertmanager/                       # observability
+│   ├── clickhouse/init/ · vector/vector.toml             # profile: analytics
+│   ├── nextcloud/ · ntfy/                                # productivity / notify
+│   └── …                                                 # per-service, created on demand
+├── data/                    # application data (non-DB)
+│   ├── authentik/ · openbao/{data,audit}/
+│   ├── nextcloud/           # owned 33:33 (www-data inside container)
+│   ├── loki/ · prometheus/ · grafana/ · clickhouse/
+│   ├── immich/ · couchdb/ · vikunja/ · tandoor/{media,static}/
+│   └── …
+├── db/
+│   ├── postgres/{data/, init.d/}
+│   └── redis/
+├── tail/ingress/
+└── backups/postgres/        # maintain.py backup output
 ```
 
-**After setup:** All services require an Entra account in the configured access group (`openirvana-homies` by default). Local Authentik logins are disabled for end users; the break-glass superuser account remains active via `/if/admin/`.
-
-**Sync group members (run on cron or manually):**
-
-```bash
-python3 scripts/set-auth.py entra-sync .env
-```
-
-**Restore local logins (recovery):**
-
-```bash
-python3 scripts/undo-entra.py .env
-```
-
-**Media stack** (optional — Jellyfin, Jellyseerr, Prowlarr, Radarr, Sonarr, Lidarr, FlareSolverr, qBittorrent via ProtonVPN):
-```bash
-# 1. Add PROTONVPN_WIREGUARD_PRIVATE_KEY to .env (from ProtonVPN dashboard → WireGuard config).
-# 2. Ensure MEDIA_PATH and DOWNLOADS_PATH exist on the host with storage mounted.
-# 3. Add DNS CNAMEs in Cloudflare: media/requests/prowlarr/radarr/sonarr/lidarr/qbit → @ (proxied).
-# 4. Start the media profile:
-sudo docker compose --profile media up -d
-```
-Jellyfin serves media directly (no VPN — accessed by users). All *arr and qBittorrent outbound
-traffic (indexer requests, torrent peers) is tunneled through ProtonVPN. FlareSolverr is
-internal-only; configure it in Prowlarr as `http://localhost:8191`. Jellyfin and Jellyseerr use
-their own auth — no Authentik forward-auth gate (media player API clients need direct access).
-
-**Productivity stack** (optional — ntfy, Tandoor, Vikunja, AFFiNE):
-```bash
-# 1. Verify productivity DB vars are set in .env (gen-secrets.py fills them).
-# 2. Add DNS CNAMEs in Cloudflare: ntfy/recipes/tasks/note → @ (proxied).
-# 3. Start the apps profile:
-sudo docker compose --profile apps up -d
-```
-Tandoor, Vikunja, and AFFiNE use native Authentik OIDC (see step 6 above for setup).
-ntfy uses its own token auth.
-
-> **First-run notes:**
-> - `docker-host-config.sh` creates `/dock/data/nextcloud` owned `33:33`
->   (www-data inside the container). Nextcloud will fail to start if that directory
->   is owned by anyone else. If you skipped the bootstrap script, fix it manually:
->   `sudo chown 33:33 /dock/data/nextcloud`
-> - Nextcloud installs on first request (~60 s). The admin account is set by
->   `NEXTCLOUD_ADMIN_USER` / `NEXTCLOUD_ADMIN_PASSWORD` in `.env`.
-> - **Auth model:** Authentik forward-auth gates services that have no native auth
->   (Wazuh, observability dashboards). Nextcloud, Tandoor, Vikunja, and AFFiNE own
->   their own login page and authenticate users via Authentik OIDC — see step 6 above.
->   Nextcloud app passwords (for desktop/mobile sync) work without going through the
->   OIDC browser flow.
-> - Wazuh requires configuring the API connection inside the dashboard UI on first login.
-> - **Nextcloud Talk / TURN:** After first login, go to
->   `Admin → Talk → TURN servers` (`/settings/admin/talk`) and add:
->   - Scheme: `turn`, Server: `<your-host-IP>:3478`, Secret: value of `COTURN_SECRET` in `.env`, Protocol: `UDP and TCP`.
->   Use the "Test server" button to verify connectivity. The TURN server is required for
->   WebRTC calls where both peers are behind NAT.
+Most paths are owned `svc-user:media (1010:1010)`, mode `770` (DB dirs `700`). A few services
+run as a different UID (e.g. Nextcloud `33:33`, CouchDB `5984:5984`) — see
+[`fix-permissions.sh`](#fix-permissionssh).
 
 ---
 
-## Per-layer service index
+## Service catalog
 
-| Layer | Service | Role |
-|---|---|---|
-| ingress | tailscale-ingress | Tailnet presence |
-| ingress | caddy | TLS, WAF, bouncer, forward-auth |
-| auth | authentik-server | SSO UI + API |
-| auth | authentik-worker | Background jobs |
-| auth | authentik-proxy | Forward-auth outpost (Caddy → Authentik gate) |
-| auth | authentik-migration | One-shot DB migration |
-| data | postgres | Shared Postgres cluster (pgvector) |
-| data | redis | Shared Redis (logical DBs) |
-| observability | crowdsec | Behavioral bans + blocklist |
-| observability | socket-proxy-ro | Read-only Docker API |
-| observability | socket-proxy-rw | R/W Docker API (Autoheal only) |
-| observability | autoheal | Restart unhealthy containers |
-| observability | falco | Runtime container security |
-| observability | wazuh-manager | SIEM event ingest |
-| observability | wazuh-indexer | OpenSearch index |
-| observability | wazuh-dashboard | Web UI |
-| host-net | zeek | Network security monitoring |
-| host-net | coturn | TURN/STUN server for Nextcloud Talk WebRTC |
-| apps | nextcloud | File sync + collaboration |
-| apps | gluetun | ProtonVPN WireGuard gateway *(profile: media)* |
-| apps (via gluetun) | prowlarr | Indexer manager *(profile: media)* |
-| apps (via gluetun) | radarr | Movie management *(profile: media)* |
-| apps (via gluetun) | sonarr | TV show management *(profile: media)* |
-| apps (via gluetun) | lidarr | Music management *(profile: media)* |
-| apps (via gluetun) | flaresolverr | Cloudflare bypass for indexers — internal only *(profile: media)* |
-| apps (via gluetun) | qbittorrent | BitTorrent client *(profile: media)* |
-| apps | jellyfin | Media server — GPU transcoding *(profile: media)* |
-| apps | jellyseerr | Media request management *(profile: media)* |
-| productivity | ntfy | Push notification server *(profile: apps)* |
-| productivity | tandoor | Recipe manager *(profile: apps)* |
-| productivity | vikunja | Task/project management *(profile: apps)* |
-| productivity | affine | Collaborative workspace *(profile: apps)* |
+The authoritative catalog lives in [`scripts/profiles.toml`](scripts/profiles.toml); inspect it
+with `python3 scripts/profiles.py --list`. Services group into seven coarse RBAC categories.
+
+| Category | Profiles | Notable services |
+|----------|----------|------------------|
+| *(infra)* | `core` | tailscale-ingress, caddy, crowdsec, authentik ×4, postgres, redis, socket-proxy ×2, autoheal, openbao |
+| `netsec` | `netmon`, `runtime-sec`*, `tor` | zeek, zeek-logs, torproxy |
+| `edr` | `runtime-sec` | falco, falcosidekick, falcosidekick-ui, redis-falco |
+| `health` | `metrics`, `exporters`, `logs`, `viz`, `analytics` | prometheus, alertmanager, grafana, loki, alloy, clickhouse, vector, cadvisor, node/postgres/redis exporters |
+| `admin` | `container-mgmt`, `home`, `automation` | komodo, dashy, n8n |
+| `notifications` | `notify` | ntfy |
+| `life` | `files`, `talk`, `photos`, `notes`, `tasks`, `recipes` | nextcloud, notify-push, spreed-signaling, janus, coturn, immich ×2, couchdb, vikunja, tandoor |
+| `media` | `vpn`, `downloads`, `indexers`, `movies`, `tv`, `audio`, `stream`, `requests`, `captcha` | gluetun, qbittorrent, prowlarr, radarr, sonarr, lidarr, jellyfin, jellyseerr, flaresolverr |
+
+> \* RBAC categories are coarse and may differ from a service's deployment profile. `crowdsec`
+> deploys with `core` but its UI is governed by the `netsec` category; `openbao` deploys with `core`
+> but its control surface is `admin`. These overrides live in `profiles.toml` `[overrides]`, exposed
+> by `profiles.py:rbac_category()`.
+
+The *arr stack (`prowlarr`, `radarr`, `sonarr`, `lidarr`), `flaresolverr`, and `qbittorrent` all run
+inside the `gluetun` (`vpn`) network namespace — their outbound traffic is tunneled through
+ProtonVPN. Jellyfin serves media directly (no VPN); Jellyfin and Jellyseerr use their own auth, not
+the forward-auth gate.
 
 ---
 
 ## Scripts reference
 
-All scripts live in `unified-stack/scripts/`. Run them from the `unified-stack/` directory unless noted otherwise.
+All scripts live in `unified-stack/scripts/`. Run them from `unified-stack/` unless noted.
 
-| Script | Purpose | When to run | Idempotent | Root/sudo |
-|--------|---------|-------------|:----------:|:---------:|
-| `gen-secrets.py` | Fill blank secrets in `.env`; fetch container-issued keys on second pass | (1) Before `compose up`; (2) after stack is running; (3) after any secret rotation | Yes | No |
-| `set-auth.py oidc` | Provision Authentik OIDC providers for all apps; write credentials to `.env`; optionally create paired Entra/Authentik security groups and sync membership (`--sync`) | After Authentik is healthy and users exist; re-run to add missing services | Yes | No |
-| `set-auth.py entra-*` | Federate Authentik with Microsoft Entra ID; gate all logins on an Entra group | `--setup` once to enable; `--sync` on cron for membership updates | Yes | No |
-| `undo-entra.py` | Disable Entra ID federation; restore local password login | Entra lockout recovery or to roll back federation | Yes | No |
-| `maintain.py` | Postgres backup, Zeek intel refresh, and Wazuh agent sync — unified daily maintenance | Nightly via cron; individually as needed | Yes | Docker socket / **Yes** (wazuh) |
-| `fix-permissions.sh` | Fix bind-mount ownership for services that run as a non-standard UID with `cap_drop:ALL` | After adding a new service; after an `EACCES` error on a bind-mount path | Yes | **Yes** |
-| `check-stack.py` | Audit every subdomain (Caddyfile, DNS, auth gate, HTTP probe) + container health table | After deploy, after DNS changes, or to diagnose service issues | Yes (read-only) | No |
-
----
+| Script | Purpose | When | Idempotent | Root/sudo |
+|--------|---------|------|:----------:|:---------:|
+| `gen-secrets.py` | Fill blank secrets in `.env`; fetch container-issued keys on the second pass | (1) before launch; (2) after the stack is up; (3) after any rotation | Yes | No |
+| `set-auth.py` | Unified auth driver — `authentik`, `oidc`, `nextcloud-oidc`, `entra-setup`, `entra-nesting`, `entra-sync`, `entra-report`, `entra-policies`, `all` | After Authentik is healthy and users exist | Yes | No |
+| `undo-entra.py` | Disable Entra federation; restore local password login | Entra lockout recovery / rollback | Yes | No |
+| `maintain.py` | Unified daily maintenance with subcommands (see below) | Nightly via cron; subcommands as needed | Yes | Docker socket (some need root) |
+| `fix-permissions.sh` | Fix bind-mount ownership for non-standard-UID `cap_drop: ALL` services | After adding a service, or on an `EACCES` bind-mount error | Yes | **Yes** |
+| `check-stack.py` | Audit every subdomain (Caddyfile, DNS, auth gate, HTTP probe) + container-health table | After deploy / DNS changes / to diagnose | Yes (read-only) | No |
+| `profiles.py` | Loader for `profiles.toml`; `--list`, `--check`, dependency resolver | Validate a deployment selection offline | Yes (read-only) | No |
 
 ### `gen-secrets.py`
 
-**Why:** Blank secrets cause containers to reject startup or use insecure defaults. This script is the safe, idempotent alternative to setting secrets by hand — it never overwrites a value that is already populated.
+Blank secrets cause containers to reject startup or fall back to insecure defaults. This is the
+idempotent alternative to hand-setting secrets — it **never overwrites a populated value**.
 
-**Two-pass workflow:**
-
-**Pass 1 — before `docker compose up`:** Generates random values for every blank secret: Postgres superuser and per-app DB passwords, Redis auth token, Wazuh API and indexer passwords, Authentik bootstrap token and secret key, Nextcloud admin password, coturn HMAC secret, and more.
-
-**Pass 2 — after the stack is running:** Queries the running CrowdSec container for a bouncer API key (`CROWDSEC_BOUNCER_API_KEY`) and the Authentik container for the embedded outpost token (`AUTHENTIK_OUTPOST_TOKEN`). Both are required by Caddy and `authentik-proxy` respectively and cannot be generated until their issuing containers are healthy.
+- **Pass 1 (before launch):** random values for every blank secret — Postgres superuser + per-app DB
+  passwords, Redis token, Authentik bootstrap token + secret key, Nextcloud admin password, OpenBao
+  keys, coturn HMAC secret, and more.
+- **Pass 2 (after the stack is up):** queries the running CrowdSec container for
+  `CROWDSEC_BOUNCER_API_KEY` and Authentik for `AUTHENTIK_OUTPOST_TOKEN` — neither can exist until
+  their issuing container is healthy.
 
 ```bash
-# Pass 1 — fill random secrets before first launch
-python3 scripts/gen-secrets.py .env
-
-# Pass 2 — fetch container-issued secrets; restart affected services
-python3 scripts/gen-secrets.py .env
+python3 scripts/gen-secrets.py .env                       # pass 1 and pass 2 (idempotent)
 docker compose up -d --no-deps --force-recreate authentik-proxy caddy
-
-# After any secret rotation — also syncs Postgres passwords and reseeds Wazuh index
-python3 scripts/gen-secrets.py .env --apply
-
-# Set a single key if currently empty (used internally by docker-host-config.sh)
-python3 scripts/gen-secrets.py .env --set HOST_PUBLIC_IP=1.2.3.4
+python3 scripts/gen-secrets.py .env --apply               # after rotation — also syncs Postgres pwds
+python3 scripts/gen-secrets.py .env --set HOST_PUBLIC_IP=1.2.3.4   # set one key if currently empty
 ```
-
-Idempotent: any variable that is already non-empty is printed as `skip` and left unchanged.
-
----
 
 ### `set-auth.py oidc`
 
-**Why:** Each OIDC-capable app requires a registered OAuth2 provider in Authentik (with a generated client ID and secret) *and* the credentials written into the app's own config. Doing this manually means eight Authentik API calls per service plus editing `.env` by hand. This script automates all of it end-to-end.
+Each OIDC-capable app needs an OAuth2 provider registered in Authentik (client ID + secret) **and**
+those credentials written into the app's config. This automates all of it.
 
-**What it does:** Creates an Authentik OAuth2/OIDC provider and application for each service, writes the generated credentials into `.env`, restarts any affected running containers, and outputs `oidc-setup-output.txt` containing exact commands for any remaining manual step (Nextcloud `occ`, AFFiNE admin UI JSON, Jellyfin/Immich curl commands).
+It creates an Authentik OAuth2/OIDC provider + application per service, writes credentials into
+`.env`, restarts affected running containers, and emits `oidc-setup-output.txt` with exact commands
+for any remaining manual step (Nextcloud `occ`, Jellyfin/Immich curl).
 
-Services covered: **Nextcloud, Tandoor, Vikunja, AFFiNE, Jellyfin** (requires `JELLYFIN_API_KEY` in `.env`), **Immich** (requires `IMMICH_API_KEY` in `.env`). The script prompts `[y/N]` for Jellyfin and Immich if their API keys are absent and skips auto-config for those services — re-run after adding the keys.
-
-```bash
-# Authentik must be healthy and at least one user must exist
-sudo python3 scripts/set-auth.py oidc
-
-# Also provision Entra + Authentik security groups and bind OIDC access policies
-# (requires OIDC_ENTRA_* vars in .env — see "Entra App Registration" section below)
-python3 scripts/set-auth.py oidc
-
-# Provision + sync Entra group members into Authentik users/groups
-python3 scripts/set-auth.py oidc --sync
-
-# Re-run at any time; services with an existing CLIENT_ID are skipped
-```
-
-Idempotent: any service whose `_CLIENT_ID` variable is already populated is skipped.
-
----
-
-### Entra App Registration for OIDC Group Management
-
-**What this App Registration does**
-
-Creates per-service security groups in Microsoft Entra (Azure AD) and mirrors their membership into Authentik. This is separate from `set-auth.py entra-*`'s `Authentik-Sync` App Registration (which federates *authentication*). This registration is only about *authorisation groups* — it lets you control which users can access which services by managing Entra group membership.
-
-**Pre-requisites**
-
-- `set-auth.py oidc` has already run successfully (Authentik OIDC providers exist).
-- An Azure account with permission to create App Registrations and grant admin consent.
-
-**Step-by-step: create the App Registration**
-
-1. Azure portal → Entra ID → App registrations → New registration
-2. Name: `Authentik-OIDC-Groups` (or any name)
-3. Supported account types: **Single tenant**
-4. Redirect URI: none
-5. After creation, note the **Application (client) ID** and **Directory (tenant) ID**
-6. Certificates & secrets → New client secret → note the **Value** (shown once)
-7. API permissions → Add a permission → Microsoft Graph → **Application permissions** → add:
-
-| Permission | Purpose |
-|---|---|
-| `Group.ReadWrite.All` | Create and read per-service security groups |
-| `GroupMember.Read.All` | List group members for `--sync` |
-| `User.Read.All` | Resolve member UPN/email for Authentik user lookup |
-
-8. Grant admin consent for your organisation.
-
-**`.env` configuration**
-
-```
-OIDC_ENTRA_TENANT_ID=<Directory (tenant) ID>
-OIDC_ENTRA_CLIENT_ID=<Application (client) ID>
-OIDC_ENTRA_CLIENT_SECRET=<client secret value>
-
-# Optional — change group naming prefixes (defaults shown)
-ENTRA_GROUP_PREFIX=authentik
-AUTHENTIK_GROUP_PREFIX=entra
-```
-
-**Running**
+Services covered: **Nextcloud, Tandoor, Vikunja, Jellyfin** (needs `JELLYFIN_API_KEY`),
+**Immich** (needs `IMMICH_API_KEY`). For Jellyfin/Immich, the script prompts `[y/N]` and skips
+auto-config if the API key is absent — re-run after adding it.
 
 ```bash
-# Provision OIDC providers and create/bind groups (no member sync)
-python3 scripts/set-auth.py oidc
-
-# Provision + sync Entra group members into Authentik users/groups
-python3 scripts/set-auth.py oidc --sync
+sudo python3 scripts/set-auth.py oidc        # Authentik must be healthy + ≥1 user
+python3 scripts/set-auth.py oidc --sync       # also sync Entra group members into Authentik
 ```
 
-Without `--sync`, only group creation and policy binding run. With `--sync`, provisioning runs first then member sync follows. Add `--sync` to the daily cron in `docker-host-config.sh` to keep group membership current.
+Idempotent: any service whose `_CLIENT_ID` is already set is skipped.
 
----
-
-### `set-auth.py entra-*`
-
-**Why:** Centralises identity management in Microsoft Entra ID so that user provisioning and deprovisioning are managed once in your Microsoft tenant. All stack services automatically enforce Entra group membership through Authentik, with zero per-app changes.
-
-**What `--setup` does:**
-1. Opens a device-code browser session — always required so the script can read and patch the App Registration (Application.* Graph permissions are not available to client credentials)
-2. Creates or finds the App Registration and reconciles redirect URIs
-3. Generates a client secret and writes it to `.env` (first run only; existing secret is preserved on re-run)
-4. Creates per-service Entra security groups and Authentik groups with access policy bindings
-5. Creates an Authentik OIDC source pointing at the Entra tenant with the correct authentication and enrollment flows
-6. Creates an expression policy that gates all logins on Entra group membership
-7. Enforces Entra-only login (removes local password form; preserves break-glass admin at `/if/admin/`)
-8. Verifies a break-glass superuser account exists in Authentik before enforcing (prevents self-lockout)
-
-**What `--sync` does:** Reads transitive group members from Entra and upserts matching Authentik users (create, update, or deactivate). Uses client credentials — no browser required.
-
-**Required App Registration permissions** (Application type, admin consent required):
-
-| Permission | Used by | Purpose |
+| Service | Automated? | Remaining manual step |
 |---|---|---|
-| `Application.Read.All` | `--setup` | Look up App Registration by appId to check redirect URIs |
-| `Application.ReadWrite.OwnedBy` | `--setup` | Patch missing redirect URIs on re-runs |
-| `Group.ReadWrite.All` | `--setup` | Create and manage per-service Entra security groups |
-| `GroupMember.Read.All` | `--sync` | Read transitive group membership |
-| `User.Read.All` | `--sync` | Read user profiles (email, display name, enabled state) |
+| Nextcloud | Provider + app provisioned, credentials in `.env` | Install the `user_oidc` app in Nextcloud → Apps, then run the `occ` command from `oidc-setup-output.txt` |
+| Tandoor / Vikunja | **Fully automatic** | None |
+| Jellyfin | **Automatic** if `JELLYFIN_API_KEY` set | Install SSO plugin, add key, re-run; or follow the `curl` in the output file |
+| Immich | **Automatic** if `IMMICH_API_KEY` set | Add key, re-run; or follow the `curl` in the output file |
 
-`--setup` automatically grants admin consent for all five during initial setup (phase 1). If consent was granted manually in the portal, re-running `--setup` skips already-granted roles.
+### Entra ID federation
 
-**Application owner:** `Application.ReadWrite.OwnedBy` only allows the service principal to manage App Registrations it *owns*. After initial setup, add the app's service principal as an owner of its own App Registration so this permission is effective:
-
-> Azure Portal → **App registrations** → [your app] → **Owners** → **Add owners** → search the app's display name → select the **service principal** entry → Save.
-
-This is a one-time step. Without it, redirect URI updates during re-runs will return 403 even with the permission granted.
+Centralises identity in Microsoft Entra ID so user provisioning/deprovisioning is managed once in
+your tenant; all services enforce Entra group membership through Authentik. Skip entirely for
+Authentik-local accounts. See `.claude/CLAUDE.md` → *Entra Variable Convention* and *RBAC Model* for
+the read/write app-registration split and nested-group model.
 
 ```bash
-# Prerequisites: set ENTRA_TENANT_ID in .env, then:
-pip install msal
-python3 scripts/set-auth.py entra-setup .env
-# Follow the device-code prompt — sign in with a Global Admin account
-
-# Sync group membership (run on cron):
-python3 scripts/set-auth.py entra-sync .env
-
-# Cron example (daily at 5 AM — run from unified-stack/ to print the entry):
-#   echo "0 5 * * * root cd $(realpath .) && python3 scripts/set-auth.py entra-sync .env"
+# Prereq: set ENTRA_TENANT_ID (+ ENTRA_WRITE_CLIENT_ID/SECRET) in .env. msal is pre-installed.
+python3 scripts/set-auth.py entra-setup       # device-code sign-in with a Global Admin
+python3 scripts/set-auth.py entra-nesting     # build the nested RBAC groups
+python3 scripts/set-auth.py entra-sync        # sync membership (run on cron — no browser)
 ```
 
-Idempotent: existing App Registration, groups, and Authentik source are detected and reused on re-run. `--sync` is always safe to run multiple times.
+`entra-setup` opens a device-code session (Application.* Graph permissions need delegated consent),
+creates/reconciles the app registration, provisions per-service Entra + Authentik groups with policy
+bindings, creates an Authentik OIDC source for the tenant, gates logins on group membership, and
+verifies a break-glass superuser exists before enforcing (prevents self-lockout). `entra-sync` reads
+transitive group members and upserts matching Authentik users (client credentials, no browser).
 
----
-
-### `undo-entra.py`
-
-**Why:** If Entra ID becomes unavailable or misconfigured after running `set-auth.py entra-*`, local Authentik logins are blocked. This script restores the password login form without touching your Entra tenant and without destroying synced user accounts.
-
-**What it does:** Disables the `entra-id` Authentik source (stops Entra-federated logins) and removes the expression policy that was gating logins on group membership. Synced user accounts and the App Registration in Entra are left untouched.
+**Recovery — restore local logins without touching Entra:**
 
 ```bash
 python3 scripts/undo-entra.py .env
 ```
 
-Idempotent: disabling an already-disabled source is a no-op. Re-run `set-auth.py entra-setup` to re-enable federation.
-
-> **Note:** This script only modifies Authentik. To delete the App Registration from Entra itself, remove it manually in the Azure portal.
-
----
-
-### MFA setup (part of `docker-host-config.sh`)
-
-**Why:** SSH password authentication is the most common attack vector on internet-facing Linux hosts. This step enforces key + TOTP two-factor authentication in a single guided interactive session.
-
-**What it does:**
-1. Installs `libpam-google-authenticator`
-2. Runs `google-authenticator` interactively — generates a TOTP secret, displays a QR code to scan in an authenticator app (Authy, Google Authenticator, 1Password, etc.), and writes `~/.google_authenticator`
-3. (Optional) Generates an `ed25519` SSH key for the host user and prints the public key
-4. (Optional) Disables SSH password authentication and configures PAM to require TOTP on every login
-
-MFA setup is called automatically at the end of `docker-host-config.sh`. It is skipped on re-runs if `~/.google_authenticator` already exists (TOTP setup is not idempotent). SSH key generation is also skipped if a key already exists at `~/.ssh/id_ed25519`.
-
-> **IMPORTANT:** Keep your existing SSH session open. Verify key + TOTP login works in a *second* terminal before closing the first. If locked out, use host console or VNC access to restore `/etc/ssh/sshd_config`.
-
----
+Disables the `entra-id` Authentik source and removes the login-gate policy. Synced users and the
+Entra app registration are untouched. Re-run `set-auth.py entra-setup` to re-enable.
 
 ### `maintain.py`
 
-**Why:** Three nightly maintenance tasks — Postgres backup, Zeek intel refresh, and Wazuh agent sync — are unified into a single entry point with subcommands, so cron has one job, logs go to one place, and operators learn one tool.
+A single nightly entry point with many subcommands, so cron has one job and logs go to one place.
 
-**Subcommands:**
-
-| Subcommand | What it does | Requires root |
-|------------|-------------|:-------------:|
-| `backup` | `pg_dumpall` → zstd compress → timestamped dump in `/dock/backups/postgres/`. Prunes dumps older than `POSTGRES_BACKUP_RETENTION_DAYS` (default 14). On failure, emits a CRITICAL JSON event to the CrowdSec decisions log for Wazuh to alert on. | Docker socket |
-| `intel` | Downloads URLhaus, Feodo Tracker, and CrowdStrike domain feeds; converts each to Zeek Intel TSV using Python's `csv` module; atomically replaces the previous file only if download + conversion succeed; calls `zeekctl deploy` to reload the Intel framework. | Docker socket |
-| `wazuh` | Diffs repo decoders/rules against `/var/ossec/etc/` file-by-file; copies changed XML files with `root:wazuh 640` ownership; splices `agent-host.conf` localfile stanzas into `ossec.conf` once; restarts `wazuh-agent` only when something changed. | **Yes** |
-| `all` | Runs `backup → intel → wazuh` in sequence. | Docker socket + **Yes** |
+| Subcommand | What it does | Root |
+|------------|--------------|:----:|
+| `backup` | `pg_dumpall` → zstd → timestamped dump in `/dock/backups/postgres/`; prunes past `POSTGRES_BACKUP_RETENTION_DAYS` (default 14); CRITICAL alert on failure | Docker socket |
+| `intel` | Downloads URLhaus / Feodo / CrowdStrike feeds → Zeek Intel TSV (atomic replace) → `zeekctl deploy` | Docker socket |
+| `prune` | Prunes dangling images / stopped containers / unused volumes | Docker socket |
+| `cloudflare` / `cloudflare-hsts` | Reconcile Cloudflare DNS / set HSTS + edge-cert fields via API | No |
+| `nextcloud` | Nextcloud housekeeping (file-scan, mimetype repair — slow, skipped in `all`) | No |
+| `dashy` | Regenerate the Dashy landing-page config from `.env` subdomains | No |
+| `grafana` | Reconcile Grafana provisioning | No |
+| `manageability` | Audit healthcheck / autoheal / `mem_limit` + routed-backend coverage | No |
+| `versions` | Check images for newer upstream releases; log JSONL for Loki → Grafana | No |
+| `entra-sync` | Sync Entra membership into Authentik (`set-auth entra-* + oidc --sync`) | No |
+| `check-stack` | Probe all services; ntfy alert via n8n if any are unhealthy | No |
+| `all` | Runs `backup → intel → prune → cloudflare-hsts → nextcloud(fast) → dashy → grafana → manageability → versions → entra-sync → check-stack` | mixed |
 
 ```bash
-# Run all maintenance tasks
-sudo python3 scripts/maintain.py all
-
-# Individual subcommands
-sudo python3 scripts/maintain.py backup
-python3 scripts/maintain.py intel
-sudo python3 scripts/maintain.py wazuh
-
-# Cron (nightly at 2 AM — docker-host-config.sh installs this automatically):
-# To install manually, run from unified-stack/ to print the entry:
-#   echo "0 2 * * * root python3 $(realpath scripts/maintain.py) all >> /var/log/maintain.log 2>&1"
+sudo python3 scripts/maintain.py all          # nightly cron target
+python3 scripts/maintain.py versions          # any subcommand standalone
 ```
 
 **Restore a Postgres backup:**
+
 ```bash
 zstd -d /dock/backups/postgres/dump-YYYYMMDD-HHMMSS.sql.zst --stdout \
   | docker exec -i postgres psql -U <POSTGRES_SUPERUSER>
 ```
 
-**Prerequisites for `wazuh`:** Host-level `wazuh-agent` must be installed. Install from [Wazuh's package repository](https://documentation.wazuh.com/current/installation-guide/wazuh-agent/index.html). `/var/ossec/bin/wazuh-control` must exist and be executable.
-
----
-
 ### `fix-permissions.sh`
 
-**Why:** Docker containers that use `cap_drop: ALL` lose the `DAC_OVERRIDE` capability. This means their root user (UID 0) is bound by normal Unix permission checks and cannot access directories it does not own — unlike a full-privilege root that bypasses DAC entirely. Services in this category fail at startup with `EACCES` on their bind-mount paths, even though the container is running as root.
-
-The standard `docker-host-config.sh` creates all `/dock/conf/<svc>` and `/dock/data/<svc>` directories as `svc-user:media` (1010:1010). That works for most containers. Containers that run as UID 0 with `cap_drop: ALL` need their directories owned by `root:root` instead.
-
-**Currently patched services:**
-
-| Service | Container UID | Why exception needed |
-|---------|:---:|---|
-| AFFiNE | 0 (root) | Runs as root with `cap_drop: ALL` — restricted root cannot traverse `1010:1010 770` storage directory |
-
-**What it does:** Applies `svc-user:media` to all standard service directories, then overrides known exceptions to the correct UID:GID for that service.
+Containers using `cap_drop: ALL` lose `DAC_OVERRIDE`, so even their root user is bound by normal
+Unix permission checks and can't traverse a directory it doesn't own — they fail at startup with
+`EACCES` on bind mounts. This script applies `svc-user:media (1010:1010)` to standard service dirs,
+then overrides known exceptions to the correct UID:GID.
 
 ```bash
 sudo bash scripts/fix-permissions.sh
-# Then restart affected services:
-docker compose --profile apps up -d --no-deps --force-recreate affine
+docker compose up -d --no-deps --force-recreate <service>
 ```
 
-**When to add a new exception:** If a new service fails with `EACCES` on a bind-mount path, run `python3 scripts/check-stack.py --logs <service>` to confirm, then check the container's UID with `docker run --rm --entrypoint id <image>`. If it runs as a non-standard UID with `cap_drop: ALL`, add an entry to `fix-permissions.sh`.
-
----
+**Add a new exception:** if a new service fails with `EACCES` on a bind mount, confirm with
+`python3 scripts/check-stack.py --logs <service>`, check the container UID
+(`docker run --rm --entrypoint id <image>`), and if it runs as a non-standard UID with
+`cap_drop: ALL`, add an entry.
 
 ### `check-stack.py`
 
-**Why:** After a deployment or DNS change it is easy to miss a misconfigured Caddyfile route, a missing DNS record, or an auth gate that is not firing. A forward-auth service returning `200` without credentials is a security hole. This script gives a single-command, colour-coded full-stack health view — covering both external reachability and local container state.
-
-**What it does:**
-
-*Service audit table* — for every `*_SUBDOMAIN` variable in `.env`:
-1. Looks up the Caddyfile handler and upstream backend
-2. Queries Cloudflare DNS for a matching record
-3. Determines the auth mode — `forward-auth`, `native-OIDC`, or `identity-provider`
-4. Probes the URL without credentials — forward-auth services must return `302 → auth`, not `200`
-5. Probes the URL with `Authorization: Bearer <AUTHENTIK_BOOTSTRAP_TOKEN>` — expects `200` or a service-own redirect
-6. Lists orphan DNS records (Cloudflare records with no matching `_SUBDOMAIN` var) and orphan Caddyfile backends (handler defined but no env var)
-
-*Container health table* — runs `docker compose ps` and prints every container with its state (`running` / `exited`), healthcheck status (`healthy` / `unhealthy` / `starting`), and uptime string. Containers that are restarting or unhealthy are highlighted red.
-
-Output is a colour-coded table. Green = OK, yellow = warning, red = misconfiguration.
+A single-command, colour-coded full-stack health view — external reachability **and** local
+container state. For every `*_SUBDOMAIN` in `.env` it resolves the Caddyfile handler + upstream,
+queries Cloudflare DNS, determines the auth mode (`forward-auth` / `native-OIDC` /
+`identity-provider`), and probes the URL with and without credentials (a forward-auth service that
+returns `200` without credentials is flagged as a security hole). It also runs `docker compose ps`
+and prints each container's state, health, and uptime.
 
 ```bash
-# Full audit — DNS + live HTTP probes + container health
-python3 scripts/check-stack.py
-
-# Config-only audit — no live HTTP calls, still shows container health
-python3 scripts/check-stack.py --no-probe
-
-# Skip container health table (useful from a remote workstation)
-python3 scripts/check-stack.py --no-containers
-
-# Tail logs for a specific container (50 lines by default)
-python3 scripts/check-stack.py --logs vikunja
-python3 scripts/check-stack.py --logs gluetun --tail 100
-
-# Plain text output for logging or narrow terminals
+python3 scripts/check-stack.py                # full audit — DNS + HTTP probes + container health
+python3 scripts/check-stack.py --no-probe     # config-only (no live HTTP), still shows containers
+python3 scripts/check-stack.py --no-containers # skip the container table (from a remote workstation)
+python3 scripts/check-stack.py --logs <svc> --tail 100   # tail a container's logs
 python3 scripts/check-stack.py --no-color | tee audit.txt
 ```
 
-`CLOUDFLARE_API_TOKEN` and `AUTHENTIK_BOOTSTRAP_TOKEN` must be set in `.env` for DNS and HTTP probes respectively. Both can be omitted when using `--no-probe`. Container health requires `docker compose` to be available on PATH.
+`CLOUDFLARE_API_TOKEN` and `AUTHENTIK_BOOTSTRAP_TOKEN` are needed for DNS and authed probes; both can
+be omitted with `--no-probe`.
+
+### MFA setup (part of `docker-host-config.sh`)
+
+SSH password auth is the most common attack vector on internet-facing hosts. The host-config script
+installs `libpam-google-authenticator`, runs `google-authenticator` interactively (TOTP secret + QR
+code → `~/.google_authenticator`), optionally generates an `ed25519` SSH key, and optionally disables
+SSH password auth + requires TOTP via PAM. It is skipped on re-runs if `~/.google_authenticator`
+already exists (TOTP setup is not idempotent).
+
+> **IMPORTANT:** keep your existing SSH session open and verify key + TOTP login in a *second*
+> terminal before closing the first. If locked out, use host console/VNC to restore
+> `/etc/ssh/sshd_config`.
 
 ---
 
 ## Troubleshooting
 
-- **Caddy stuck on ACME**: check `docker logs caddy`; verify Cloudflare token has `Zone:read + DNS:edit` on the zone.
-- **Wazuh indexer OOM**: check tier block; MED/LOW tiers halve JVM heap; or add swap.
-- **Falco eBPF driver fails to load**: set `FALCO_DRIVER=ebpf` in `.env` (legacy probe) and restart falco.
-- **Authentik admin lockout**: `docker exec -it authentik-server ak shell` → `from authentik.core.models import User; u = User.objects.get(username='akadmin'); u.set_password('newpass'); u.save()`. If locked out via Entra ID (not local password), run `python3 scripts/undo-entra.py .env` to restore the password login form without touching Entra or synced users.
-- **Postgres backup failed alert**: check `/var/log/pg-backup.log`; pruning is paused until next success.
-- **Zeek not logging**: `docker exec zeek zeekctl status`; if `crashed`, check `/dock/conf/zeek/logs/current/stderr.log`.
-- **GlueTUN not connecting**: check `docker logs gluetun`; verify `PROTONVPN_WIREGUARD_PRIVATE_KEY` is the raw base64 key (not a config file path). If connecting but leaking: confirm `FIREWALL_OUTBOUND_SUBNETS=192.0.2.10/8` is set.
-- **\*arr can't reach indexers / qBittorrent not seeding**: VPN tunnel may be down. Run `docker exec gluetun wget -qO- https://ifconfig.io` — if it returns your ISP's IP instead of the VPN IP, GlueTUN needs to reconnect.
-- **Nextcloud Talk TURN test fails**: confirm 3478/UDP+TCP and 49152–49200/UDP are port-forwarded at the router to the host IP. Check `docker logs coturn` for authentication errors. Verify `COTURN_SECRET` in `.env` matches the secret entered in Talk admin settings.
-- **Jellyfin no GPU transcoding**: ensure the host has `/dev/dri` (Intel: `intel-media-va-driver`, AMD: `mesa-va-drivers`). Check `docker logs jellyfin` for permission errors on `/dev/dri/renderD128`.
-- **Tandoor 500 on startup**: `docker logs tandoor` — usually a missing `SECRET_KEY` or DB not yet provisioned. Run `gen-secrets.py` and verify `TANDOOR_DB_NAME/USER/PASSWORD` are set.
-- **Vikunja "JWT secret must be set"**: `VIKUNJA_JWT_SECRET` is empty. Run `python3 scripts/gen-secrets.py .env` to fill it.
-- **AFFiNE WebSocket disconnects / CORS errors**: `AFFINE_SERVER_EXTERNAL_URL` must exactly match the URL in the browser (scheme + hostname, no trailing slash). Update `.env` and restart affine.
-- **ntfy push not delivered**: check `docker logs ntfy`. Ensure `NTFY_BASE_URL` matches the public URL. Confirm the topic's subscriber is connected and `NTFY_AUTH_DEFAULT_ACCESS=deny-all` is working with the correct token.
+- **Caddy stuck on ACME:** `docker logs caddy`; verify the Cloudflare token has `Zone:Read + DNS:Edit` on the zone.
+- **A profiled service didn't start:** confirm its profile (or a bundle containing it) is in `STACK_PROFILES`, and that `SERVICE_DISABLE` didn't remove it. Run `python3 scripts/profiles.py --check --profiles "<your set>"` to see HARD/SOFT dependency errors.
+- **HARD-dependency abort on `run.sh`:** you disabled a service something else needs (e.g. `gluetun` with an *arr enabled). Either keep the dependency or disable the dependents too.
+- **Falco eBPF driver fails to load:** set `FALCO_DRIVER=ebpf` (legacy probe) in `.env` and restart falco.
+- **Grafana dashboards empty:** `viz` without `metrics`/`logs` — Grafana starts but has no datasource data. Add the `observability` bundle (or `metrics`+`logs`).
+- **Postgres backup-failed alert:** check the `maintain.py backup` log; pruning is paused until the next success.
+- **Zeek not logging:** `docker exec zeek zeekctl status`; if `crashed`, check `/dock/conf/zeek/logs/current/stderr.log`.
+- **gluetun not connecting:** `docker logs gluetun`; verify `PROTONVPN_WIREGUARD_PRIVATE_KEY` is the raw base64 key (not a file path), and `FIREWALL_OUTBOUND_SUBNETS=192.0.2.10/8` is set.
+- **\*arr can't reach indexers / qBittorrent not seeding:** the VPN tunnel may be down. `docker exec gluetun wget -qO- https://ifconfig.io` — if it returns your ISP IP, gluetun needs to reconnect.
+- **Nextcloud Talk TURN test fails:** confirm 3478/UDP+TCP and 49152–49200/UDP are forwarded to the host; check `docker logs coturn`; verify `COTURN_SECRET` matches the secret in Talk admin settings.
+- **Jellyfin no GPU transcoding:** ensure the host has `/dev/dri` (Intel `intel-media-va-driver`, AMD `mesa-va-drivers`); check `docker logs jellyfin` for `/dev/dri/renderD128` permission errors.
+- **Tandoor 500 on startup:** usually a missing `SECRET_KEY` or unprovisioned DB. Run `gen-secrets.py`; verify `TANDOOR_DB_*` are set.
+- **Vikunja "JWT secret must be set":** `VIKUNJA_JWT_SECRET` is empty — run `gen-secrets.py`.
+- **CouchDB (notes) sync fails from Obsidian:** a `401` means the obsidian-livesync credentials don't match `COUCHDB_USER`/`COUCHDB_PASSWORD` (the sync API uses CouchDB-native auth, not Authentik). A CORS error means the client origin isn't in the allow-list — `templates/couchdb/local.d/10-livesync.ini` enables CORS for `app://obsidian.md` / `capacitor://localhost`; restart couchdb after editing it.
+- **ntfy push not delivered:** `docker logs ntfy`; ensure `NTFY_BASE_URL` matches the public URL and the topic subscriber is connected.
+- **Authentik admin lockout:** `docker exec -it authentik-server ak shell` → reset via `User.objects.get(username='akadmin')`. If locked out via Entra (not local), run `python3 scripts/undo-entra.py .env`.
 
-#### Entra ID lockout (can't sign in via Microsoft)
-
-If Entra ID is unavailable or misconfigured after running `set-auth.py entra-setup`, restore local logins without touching Entra:
-
-```bash
-python3 scripts/undo-entra.py .env
-```
-
-This disables the `entra-id` Authentik source and restores the password login form. Synced users are preserved; the App Registration in Entra is untouched. Re-run `set-auth.py entra-setup` to re-enable federation.
-
-#### `check-stack.py`
+### `check-stack.py` symptoms
 
 | Symptom | Likely cause | Fix |
 |---------|-------------|-----|
-| `.env` not found | Wrong working directory | Run from `unified-stack/`: `python3 scripts/check-stack.py` |
-| All services show `UNAUTH: skipped` | `AUTHENTIK_BOOTSTRAP_TOKEN` blank in `.env` | Run `python3 scripts/gen-secrets.py .env` to generate the token |
-| DNS column shows `skipped` for all rows | `CLOUDFLARE_API_TOKEN` not set in `.env` | Set it, or use `--no-probe` for a config-only run |
-| Forward-auth service shows `200 OPEN` | Auth gate not firing — request reaching the app without authentication | Check that the service subdomain is **not** listed in the `@requires-auth-pub` exclusion block in the Caddyfile |
-| All services show `unreachable (0)` | Stack not running, or script run from a machine with no internet access | Script probes public `*.example.com` URLs — run from a machine that can reach them; or run on prod-host with `--no-probe` for config-only |
-| Service shows `502` on authed probe | Service container is down or misconfigured | Rerun with `--logs <service>` to see the container crash reason |
-| `AUTHED: 401` | Bootstrap token rejected | Token may have been rotated; re-run `python3 scripts/gen-secrets.py .env` to refresh |
-| Orphan DNS records listed at the bottom | Stale Cloudflare records from removed services, or records that pre-date `.env` vars | Delete stale records in the Cloudflare dashboard, or add the matching `_SUBDOMAIN` var to `.env` |
-| Orphan Caddyfile backends listed | Caddyfile handler defined for a service whose `_SUBDOMAIN` var is not in `.env` | Enable the profile that sets the var (`--profile media` / `--profile apps`) or add the var manually |
-| Column widths misaligned | Terminal width below ~160 chars | Use `--no-color` and pipe through `less -S`, or redirect to a file |
-| Container health table shows `(no containers found)` | Stack not running, or wrong project path | Run from `unified-stack/`; verify `--compose` points to `docker-compose.yml` |
-| Container shows `Restarting` in health table | Container crash-looping | Run `python3 scripts/check-stack.py --logs <service>` to inspect the crash reason |
-
-#### `tests/test_setup_entra.py` (pytest)
-
-The test suite runs entirely in-process using `unittest.mock` — no live network calls, no Authentik connection, and no Entra or Azure credentials required.
-
-```bash
-# Install pytest if not present (Ubuntu)
-sudo apt-get install -y python3-pytest
-
-# Run all tests from unified-stack/
-python3 -m pytest tests/test_setup_entra.py -v
-
-# Run a single test
-python3 -m pytest tests/test_setup_entra.py::test_msal_guard_exits_when_missing -v
-```
-
-| Symptom | Likely cause | Fix |
-|---------|-------------|-----|
-| `No module named pytest` | pytest not installed | `sudo apt-get install python3-pytest` or `pip install pytest` |
-| `ModuleNotFoundError: No module named 'scripts.setup_entra'` | Test run from wrong directory | Run from `unified-stack/`, not from repo root |
-| `collected 0 items` | pytest cannot find tests | Verify test function names start with `test_`; check for syntax errors in the test file |
-| `AttributeError: module has no attribute 'X'` | A function in `set-auth.py entra-*` was renamed | Check `set-auth.py entra-*` for the current function name and update the corresponding `@patch` target in the test |
-| `SystemExit not raised` | Script guard condition changed | The test asserts `pytest.raises(SystemExit, match=...)` — verify the guard in `set-auth.py entra-*` still calls `sys.exit(1)` on the expected condition |
-| msal-related test fails despite msal being installed | Import path in `@patch` does not match the import in the script | The patch target must be `scripts.setup_entra.msal`, not `msal` — match the module path where msal is imported, not where it is defined |
+| `.env` not found | Wrong working directory | Run from `unified-stack/` |
+| All services `UNAUTH: skipped` | `AUTHENTIK_BOOTSTRAP_TOKEN` blank | Run `gen-secrets.py` |
+| DNS column `skipped` for all rows | `CLOUDFLARE_API_TOKEN` not set | Set it, or use `--no-probe` |
+| Forward-auth service shows `200 OPEN` | Auth gate not firing (security hole) | Ensure the subdomain is **not** in the `@requires-auth-pub` exclusion block in the Caddyfile |
+| All services `unreachable (0)` | Stack down, or run from a host that can't reach the public URLs | Run on the host, or use `--no-probe` |
+| Orphan DNS / Caddyfile backends listed | Stale records, or a profile not enabled | Delete stale records, or enable the profile that sets the `_SUBDOMAIN` var |
+| Container table `(no containers found)` | Stack not running / wrong project path | Run from `unified-stack/` |
 
 ---
 
-## Adding a new app (Phase 3+)
+## Adding a service
 
-1. Add a new section in `.env` with `<APP>_DB_NAME`, `<APP>_DB_USER`, `<APP>_DB_PASSWORD` (leave password empty — `docker-host-config.sh` fills it on next run).
-2. Add a new handle block in `templates/caddy/Caddyfile` for both site stanzas. Choose
-   the auth model that fits the app:
+### Automated — `add-service.py` (repo root)
 
-   **Caddy forward-auth** (app has no auth of its own — e.g. Wazuh):
-   ```caddyfile
-   @newapp host newapp.{$PUBLIC_FQDN}
-   handle @newapp {
-       reverse_proxy newapp:<port>
-   }
-   ```
-   The global `forward_auth` directive already gates everything that isn't listed in the
-   `@requires-auth-pub` / `@requires-auth-ts` exclusion blocks — no extra import needed.
+Scaffolds and fully provisions a service in one command. For `--type unified --auth authentik`,
+Caddy routing, DNS, Authentik registration, and env vars are all wired automatically.
 
-   **Native OIDC** (app handles its own login — e.g. Nextcloud, Vikunja, AFFiNE):
-   ```caddyfile
-   @newapp host newapp.{$PUBLIC_FQDN}
-   handle @newapp {
-       reverse_proxy newapp:<port>
-   }
-   ```
-   Then add `not host {$NEWAPP_SUBDOMAIN}.{$PUBLIC_FQDN}` to the `@requires-auth-pub`
-   and `@requires-auth-ts` matchers, and configure OIDC inside the app itself.
+```bash
+python add-service.py <name> [--port PORT] [--image IMAGE] \
+  [--type {standalone,unified}] [--auth {authentik,native-oidc,none}] \
+  [--subdomain SLUG] [--dry-run]
+```
 
-3. Add the app's service in `docker-compose.yml`. Join its own layer (create one if needed:
-   `192.0.2.10/24` for media, `192.0.2.10/24` for apps, etc.) + `data` for
-   Postgres/Redis access. For native-OIDC apps also add the `oidc-clients` network so the
-   app can reach `authentik-server:9000` for token validation without exposing authentik-worker.
-4. Add tailscale-ingress multi-home: add the new layer to its `networks:` list.
+For `--type unified --auth authentik` it reads `CLOUDFLARE_API_TOKEN`, `AUTHENTIK_BOOTSTRAP_TOKEN`,
+`AUTHENTIK_SUBDOMAIN`, `PUBLIC_FQDN`, and `TAILNET_FQDN` from `unified-stack/.env` (already present
+for normal operation), then runs 7 idempotent steps: Caddyfile snippet + handles, `.env` /
+`.env.example` subdomain entry, Caddy reload, Cloudflare CNAME, Authentik `forward_single` provider
+plus app, and a `check-stack.py` health pass.
+
+```bash
+python add-service.py hoarder --port 3000 --type unified          # scaffold + full provision
+python add-service.py gitea --port 3000 --type unified --auth native-oidc
+python add-service.py myapp --port 9000 --type unified --dry-run   # preview, no writes/API calls
+```
+
+Re-running on an existing service skips scaffold and runs provisioning only (repairs a partial
+setup). Remaining manual steps: paste the printed compose block into `docker-compose.yml`, set the
+`image:`, start with `docker compose up -d <name>`, and (for SSO apps) run `set-auth.py oidc`.
+
+### Manual
+
+1. Add `<APP>_DB_NAME/USER/PASSWORD` to `.env` (leave the password blank — `gen-secrets.py` fills it).
+2. Add a handle block in `templates/caddy/Caddyfile` for both site stanzas. **Forward-auth** (app has
+   no login of its own, e.g. Dashy): just `reverse_proxy newapp:<port>` — the global `forward_auth`
+   directive gates everything not in the `@requires-auth-pub`/`@requires-auth-ts` exclusion blocks.
+   **Native OIDC** (app handles its own login): same handle, then add
+   `not host {$NEWAPP_SUBDOMAIN}.{$PUBLIC_FQDN}` to both `@requires-auth-*` matchers and configure
+   OIDC inside the app.
+3. Add the service to `docker-compose.yml` with a `profiles:` label (its fine profile + the
+   per-service name), join its layer + `data`, and add the new fine profile to `profiles.toml`
+   (including any HARD/SOFT deps). For native-OIDC apps also join `oidc-clients`.
+4. Add the new layer to `tailscale-ingress`'s `networks:` list (multi-home).
 5. Restart: `docker compose up -d --build`.
 
+> **Reminder:** `profiles.toml` is the single source of truth — a new service must be added there (a
+> fine profile + any dependency edges), never only in compose. Every new service needs a
+> `<SERVICE>_SUBDOMAIN` in **both** `.env.example` and the live `.env`.
+
 ---
 
-## `add-service.py` (repo root)
+## Verification
 
-Scaffolds and fully provisions a new service in one command. For unified+Authentik services every
-external-facing dependency — Caddy routing, DNS, Authentik app registration, and env vars — is
-wired automatically.
-
-```
-python add-service.py <name> [options]
-```
-
-### Options
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--port PORT` | `80` | Internal container port |
-| `--image IMAGE` | placeholder | Docker image |
-| `--type {standalone,unified}` | `standalone` | `standalone` = dev/ Tailscale-sidecar; `unified` = Caddy + Authentik |
-| `--auth {authentik,native-oidc,none}` | `authentik` | Auth gate for unified type |
-| `--db {none,postgres,redis,both}` | `none` | Add local DB sidecar(s) — standalone only |
-| `--subdomain SLUG` | service name | External subdomain slug (e.g. `hoard` → `example.com`) |
-| `--out DIR` | `./dev/<name>` or `./unified-stack/services/<name>` | Output base directory |
-| `--dry-run` | off | Print what would happen without writing files or calling external APIs |
-| `--no-host-setup` | off | Skip SSH host provisioning (print manual commands instead) |
-| `--ssh-host USER@HOST` | `admin@prod-host` | SSH target for host provisioning |
-| `--ssh-key PATH` | `~/.ssh/prod-host` | SSH identity file |
-| `--repo-path PATH` | `/home/admin/openirvana` | Repo path on the Docker host |
-
-### Prerequisites for cloud provisioning
-
-For `--type unified --auth authentik` the script reads these vars from `unified-stack/.env`:
-
-| Variable | Purpose |
-|----------|---------|
-| `CLOUDFLARE_API_TOKEN` | Create the public CNAME record for the service |
-| `AUTHENTIK_BOOTSTRAP_TOKEN` | Register the proxy provider + application in Authentik |
-| `AUTHENTIK_SUBDOMAIN` | Authentik's own subdomain (used to build the API base URL) |
-| `PUBLIC_FQDN` | Root domain (e.g. `example.com`) |
-| `TAILNET_FQDN` | Tailnet FQDN for Caddy's tailnet site block |
-
-These are already present for normal stack operation; no extra setup is required.
-
-### What it does automatically
-
-**For all types** (non-`--dry-run`):
-
-- Generates service files in `unified-stack/services/<name>/` (unified) or `dev/<name>/` (standalone)
-- SSHes to the Docker host and runs `fix-permissions.sh --service <name>` to create
-  `/dock/conf/<name>` and `/dock/data/<name>` with `svc-user:media 770`
-
-**Additionally for `--type unified --auth authentik`**, the following 7 provisioning steps run
-automatically after scaffold. Each step is idempotent — re-running skips anything already done:
-
-| Step | What happens |
-|------|-------------|
-| **1. Caddyfile** | Inserts `(backend-<name>)` snippet, public `@<name>` handle, and tailnet `@<name>-ts` handle into `templates/caddy/Caddyfile` |
-| **2. `.env`** | Appends `<NAME>_SUBDOMAIN=<slug>` to `unified-stack/.env` if not already set |
-| **3. `.env.example`** | Inserts `<NAME>_SUBDOMAIN=<slug>` after the last `_SUBDOMAIN=` line in `.env.example` |
-| **4. Caddy reload** | Runs `docker exec caddy caddy reload --config /etc/caddy/Caddyfile` if the Caddyfile changed |
-| **5. Cloudflare DNS** | Creates a proxied CNAME `<subdomain>.<domain>` pointing at the same target as `auth.<domain>` |
-| **6. Authentik** | Creates a `forward_single` proxy provider + application, assigns it to the embedded outpost |
-| **7. Health check** | Runs `check-stack.py` so you see live status of all services immediately |
-
-### What requires manual follow-up
-
-| Step | Standalone | Unified (authentik) |
-|------|-----------|---------------------|
-| Set the Docker image | Edit `IMAGE_URL` in `dev/<name>/.env` | Edit `image:` in the generated service block in `docker-compose.yml` |
-| Set the Tailscale auth key | Edit `TS_AUTHKEY` in `dev/<name>/.env` | N/A — unified uses the shared ingress |
-| Add service block to compose | N/A | Paste the printed block into `unified-stack/docker-compose.yml` |
-| Start the service | `docker compose --env-file dev/<name>/.env -f dev/<name>/docker-compose.yml up -d` | `docker compose up -d <name>` |
-| OIDC integration | N/A | If the service uses Authentik SSO, run `python3 scripts/set-auth.py oidc` after start |
-| Special UID permissions | N/A | If the service runs as a non-standard UID with `cap_drop:ALL`, add it to `fix-permissions.sh` and re-run |
-
-### Re-provisioning an existing service
-
-If `unified-stack/services/<name>` already exists the script skips scaffold and runs provisioning
-only. This is useful to repair a partially-provisioned service or to apply any step that was
-missed (e.g. because `CLOUDFLARE_API_TOKEN` was not set at creation time):
-
-```bash
-python add-service.py hoarder --port 3000 --type unified
-# → "hoarder already exists — skipping scaffold, running provisioning only"
-# All 7 steps run; already-done steps are silently skipped.
-```
-
-### Examples
-
-```bash
-# Standalone service (Tailscale-sidecar, Postgres + Redis sidecars):
-python add-service.py paperless --port 8000 --type standalone --db both
-
-# Unified service — scaffold + full provisioning (DNS, Authentik, Caddyfile, env):
-python add-service.py hoarder --port 3000 --type unified
-
-# Unified service with a custom subdomain slug:
-python add-service.py actual-budget --port 5006 --type unified --subdomain budget
-
-# Unified service with native OIDC (service handles its own login, no Authentik proxy):
-python add-service.py gitea --port 3000 --type unified --auth native-oidc
-
-# Preview everything without writing files or calling external APIs:
-python add-service.py myapp --port 9000 --type unified --dry-run
-
-# Write files but skip SSH host provisioning:
-python add-service.py myapp --port 9000 --no-host-setup
-```
+| Scope | Command |
+|-------|---------|
+| Service catalog | `python3 scripts/profiles.py --list` |
+| Dependency doctor (offline) | `python3 scripts/profiles.py --check --profiles "observability,media"` |
+| Python types (after any `.py` edit) | `python3 -m pyright scripts/<file>.py` |
+| Test suite | `python3 -m pytest tests/ -v` |
+| Compose syntax (offline) | `docker compose --env-file .env -f docker-compose.yml config` |
+| Live stack | `bash run.sh` (interactive) / `bash run.sh -y` (unattended) |
+| Full-stack health | `python3 scripts/check-stack.py` |

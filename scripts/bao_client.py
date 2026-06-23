@@ -96,8 +96,8 @@ class BaoClient:
         return resp.get("data", {}).get("keys", [])
 
     # --- AppRole ---
-    def create_approle(self, role: str, policies: list[str],
-                       token_ttl: str = "20m", secret_id_ttl: str = "0") -> None:
+    def create_approle(self, role: str, policies: list[str],  # nosec B107
+                       token_ttl: str = "20m", secret_id_ttl: str = "0") -> None:  # noqa: S107
         self._client.auth.approle.create_or_update_approle(
             role_name=role, token_policies=policies, token_ttl=token_ttl,
             secret_id_ttl=secret_id_ttl, secret_id_num_uses=0)
@@ -117,3 +117,11 @@ class BaoClient:
         if not token:
             raise RuntimeError(f"AppRole login returned no client_token: {resp!r}")
         return token
+
+    def kv_delete(self, path: str, mount: str = "secret") -> None:
+        """Soft-delete the latest version of a KV v2 secret. Idempotent."""
+        try:
+            self._client.secrets.kv.v2.delete_latest_version_of_secret(
+                path=path, mount_point=mount)
+        except hvac_exc.InvalidPath:
+            pass  # already absent — matches idempotent contract

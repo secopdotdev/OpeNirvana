@@ -12,11 +12,34 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
+
+
+# ── Atomic-write helper ─────────────────────────────────────────────────────────
+
+def _replace_with_retry(src: str, dst: "Path | str", attempts: int = 10) -> None:
+    """os.replace(src, dst) with a bounded retry on transient Windows locks.
+
+    On Windows, os.replace can raise PermissionError ([WinError 5]) when an
+    antivirus scanner or the search indexer briefly holds the destination just
+    after a temp file is written. The swap is still atomic; it just needs a
+    moment. On POSIX the first attempt always succeeds, so this is a no-op cost.
+    Backoff is linear (~0.05s * attempt); worst case ~2.75s before re-raising.
+    """
+    for attempt in range(attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(0.05 * (attempt + 1))
 
 
 # ── ANSI output ────────────────────────────────────────────────────────────────
@@ -69,7 +92,7 @@ class EnvFile:
                 fh.write(text)
                 fh.flush()
                 os.fsync(fh.fileno())
-            os.replace(tmp, self.path)     # atomic swap
+            _replace_with_retry(tmp, self.path)   # atomic swap (Windows-lock tolerant)
         except BaseException:
             try: os.unlink(tmp)
             except FileNotFoundError: pass
@@ -119,6 +142,33 @@ class EnvFile:
             self._text = self._text.rstrip("\n") + f"\n{key}={value}\n"
             self._atomic_write(self._text)
             print(f"  wrote  {key} (appended)")
+
+
+# ── Authentik admin-token resolution ──────────────────────────────────────────
+
+def resolve_admin_token(env: "Union[EnvFile, Mapping[str, str]]") -> str:
+    """Return the best available Authentik admin API token from *env*.
+
+    Preference order:
+    1. ``AUTHENTIK_API_TOKEN``     — the re-mintable scoped service token
+       written by ``authentik-token-broker.py`` (ADR-0018).  Preferred because
+       it is a least-privilege service-account token that can be revoked and
+       re-minted without touching the bootstrap secret.
+    2. ``AUTHENTIK_BOOTSTRAP_TOKEN`` — the legacy bootstrap admin token.
+       Used as a fallback on installs where the broker has not yet been run or
+       the API token is absent from the environment.
+    3. ``""`` — both vars are absent or blank; callers must validate and
+       surface an appropriate error.
+
+    Works with both :class:`EnvFile` (single-arg ``.get(key)`` returning ``""``
+    on miss) and plain ``dict`` / ``Mapping`` objects (``None`` on miss).  The
+    ``or`` chain handles both falsy cases uniformly.
+    """
+    return (
+        env.get("AUTHENTIK_API_TOKEN")
+        or env.get("AUTHENTIK_BOOTSTRAP_TOKEN")
+        or ""
+    )
 
 
 # ── Authentik API client ───────────────────────────────────────────────────────
@@ -240,82 +290,15 @@ def discover_app_access_groups(ak: "AuthentikClient", apps: list[dict]) -> dict[
 
 # ── Cloudflare DNS API client ──────────────────────────────────────────────────
 
-class CloudflareClient:
-    """Minimal Cloudflare DNS API client (stdlib only)."""
-
-    _BASE = "https://api.cloudflare.com/client/v4"
-
-    def __init__(self, token: str) -> None:
-        self.token = token
-
-    def _request(self, method: str, path: str, body: Optional[dict] = None) -> dict:
-        url = f"{self._BASE}/{path.lstrip('/')}"
-        data = json.dumps(body).encode() if body is not None else None
-        req = urllib.request.Request(
-            url, data=data, method=method,
-            headers={
-                "Authorization": f"Bearer {self.token}",
-                "Content-Type": "application/json",
-            },
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                return json.loads(resp.read())
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode(errors="replace")
-            raise RuntimeError(f"HTTP {exc.code} {method} {url}: {detail}") from exc
-
-    def get_zone_id(self, domain: str) -> str:
-        """Return the Cloudflare zone ID for the given domain."""
-        resp = self._request("GET", f"/zones?name={domain}&status=active")
-        if not resp.get("success") or not resp.get("result"):
-            raise RuntimeError(f"Zone not found for domain: {domain}")
-        return resp["result"][0]["id"]
-
-    def get_dns_records(self, zone_id: str, domain: str) -> dict[str, list[str]]:
-        """Return {subdomain: [types]} for all DNS records in the zone."""
-        records: dict[str, list[str]] = {}
-        page = 1
-        while True:
-            data = self._request(
-                "GET", f"/zones/{zone_id}/dns_records?per_page=100&page={page}"
-            )
-            if not data.get("success"):
-                break
-            for r in data.get("result", []):
-                name: str = r["name"]
-                rtype: str = r["type"]
-                if name == domain:
-                    sub = "@"
-                elif name.endswith(f".{domain}"):
-                    sub = name[: -(len(domain) + 1)]
-                else:
-                    sub = name
-                records.setdefault(sub, []).append(rtype)
-            info_page = data.get("result_info", {})
-            if page >= info_page.get("total_pages", 1):
-                break
-            page += 1
-        return records
-
-    def get_cname_target(self, zone_id: str, fqdn: str) -> Optional[str]:
-        """Return the CNAME content for a record name, or None if not found."""
-        data = self._request(
-            "GET", f"/zones/{zone_id}/dns_records?type=CNAME&name={fqdn}"
-        )
-        if data.get("success") and data.get("result"):
-            return data["result"][0]["content"]
-        return None
-
-    def create_cname(self, zone_id: str, fqdn: str, target: str, proxied: bool = True) -> dict:
-        """Create a CNAME record. fqdn = full record name (e.g. 'example.com')."""
-        return self._request("POST", f"/zones/{zone_id}/dns_records", {
-            "type":    "CNAME",
-            "name":    fqdn,
-            "content": target,
-            "proxied": proxied,
-            "ttl":     1,
-        })
+# The CloudflareClient implementation now lives in the vendored cloudflare-toolkit
+# `dns.py` module (canonical: github.com/your-org/cloudflare-toolkit). It is
+# re-exported here so existing callers keep working unchanged — `from utils import
+# CloudflareClient` and `utils.CloudflareClient(...)` both still resolve. The
+# canonical class is a superset (it also exposes delete_dns_record). Ensure the
+# sibling scripts dir is importable first (covers importers run from elsewhere).
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+from dns import CloudflareClient  # noqa: E402,F401,I001  (vendored sibling re-export)
 
 
 # ── Docker helpers ─────────────────────────────────────────────────────────────

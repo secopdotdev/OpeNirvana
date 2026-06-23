@@ -5,15 +5,14 @@ maintain.py — Unified maintenance runner for the unified-stack.
 Subcommands:
   backup       Dump all Postgres databases and prune old backups.
   intel        Refresh Zeek threat-intel feeds (URLhaus, Feodo, CrowdStrike).
-  wazuh        Sync custom Wazuh decoders/rules and merge agent localfiles.
   prune        Remove dangling Docker images, unused volumes, and stale builder cache.
   cloudflare   Poll Cloudflare security events API and write to firewall-events.log.
   entra-sync   Sync Entra group membership into Authentik (set-auth entra-* + oidc --sync).
   check-stack  Probe all services; send ntfy alert via n8n if any are unhealthy.
-  all          Run backup → intel → wazuh → prune → entra-sync → check-stack.
+  all          Run backup → intel → prune → entra-sync → check-stack.
 
 Usage:
-  python3 scripts/maintain.py <backup|intel|wazuh|prune|cloudflare|all>
+  python3 scripts/maintain.py <backup|intel|prune|cloudflare|all>
 
 Run from any directory; paths resolve relative to this script.
 Cron example (daily at 02:00):
@@ -26,6 +25,7 @@ import argparse
 import csv
 import datetime
 import io
+import ipaddress
 import json
 import os
 import re
@@ -40,40 +40,21 @@ import uuid
 from pathlib import Path
 
 _STACK_DIR = Path(__file__).resolve().parent.parent
+_SCRIPTS_DIR = Path(__file__).resolve().parent
+# Make sibling vendored cloudflare-toolkit modules importable (firewall/hsts/dns →
+# _http). Imports are done lazily inside the cloudflare commands so module load
+# never hard-depends on them (the CIDR command and its tests stay independent).
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
 
-_WAZUH_CONTAINER = "wazuh-manager"
-_WAZUH_API       = "https://localhost:55000"
-_WAZUH_API_USER  = "wazuh-wui"
-
-_CF_API_BASE = "https://api.cloudflare.com/client/v4"
 _CF_STATE    = Path("/dock/conf/cloudflare/state.json")
 _CF_LOG      = Path("/dock/conf/cloudflare/firewall-events.log")
 
-_CF_GRAPHQL_QUERY = """\
-query ($zoneTag: String!, $datetimeGt: String!, $datetimeLt: String!) {
-  viewer {
-    zones(filter: {zoneTag: $zoneTag}) {
-      firewallEventsAdaptive(
-        filter: {datetime_gt: $datetimeGt, datetime_lt: $datetimeLt}
-        limit: 1000
-        orderBy: [datetime_ASC]
-      ) {
-        action
-        clientCountryName
-        clientIP
-        clientRequestHTTPHost
-        clientRequestHTTPMethodName
-        clientRequestPath
-        datetime
-        rayName
-        ruleId
-        source
-        userAgent
-      }
-    }
-  }
-}
-"""
+_CF_IPS_V4   = "https://www.cloudflare.com/ips-v4"
+_CF_IPS_V6   = "https://www.cloudflare.com/ips-v6"
+_CF_CIDR_FILE = Path("/dock/conf/cloudflare/cf-cidrs.txt")
+_ENV_FILE    = _STACK_DIR / ".env"
+_MIN_V4, _MIN_V6 = 10, 5  # sane floor; CF publishes ~15 v4 + ~7 v6
 
 
 def _load_env(path: Path) -> None:
@@ -116,72 +97,9 @@ def err(msg: str) -> None:
     print(f"\033[31m{msg}\033[0m", file=sys.stderr)
 
 
-# ── Cloudflare API helpers ────────────────────────────────────────────────────
-
-def _cf_api_get(token: str, path: str) -> dict:
-    """GET from CF REST API with one retry on 429/5xx."""
-    url = f"{_CF_API_BASE}{path}"
-    for attempt in range(2):
-        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                return json.loads(resp.read())
-        except urllib.error.HTTPError as exc:
-            if attempt == 0 and exc.code in (429, 500, 502, 503, 504):
-                time.sleep(5)
-                continue
-            raise
-    raise RuntimeError("unreachable")
-
-
-def _cf_api_patch(token: str, path: str, body: dict) -> dict:
-    """PATCH to CF REST API with one retry on 429/5xx."""
-    url = f"{_CF_API_BASE}{path}"
-    payload = json.dumps(body).encode()
-    for attempt in range(2):
-        req = urllib.request.Request(
-            url, data=payload, method="PATCH",
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                return json.loads(resp.read())
-        except urllib.error.HTTPError as exc:
-            if attempt == 0 and exc.code in (429, 500, 502, 503, 504):
-                time.sleep(5)
-                continue
-            raise
-    raise RuntimeError("unreachable")
-
-
-def _cf_graphql(token: str, variables: dict) -> dict:
-    """POST to CF GraphQL API with one retry on 429/5xx."""
-    url = f"{_CF_API_BASE}/graphql"
-    payload = json.dumps({"query": _CF_GRAPHQL_QUERY, "variables": variables}).encode()
-    for attempt in range(2):
-        req = urllib.request.Request(
-            url, data=payload,
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                return json.loads(resp.read())
-        except urllib.error.HTTPError as exc:
-            if attempt == 0 and exc.code in (429, 500, 502, 503, 504):
-                time.sleep(5)
-                continue
-            raise
-    raise RuntimeError("unreachable")
-
-
-def _cf_resolve_zone(token: str, domain: str) -> str:
-    """Return zone ID for the apex domain."""
-    apex = ".".join(domain.split(".")[-2:])
-    data = _cf_api_get(token, f"/zones?name={apex}")
-    zones = data.get("result", [])
-    if not zones:
-        raise ValueError(f"No Cloudflare zone found for {apex!r}")
-    return zones[0]["id"]
+# Cloudflare API helpers (api_get/api_patch/api_graphql/resolve_zone_id) now live
+# in the vendored _http.py — consumed via the firewall.py / hsts.py toolkit modules
+# imported lazily inside cmd_cloudflare / cmd_cloudflare_hsts below.
 
 
 # ── backup ────────────────────────────────────────────────────────────────────
@@ -335,262 +253,6 @@ def cmd_intel() -> None:
         err(f"{ts()} zeek reload failed")
 
 
-# ── wazuh ─────────────────────────────────────────────────────────────────────
-
-def _sync_dir(src: Path, dst: Path, pattern: str = "*.xml") -> bool:
-    """Copy src files matching pattern to dst. Return True if changed.
-
-    Tries root:wazuh 640 (host-agent case); falls back to 644 if wazuh group
-    doesn't exist (container case — wazuh-manager reads bind-mounts as root).
-    """
-    dst.mkdir(parents=True, exist_ok=True)
-    src_files = {f.name: f for f in src.glob(pattern)}
-
-    changed = False
-    for name, sf in src_files.items():
-        df = dst / name
-        if not df.exists() or sf.read_bytes() != df.read_bytes():
-            shutil.copy2(str(sf), str(df))
-            try:
-                shutil.chown(str(df), user="root", group="wazuh")
-                df.chmod(0o640)
-            except LookupError:
-                df.chmod(0o644)
-            changed = True
-
-    return changed
-
-
-def _extract_ossec_body(conf_path: Path) -> str:
-    """Return the lines between <ossec_config> and </ossec_config>, exclusive."""
-    lines = conf_path.read_text(encoding="utf-8").splitlines(keepends=True)
-    body, inside = [], False
-    for line in lines:
-        if "<ossec_config>" in line:
-            inside = True
-            continue
-        if "</ossec_config>" in line:
-            break
-        if inside:
-            body.append(line)
-    return "".join(body)
-
-
-def _merge_ossec_conf(ossec_conf: Path, insert_block: str) -> None:
-    """Insert insert_block with sentinel comments before the closing </ossec_config>."""
-    lines = ossec_conf.read_text(encoding="utf-8").splitlines(keepends=True)
-
-    close_idx = next(
-        (i for i in range(len(lines) - 1, -1, -1) if "</ossec_config>" in lines[i]),
-        None,
-    )
-    if close_idx is None:
-        raise ValueError(f"No </ossec_config> tag found in {ossec_conf}")
-
-    block = insert_block if insert_block.endswith("\n") else insert_block + "\n"
-    new_lines = (
-        lines[:close_idx]
-        + ["<!-- BEGIN unified-stack localfiles -->\n", block, "<!-- END unified-stack localfiles -->\n"]
-        + lines[close_idx:]
-    )
-
-    tmp = ossec_conf.with_suffix(".new")
-    tmp.write_text("".join(new_lines), encoding="utf-8")
-    shutil.chown(str(tmp), user="root", group="wazuh")
-    tmp.chmod(0o640)
-    tmp.replace(ossec_conf)
-
-
-def _docker_cp_xmls(src_dir: Path, container_dst: str) -> bool:
-    """docker cp all XML files from src_dir into the container. Returns True if any changed."""
-    changed = False
-    for xml in src_dir.glob("*.xml"):
-        r = subprocess.run(
-            ["docker", "exec", _WAZUH_CONTAINER, "cat", f"{container_dst}/{xml.name}"],
-            capture_output=True,
-        )
-        if r.returncode == 0 and r.stdout == xml.read_bytes():
-            continue
-        subprocess.run(
-            ["docker", "cp", str(xml), f"{_WAZUH_CONTAINER}:{container_dst}/{xml.name}"],
-            check=True, capture_output=True,
-        )
-        subprocess.run(
-            ["docker", "exec", _WAZUH_CONTAINER,
-             "chown", "root:wazuh", f"{container_dst}/{xml.name}"],
-            capture_output=True, check=True,
-        )
-        subprocess.run(
-            ["docker", "exec", _WAZUH_CONTAINER,
-             "chmod", "640", f"{container_dst}/{xml.name}"],
-            capture_output=True, check=True,
-        )
-        changed = True
-    return changed
-
-
-def _wazuh_container_state() -> str | None:
-    r = subprocess.run(
-        ["docker", "inspect", _WAZUH_CONTAINER, "--format", "{{.State.Status}}"],
-        capture_output=True, text=True,
-    )
-    return r.stdout.strip() if r.returncode == 0 else None
-
-
-def _wazuh_api_ready() -> bool:
-    r = subprocess.run(
-        ["docker", "exec", _WAZUH_CONTAINER,
-         "curl", "-sk", "-o", "/dev/null", "-w", "%{http_code}",
-         f"{_WAZUH_API}/"],
-        capture_output=True, text=True)
-    return r.returncode == 0 and r.stdout.strip() in ("200", "401", "403")
-
-
-def _wazuh_wait_api(timeout: int = 120) -> None:
-    """Block until the Wazuh REST API responds, e.g. after a container restart."""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if _wazuh_api_ready():
-            return
-        time.sleep(5)
-    err(f"Wazuh API not ready after {timeout}s — is wazuh-manager healthy?")
-    sys.exit(1)
-
-
-def _wazuh_token(password: str) -> str:
-    r = subprocess.run(
-        ["docker", "exec", _WAZUH_CONTAINER,
-         "curl", "-sk", "-X", "GET",
-         "-u", f"{_WAZUH_API_USER}:{password}",
-         f"{_WAZUH_API}/security/user/authenticate"],
-        capture_output=True, text=True, check=True,
-    )
-    return json.loads(r.stdout)["data"]["token"]
-
-
-def _wazuh_restart(token: str) -> None:
-    subprocess.run(
-        ["docker", "exec", _WAZUH_CONTAINER,
-         "curl", "-sk", "-X", "PUT",
-         "-H", f"Authorization: Bearer {token}",
-         f"{_WAZUH_API}/manager/restart"],
-        capture_output=True, check=True,
-    )
-
-
-def _wazuh_merge_ossec_container(block: str) -> bool:
-    """Merge localfile block into ossec.conf inside the container. Returns True if changed.
-
-    If the sentinel is already present, replaces the existing block so that
-    updates to agent-host.conf are picked up on re-runs.
-    """
-    snippet = f"""\
-import re, shutil
-from pathlib import Path
-start_s = "<!-- BEGIN unified-stack localfiles -->"
-end_s   = "<!-- END unified-stack localfiles -->"
-block   = {json.dumps(block)}
-conf    = Path("/var/ossec/etc/ossec.conf")
-text    = conf.read_text()
-if start_s in text:
-    new = re.sub(
-        re.escape(start_s) + r".*?" + re.escape(end_s),
-        start_s + "\\n" + block + "\\n" + end_s,
-        text, flags=re.DOTALL)
-    if new == text:
-        print("SKIP"); exit(0)
-else:
-    idx = text.rfind("</ossec_config>")
-    if idx == -1:
-        print("ERROR: no </ossec_config>"); exit(1)
-    new = text[:idx] + start_s + "\\n" + block + "\\n" + end_s + "\\n" + text[idx:]
-tmp = conf.with_suffix(".new")
-tmp.write_text(new)
-shutil.chown(str(tmp), user="root", group="wazuh")
-tmp.chmod(0o640)
-tmp.replace(conf)
-print("OK")
-"""
-    r = subprocess.run(
-        ["docker", "exec", _WAZUH_CONTAINER, "python3", "-c", snippet],
-        capture_output=True, text=True,
-    )
-    if r.returncode != 0 or r.stdout.strip().startswith("ERROR"):
-        err(r.stdout + r.stderr)
-        sys.exit(1)
-    return r.stdout.strip() == "OK"
-
-
-def cmd_wazuh() -> None:
-    step("wazuh-ingest")
-
-    # ── Containerized manager path ─────────────────────────────────────────────
-    if _wazuh_container_state() == "running":
-        password = os.environ.get("WAZUH_API_PASSWORD", "")
-        if not password:
-            err("WAZUH_API_PASSWORD not set — cannot authenticate to Wazuh API")
-            sys.exit(1)
-
-        changed = False
-        tpl_dir  = _STACK_DIR / "templates" / "wazuh"
-        conf_dir = Path("/dock/conf/wazuh")
-
-        for subdir in ("decoders", "rules"):
-            if _docker_cp_xmls(tpl_dir / subdir, f"/var/ossec/etc/{subdir}"):
-                ok(f"synced {subdir}")
-                changed = True
-            else:
-                ok(f"no change: {subdir}")
-
-        block = _extract_ossec_body(conf_dir / "agent-host.conf")
-        if _wazuh_merge_ossec_container(block):
-            ok("merged localfile block into ossec.conf")
-            changed = True
-        else:
-            ok("no change: ossec.conf")
-
-        if changed:
-            _wazuh_wait_api()
-            token = _wazuh_token(password)
-            _wazuh_restart(token)
-            ok("wazuh-manager restarted via API")
-        else:
-            ok("no changes — skipping restart")
-        return
-
-    # ── Host-agent path ────────────────────────────────────────────────────────
-    src_dir       = Path("/dock/conf/wazuh")
-    agent_etc     = Path("/var/ossec/etc")
-    ossec_conf    = agent_etc / "ossec.conf"
-    wazuh_control = Path("/var/ossec/bin/wazuh-control")
-
-    if not wazuh_control.is_file():
-        err(f"{_WAZUH_CONTAINER} container not running and {wazuh_control} not found.")
-        sys.exit(1)
-
-    changed = False
-
-    for subdir in ("decoders", "rules"):
-        if _sync_dir(src_dir / subdir, agent_etc / subdir):
-            ok(f"synced {subdir}")
-            changed = True
-        else:
-            ok(f"no change: {subdir}")
-
-    conf_text = ossec_conf.read_text(encoding="utf-8") if ossec_conf.exists() else ""
-    if "unified-stack localfiles" not in conf_text:
-        body = _extract_ossec_body(src_dir / "agent-host.conf")
-        _merge_ossec_conf(ossec_conf, body)
-        ok("merged agent-host.conf localfiles into ossec.conf")
-        changed = True
-
-    if changed:
-        subprocess.run(["systemctl", "restart", "wazuh-agent"], check=True)
-        ok("wazuh-agent restarted with updated decoders/rules/localfiles")
-    else:
-        ok("no wazuh-agent changes")
-
-
 # ── prune ─────────────────────────────────────────────────────────────────────
 
 def cmd_prune() -> None:
@@ -627,97 +289,20 @@ def cmd_cloudflare() -> None:
         err("PUBLIC_FQDN not set — cannot resolve zone ID")
         sys.exit(1)
 
-    # Load state
-    state: dict = {}
-    if _CF_STATE.exists():
-        try:
-            state = json.loads(_CF_STATE.read_text())
-        except (json.JSONDecodeError, OSError):
-            err(f"WARNING: {_CF_STATE} unparseable — starting from last 15 minutes")
+    from firewall import fetch_events  # vendored cloudflare-toolkit module
 
-    # Resolve zone ID (cached; re-resolved on 404)
-    zone_id: str = state.get("zone_id", "")
-    if zone_id:
-        try:
-            _cf_api_get(token, f"/zones/{zone_id}")
-        except urllib.error.HTTPError as exc:
-            if exc.code == 404:
-                err(f"Cached zone ID {zone_id!r} is invalid — re-resolving")
-                zone_id = ""
-    if not zone_id:
-        zone_id = _cf_resolve_zone(token, fqdn)
-        state["zone_id"] = zone_id
-        ok(f"resolved zone ID: {zone_id}")
-
-    # Cursor — cap lookback at 23h to stay within firewallEventsAdaptive's 1d limit
-    _utcnow  = datetime.datetime.now(datetime.timezone.utc)
-    now_str  = _utcnow.strftime("%Y-%m-%dT%H:%M:%SZ")
-    max_back = (_utcnow - datetime.timedelta(hours=23)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    fallback = (_utcnow - datetime.timedelta(minutes=15)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    raw_last: str = state.get("last_seen") or fallback
-    last_seen = raw_last if raw_last >= max_back else max_back
-    if not state.get("last_seen"):
-        err(f"WARNING: no last_seen in state — fetching from {last_seen}")
-    elif last_seen != raw_last:
-        err(f"WARNING: last_seen {raw_last!r} > 23h ago — clamped to {last_seen}")
-
-    # Query GraphQL
+    # Fail-soft: fetch_events raises BEFORE it writes the log or advances state, so a
+    # caught error leaves the cursor unmoved and the weekly cron resumes from the same
+    # point next run. URLError/HTTPError subclass OSError (transient network/HTTP);
+    # RuntimeError covers GraphQL errors / null data. Catch both — a bare RuntimeError
+    # clause would let a cron-time DNS blip crash the run where it used to fail soft.
     try:
-        result = _cf_graphql(token, {"zoneTag": zone_id, "datetimeGt": last_seen, "datetimeLt": now_str})
-    except (urllib.error.URLError, urllib.error.HTTPError, OSError) as exc:
-        err(f"CF API error after retry: {exc} — cursor not advanced")
+        written = fetch_events(token, fqdn, _CF_LOG, _CF_STATE)
+    except (RuntimeError, OSError) as exc:
+        err(f"CF API error: {exc} — cursor not advanced")
         return
 
-    if result.get("errors"):
-        err(f"CF GraphQL errors: {result['errors']} — cursor not advanced")
-        return
-
-    data = result.get("data")
-    if data is None:
-        err(f"CF GraphQL returned null data — cursor not advanced")
-        return
-
-    events = (data.get("viewer", {})
-              .get("zones", [{}])[0].get("firewallEventsAdaptive", []))
-
-    # Write log + heartbeat; action first so prematch ^{"action": fires on all lines
-    _CF_LOG.parent.mkdir(parents=True, exist_ok=True)
-    with _CF_LOG.open("a") as f:
-        for event in events:
-            f.write(json.dumps(event) + "\n")
-        f.write(json.dumps({
-            "action": "heartbeat",
-            "datetime": now_str,
-            "type": "heartbeat",
-            "events_fetched": len(events),
-        }) + "\n")
-
-    # Advance cursor
-    new_cursor = events[-1]["datetime"] if events else now_str
-    state["last_seen"] = new_cursor
-    _CF_STATE.parent.mkdir(parents=True, exist_ok=True)
-    _CF_STATE.write_text(json.dumps(state, indent=2))
-
-    ok(f"fetched {len(events)} events; cursor → {new_cursor}")
-
-
-# Cloudflare rewrites the origin's Strict-Transport-Security header at edge,
-# overriding whatever Caddy sends. The dashboard control lives under SSL/TLS →
-# Edge Certificates → HSTS; this subcommand sets the same fields via API so
-# fresh hosts get a long HSTS policy without manual dashboard clicks.
-# Target values mirror what Caddy's security-headers snippet sends so the
-# observable header is the same whether a request goes via CF or origin-direct.
-# CF caps max_age at 31536000s (1y); that still satisfies Nextcloud's
-# setupcheck threshold of 15552000s (6 mo). These are exactly the fields
-# CF echoes back in GET .../settings/security_header, so the idempotency
-# comparison below matches cleanly (an earlier draft included a phantom
-# "nodefault" key CF never returns, which forced a PATCH on every run).
-_HSTS_TARGET = {
-    "enabled":            True,
-    "max_age":            31536000,
-    "include_subdomains": True,
-    "preload":            True,
-}
+    ok(f"fetched {written} events")
 
 
 def cmd_cloudflare_hsts() -> None:
@@ -732,40 +317,106 @@ def cmd_cloudflare_hsts() -> None:
         err("PUBLIC_FQDN not set — cannot resolve zone ID")
         sys.exit(1)
 
-    zone_id = _cf_resolve_zone(token, fqdn)
+    from hsts import apply_hsts  # vendored cloudflare-toolkit module
 
-    # GET current — only PATCH if values differ. Avoids audit-log churn on
-    # every deploy and gives a clean "already configured" report when correct.
+    # NOT fail-soft on transient errors (matches prior behavior: a resolve/GET blip
+    # crashes the run rather than silently skipping HSTS). A 403 is the one tolerated
+    # case — a missing Zone Settings:Edit scope is a config issue, not a deploy-blocker.
+    # apply_hsts already prints the missing-scope guidance to stderr before re-raising,
+    # so the wrapper stays silent on 403 to avoid a duplicate message.
     try:
-        current = _cf_api_get(token, f"/zones/{zone_id}/settings/security_header")
+        apply_hsts(token, fqdn)
     except urllib.error.HTTPError as exc:
         if exc.code == 403:
-            err("CF API returned 403 on /zones/.../settings/security_header.")
-            err("The CLOUDFLARE_API_TOKEN is missing `Zone.Zone Settings:Edit`.")
-            err("Add that permission scope to the token (dashboard → My Profile")
-            err("→ API Tokens → edit) and re-run this command.")
             return
         raise
-    sts = (current.get("result", {})
-                  .get("value", {})
-                  .get("strict_transport_security", {}) or {})
-    if all(sts.get(k) == v for k, v in _HSTS_TARGET.items()):
-        ok(f"HSTS already at target: max_age={sts.get('max_age')} "
-           f"include_subdomains={sts.get('include_subdomains')} "
-           f"preload={sts.get('preload')}")
-        return
-
-    resp = _cf_api_patch(token, f"/zones/{zone_id}/settings/security_header", {
-        "value": {"strict_transport_security": _HSTS_TARGET},
-    })
-    if not resp.get("success"):
-        errors = resp.get("errors") or resp
-        err(f"CF HSTS PATCH failed: {errors}")
+    except RuntimeError as exc:
+        err(f"CF HSTS update failed: {exc}")
         sys.exit(1)
-    new_sts = resp.get("result", {}).get("value", {}).get("strict_transport_security", {})
-    ok(f"HSTS updated: max_age={new_sts.get('max_age')} "
-       f"include_subdomains={new_sts.get('include_subdomains')} "
-       f"preload={new_sts.get('preload')}")
+
+
+# ── cloudflare CIDR allowlist refresh (WS1 Layers 2+3) ─────────────────────────
+
+def _fetch_text(url: str) -> str:
+    """Fetch a URL body as text. Raises on transport error (caller treats as bad).
+
+    A User-Agent is required: www.cloudflare.com sits behind Cloudflare's own bot
+    management, which 403s the default `Python-urllib/x.y` UA. Verified on the host —
+    default UA → 403, browser UA → 200. Without this the WS1 CIDR refresh fails closed
+    and docker-host-config's UFW step FATALs on a fresh deploy.
+    """
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (openirvana maintain.py)"})
+    with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310 (fixed CF host)
+        return resp.read().decode("utf-8")
+
+
+def _parse_cidrs(text: str) -> list[str]:
+    out: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        ipaddress.ip_network(line)  # raises ValueError on garbage → fail-closed
+        out.append(line)
+    return out
+
+
+def _atomic_write(path: Path, data: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(data)
+        # Preserve the existing file's owner + mode across the replace. mkstemp creates
+        # the temp owned by the current (often root) user at 0600; without this, a
+        # root-run rewrite — host-config's harden_ufw CIDR step, or the weekly CIDR
+        # refresh cron — silently leaves .env root-owned, so the non-root deploy user
+        # can no longer read it and run.sh aborts with PermissionError on the next deploy.
+        if path.exists():
+            st = path.stat()
+            _chown = getattr(os, "chown", None)  # Unix-only; absent on Windows dev
+            if _chown is not None:
+                try:
+                    _chown(tmp, st.st_uid, st.st_gid)
+                except PermissionError:
+                    pass  # non-root caller can't chown; ownership already matches anyway
+            os.chmod(tmp, st.st_mode & 0o777)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def _env_set_cidrs(env_path: Path, value: str) -> None:
+    """Replace (or append) CLOUDFLARE_CIDRS="..." preserving all other lines."""
+    lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
+    new = f'CLOUDFLARE_CIDRS="{value}"'
+    replaced = False
+    for i, ln in enumerate(lines):
+        if ln.startswith("CLOUDFLARE_CIDRS="):
+            lines[i] = new
+            replaced = True
+            break
+    if not replaced:
+        lines.append(new)
+    _atomic_write(env_path, "\n".join(lines) + "\n")
+
+
+def cmd_cloudflare_cidrs() -> None:
+    step("cloudflare-cidrs")
+    try:
+        v4 = _parse_cidrs(_fetch_text(_CF_IPS_V4))
+        v6 = _parse_cidrs(_fetch_text(_CF_IPS_V6))
+    except (OSError, ValueError) as exc:
+        print(f"  WARN: CF CIDR fetch/parse failed ({exc}); keeping prior allowlist (fail-closed)")
+        return
+    if len(v4) < _MIN_V4 or len(v6) < _MIN_V6:
+        print(f"  WARN: CF CIDR count below floor (v4={len(v4)}, v6={len(v6)}); keeping prior (fail-closed)")
+        return
+    cidrs = v4 + v6
+    _env_set_cidrs(_ENV_FILE, " ".join(cidrs))
+    _atomic_write(_CF_CIDR_FILE, "\n".join(cidrs) + "\n")
+    print(f"  wrote {len(cidrs)} CF CIDRs to .env (CLOUDFLARE_CIDRS) and {_CF_CIDR_FILE}")
 
 
 # ── nextcloud housekeeping ──────────────────────────────────────────────────────
@@ -1118,7 +769,7 @@ def cmd_manageability() -> int:
     # upstream host is a docker DNS name = the compose *service* name (its
     # network alias), which may differ from the container_name (e.g. service
     # "janus" -> container "janus-gateway"). Resolve both, and strip any
-    # scheme (https://wazuh-dashboard:5601 -> wazuh-dashboard).
+    # scheme (https://grafana:3000 -> grafana).
     missing_backend = []
     try:
         sys.path.insert(0, str(_STACK_DIR / "scripts"))
@@ -1262,10 +913,10 @@ def main() -> None:
             "Subcommands:\n"
             "  backup       Dump all Postgres databases and prune old backups.\n"
             "  intel        Refresh Zeek threat-intel feeds.\n"
-            "  wazuh        Sync Wazuh decoders/rules and merge agent localfiles.\n"
             "  prune        Remove dangling Docker images, unused volumes, and stale builder cache.\n"
             "  cloudflare       Poll Cloudflare security events and write to firewall-events.log.\n"
             "  cloudflare-hsts  PATCH the CF zone HSTS setting to a long policy (idempotent).\n"
+            "  cloudflare-cidrs Refresh Cloudflare IP allowlist in .env and cf-cidrs.txt (fail-closed).\n"
             "  nextcloud        Clear NC admin-overview warnings (window, log rotate, indices, mimetypes).\n"
             "  dashy            Regenerate the Dashy dashboard from live discovery (idempotent).\n"
             "  grafana          Regenerate the Grafana Observability dashboards (idempotent).\n"
@@ -1273,24 +924,24 @@ def main() -> None:
             "  versions         Check images for newer upstream releases; log JSONL for Loki.\n"
             "  entra-sync       Sync Entra group membership into Authentik (set-auth entra-* + oidc --sync).\n"
             "  check-stack      Probe all services; send ntfy alert via n8n if any are unhealthy.\n"
-            "  all              Run backup → intel → wazuh → prune → cloudflare-hsts → nextcloud → dashy → grafana → manageability → versions → entra-sync → check-stack."
+            "  all              Run backup → intel → prune → cloudflare-hsts → nextcloud → dashy → grafana → manageability → versions → entra-sync → check-stack."
         ),
     )
     parser.add_argument(
         "command",
-        choices=["backup", "intel", "wazuh", "prune", "cloudflare", "cloudflare-hsts",
-                 "nextcloud", "dashy", "grafana", "manageability", "versions",
-                 "entra-sync", "check-stack", "all"],
+        choices=["backup", "intel", "prune", "cloudflare", "cloudflare-hsts",
+                 "cloudflare-cidrs", "nextcloud", "dashy", "grafana", "manageability",
+                 "versions", "entra-sync", "check-stack", "all"],
     )
     args = parser.parse_args()
 
     dispatch = {
         "backup":           cmd_backup,
         "intel":            cmd_intel,
-        "wazuh":            cmd_wazuh,
         "prune":            cmd_prune,
         "cloudflare":       cmd_cloudflare,
         "cloudflare-hsts":  cmd_cloudflare_hsts,
+        "cloudflare-cidrs": cmd_cloudflare_cidrs,
         "nextcloud":        cmd_nextcloud,
         "dashy":            cmd_dashy,
         "grafana":          cmd_grafana,
@@ -1300,7 +951,7 @@ def main() -> None:
         "check-stack":      cmd_check_stack,
     }
     if args.command == "all":
-        cmd_backup(); cmd_intel(); cmd_wazuh(); cmd_prune()
+        cmd_backup(); cmd_intel(); cmd_prune()
         cmd_cloudflare_hsts()
         # expensive=False: never run the slow mimetype repair in the nightly
         # window — it can take hours on large instances. Run `maintain.py

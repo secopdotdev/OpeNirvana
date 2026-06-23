@@ -36,10 +36,15 @@ def sync(addr: str, env: EnvFile, mount: str, force: bool) -> int:
 
 def main() -> None:
     base = Path(__file__).resolve().parent.parent
-    env = EnvFile(base / ".env")
     ap = argparse.ArgumentParser()
+    # Optional positional env path — run.sh invokes `bao-sync.py "$ENV_FILE"`, matching the
+    # gen-secrets.py / bao-bootstrap.py contract. Without this, argparse rejected the path
+    # ("unrecognized arguments: …/.env") and the compile step failed closed.
+    ap.add_argument("env_file", nargs="?", default=str(base / ".env"),
+                    help="path to the .env to compile from KV (default: <repo>/unified-stack/.env)")
     ap.add_argument("--force", action="store_true", help="overwrite existing .env values (rotation)")
     args = ap.parse_args()
+    env = EnvFile(Path(args.env_file))
     addr = os.environ.get("BAO_ADDR", "http://127.0.0.1:8200")
     sys.exit(sync(addr, env, env.get("BAO_KV_MOUNT") or "secret", args.force))
 

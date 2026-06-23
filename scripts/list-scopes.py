@@ -1,29 +1,97 @@
-"""List Authentik scope mappings and AFFiNE provider property_mappings."""
-import json
-import urllib.request
+#!/usr/bin/env python3
+"""List Authentik scope mappings and a provider's property_mappings.
+
+Resolves credentials via the project-canonical resolve_admin_token() helper
+(prefers AUTHENTIK_API_TOKEN over AUTHENTIK_BOOTSTRAP_TOKEN) so this script
+keeps working after bootstrap-token revocation (ADR-0017).
+
+Usage:
+    python3 scripts/list-scopes.py [--env PATH] [--provider-id N]
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
 from pathlib import Path
 
-env_file = Path(__file__).parent.parent / ".env"
-env_text = env_file.read_text()
-token = [l.split("=", 1)[1].strip() for l in env_text.splitlines()
-         if l.startswith("AUTHENTIK_BOOTSTRAP_TOKEN=")][0]
-base = "https://example.com/api/v3"
+# ── Ensure scripts/ is on the path so sibling modules are importable ──────────
+_SCRIPTS = Path(__file__).resolve().parent
+if str(_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS))
+
+from utils import AuthentikClient, EnvFile, red, resolve_admin_token
+
+# Default Authentik OAuth2 provider ID to inspect (Nextcloud is provisioned
+# first, so pk 1 on a clean install); override with --provider-id.
+_DEFAULT_PROVIDER_ID: int = 1
 
 
-def req(method, path, body=None):
-    url = base + "/" + path.lstrip("/")
-    data = json.dumps(body).encode() if body else None
-    r = urllib.request.Request(url, data=data, method=method,
-        headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"})
-    with urllib.request.urlopen(r, timeout=20) as resp:
-        return json.loads(resp.read())
+def main(argv: list[str] | None = None) -> int:
+    """Entry point; returns an exit code."""
+    parser = argparse.ArgumentParser(
+        description="List Authentik scope mappings and a provider's property_mappings."
+    )
+    _stack_env = Path(__file__).resolve().parent.parent / ".env"
+    parser.add_argument(
+        "--env",
+        default=str(_stack_env),
+        metavar="PATH",
+        help="Path to the .env file (default: <unified-stack>/.env)",
+    )
+    parser.add_argument(
+        "--provider-id",
+        type=int,
+        default=_DEFAULT_PROVIDER_ID,
+        metavar="N",
+        help=f"Authentik OAuth2 provider ID to inspect (default: {_DEFAULT_PROVIDER_ID})",
+    )
+    args = parser.parse_args(argv)
+
+    env_path = Path(args.env)
+    if not env_path.exists():
+        red(f".env not found: {env_path}")
+        return 1
+
+    env = EnvFile(env_path)
+
+    # ── Resolve admin token (ADR-0017: prefers AUTHENTIK_API_TOKEN) ───────────
+    token = resolve_admin_token(env)
+    if not token:
+        red(
+            "No Authentik admin token found. "
+            "Set AUTHENTIK_API_TOKEN (preferred) or AUTHENTIK_BOOTSTRAP_TOKEN in .env."
+        )
+        return 1
+
+    # ── Build base URL from .env ───────────────────────────────────────────────
+    auth_sub = env.get("AUTHENTIK_SUBDOMAIN") or "auth"
+    public_fqdn = env.get("PUBLIC_FQDN")
+    if not public_fqdn:
+        red("PUBLIC_FQDN not set in .env")
+        return 1
+
+    base_url = f"https://{auth_sub}.{public_fqdn}"
+    ak = AuthentikClient(base_url, token)
+
+    # ── List all scope mappings ────────────────────────────────────────────────
+    mappings = ak.get("propertymappings/scope/")
+    print("All scope mappings:")
+    for m in mappings.get("results", []):
+        print(
+            "  pk=%s  scope=%s  name=%s"
+            % (m["pk"], m.get("scope_name", ""), m["name"])
+        )
+
+    # ── Provider property_mappings ─────────────────────────────────────────────
+    provider = ak.get(f"providers/oauth2/{args.provider_id}/")
+    print(
+        f"\nProvider {args.provider_id} property_mappings:",
+        provider.get("property_mappings", []),
+    )
+
+    return 0
 
 
-mappings = req("GET", "propertymappings/scope/")
-print("All scope mappings:")
-for m in mappings["results"]:
-    print("  pk=%s  scope=%s  name=%s" % (m["pk"], m.get("scope_name", ""), m["name"]))
-
-# AFFiNE provider details (provider ID 4 — update if provider ID changes)
-provider = req("GET", "providers/oauth2/4/")
-print("\nAFFiNE provider property_mappings:", provider.get("property_mappings", []))
+if __name__ == "__main__":
+    sys.exit(main())

@@ -21,7 +21,7 @@ import urllib.request
 from pathlib import Path
 from urllib.parse import urlparse
 
-from utils import AuthentikClient, EnvFile
+from utils import AuthentikClient, EnvFile, resolve_admin_token
 
 _STACK_DIR = Path(__file__).resolve().parent.parent
 
@@ -161,7 +161,7 @@ def run(args, env: EnvFile) -> int:
     caddy = cs.parse_caddyfile(caddyfile_path, env_dict)
 
     domain   = env_dict.get("PUBLIC_FQDN", "")
-    ak_token = env_dict.get("AUTHENTIK_BOOTSTRAP_TOKEN", "")
+    ak_token = resolve_admin_token(env_dict)
 
     if not domain:
         print("ERROR: PUBLIC_FQDN not set in .env", file=sys.stderr)

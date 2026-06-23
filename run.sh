@@ -21,9 +21,9 @@
 #   --branch BRANCH         Branch to deploy (default: main)
 #   --tag TAG               Checkout this release tag; "latest" resolves newest
 #
-#   --profile PROFILE       Activate a compose profile (repeatable)
-#                           Valid values: apps, media
-#                           Default: auto-detect from running containers + prompt
+#   --profile PROFILE       Override STACK_PROFILES with this fine profile or bundle
+#                           (repeatable). Valid: any profile/bundle (profiles.py --list).
+#                           Default: read STACK_PROFILES from .env
 #
 #   --env SOURCE            Copy SOURCE file as .env before deploying
 #   --copy-env              Copy .env.example → .env if .env is missing
@@ -128,6 +128,57 @@ _env_get() {
     local key="$1" path="$2"
     [[ -f "$path" ]] || { echo ""; return; }
     awk -F= -v k="$key" '$1==k { sub(/^[^=]*=/,""); sub(/[[:space:]]*#.*$/,""); gsub(/^[[:space:]]+|[[:space:]]+$/,""); print; exit }' "$path"
+}
+
+# Idempotent upsert KEY=VALUE in a .env file, but ONLY when the key is absent or its
+# current value is blank — a human-set value always wins (authority: human > inference >
+# blank). Returns 0 if it wrote, 1 if it left an existing non-blank value untouched.
+_env_set_if_blank() {
+    local key="$1" val="$2" path="$3"
+    [[ -n "$(_env_get "$key" "$path")" ]] && return 1
+    if grep -q "^${key}=" "$path" 2>/dev/null; then
+        _as_user sed -i "s|^${key}=.*|${key}=${val}|" "$path"
+    else
+        printf '%s=%s\n' "$key" "$val" | _as_user tee -a "$path" >/dev/null
+    fi
+    return 0
+}
+
+# Detect host RAM tier from /proc/meminfo and write RESOURCE_TIER only-if-blank. Thresholds
+# (GB) match README "Choose your deployment": ≤12 MICRO, ≤20 LOW, ≤44 MED, ≤96 HIGH, else
+# MAX. Advisory only — the tier does NOT change which services deploy; it tells the operator
+# which per-service *_MEM_LIMIT preset block (.env "PERFORMANCE TIERING") to uncomment.
+detect_host_ram() {
+    local mem_kb mem_gb tier existing
+    mem_kb="$(awk '/^MemTotal:/{print $2; exit}' /proc/meminfo 2>/dev/null)"
+    if [[ -z "$mem_kb" ]]; then
+        c_yel "  Could not read /proc/meminfo — skipping RESOURCE_TIER auto-detect."
+        return
+    fi
+    mem_gb=$(( mem_kb / 1024 / 1024 ))
+    if   (( mem_gb <= 12 )); then tier="MICRO"
+    elif (( mem_gb <= 20 )); then tier="LOW"
+    elif (( mem_gb <= 44 )); then tier="MED"
+    elif (( mem_gb <= 96 )); then tier="HIGH"
+    else                          tier="MAX"; fi
+
+    existing="$(_env_get RESOURCE_TIER "$ENV_FILE")"
+    if [[ -n "$existing" ]]; then
+        c_grn "  RESOURCE_TIER=$existing (operator-set; auto-detect skipped — host ~${mem_gb} GB → $tier)"
+    elif $DRY_RUN; then
+        c_yel "  [dry-run] would set RESOURCE_TIER=$tier (host ~${mem_gb} GB)"
+        existing="$tier"
+    else
+        _env_set_if_blank RESOURCE_TIER "$tier" "$ENV_FILE" \
+            && c_grn "  RESOURCE_TIER=$tier (auto-detected from ~${mem_gb} GB host RAM)"
+        existing="$tier"
+    fi
+
+    # Advisory for genuinely small hosts still on the generous MAX/HIGH preset defaults.
+    if [[ "$existing" == "MICRO" || "$existing" == "LOW" ]]; then
+        c_yel "  Host RAM is ~${mem_gb} GB ($existing). Per-service memory limits default to the HIGH"
+        c_yel "  preset — uncomment the matching tier block in .env and/or trim STACK_PROFILES to avoid OOM."
+    fi
 }
 
 # Dump the last 30 log lines of every container whose health is not 'healthy'.
@@ -287,6 +338,28 @@ require_cmd() {
 }
 
 require_cmd git
+
+# ── Fresh-host detection ──────────────────────────────────────────────────────────
+# On a brand-new host docker is not yet installed. Detect that and run the full
+# host-bootstrap before proceeding (installs Docker, creates /dock tree, etc.).
+# The bootstrap requires root; we re-exec under sudo if we're not already root.
+if ! command -v docker &>/dev/null; then
+    c_hdr "Fresh host detected — running docker-host-config.sh bootstrap"
+    HOST_CONFIG="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/scripts/docker-host-config.sh"
+    if [[ ! -f "$HOST_CONFIG" ]]; then
+        # Script is running from a curl pipe before the repo exists — clone first,
+        # then re-exec so BASH_SOURCE resolves correctly.
+        die "docker-host-config.sh not found. Run: git clone <repo> && sudo bash run.sh"
+    fi
+    if [[ $EUID -ne 0 ]]; then
+        c_yel "  Bootstrap requires root. Re-running with sudo..."
+        exec sudo bash "$0" "$@"
+    fi
+    bash "$HOST_CONFIG" main
+    # Re-exec as the real user to continue the deploy with the freshly installed Docker.
+    exec bash "$0" "$@"
+fi
+
 require_cmd docker
 
 # ── Repository discovery ─────────────────────────────────────────────────────────
@@ -443,14 +516,15 @@ if $DO_PULL; then
         fi
     fi
 
-    # Report local edits to TRACKED files — they are about to be discarded. The
-    # deploy box mirrors the repo authoritatively: tracked files reset to origin,
-    # while .env (gitignored) and every untracked file are left untouched. This
-    # also self-heals a tree left unmerged by an interrupted previous run.
+    # Detect local edits to tracked files. A deploy box should mirror origin
+    # exactly; local edits indicate an operator mistake or an interrupted merge.
+    # We fail-closed rather than silently discarding — use --no-pull to skip
+    # git sync if you intentionally have local changes.
     local_changes="$(_as_user git -C "$REPO_ROOT" status --porcelain --untracked-files=no 2>/dev/null || true)"
     if [[ -n "$local_changes" ]]; then
-        c_yel "  Local edits to tracked files detected — discarding (deploy box mirrors origin):"
+        c_red "  Local edits to tracked files detected:"
         printf '%s\n' "$local_changes" | sed 's/^/      /' >&2
+        die "Aborting — deploy box must not have local tracked changes. Stash or commit them, or pass --no-pull to skip git sync."
     fi
 
     if [[ -n "$TAG" ]]; then
@@ -465,9 +539,9 @@ if $DO_PULL; then
         c_cyn "  Updating $BRANCH from origin"
         if ! $DRY_RUN; then
             _as_user git -C "$REPO_ROOT" fetch origin "$BRANCH"
-            _as_user git -C "$REPO_ROOT" reset --hard "origin/$BRANCH"
+            _as_user git -C "$REPO_ROOT" merge --ff-only "origin/$BRANCH"
         else
-            c_yel "  [dry-run] git fetch origin $BRANCH && git reset --hard origin/$BRANCH"
+            c_yel "  [dry-run] git fetch origin $BRANCH && git merge --ff-only origin/$BRANCH"
         fi
     fi
 
@@ -582,17 +656,23 @@ elif [[ -n "$_ts_cid" && -z "$_ts_key" ]]; then
     c_yel "  Or pass --tailscale to this script to provision automatically."
 fi
 
-# ── Profile selection (fine-grained, dependency-checked) ───────────────────────────
-# Deployment modularity: STACK_PROFILES (fine profile names) + CUSTOM_COMPOSE_PROFILE
-# (individual service short-names) in .env drive which services deploy. Every service
-# is tagged `profiles: [<fine-profile>, <self-name>]`, so both knobs feed
-# COMPOSE_PROFILES uniformly. `core` infra is always forced on. scripts/profiles.py is
-# the single source of truth + dependency doctor. RBAC categories are a separate concern
-# (see set-auth.py); they are NOT deployment profiles.
-c_hdr "Profile selection"
+# ── Resource tier detection ────────────────────────────────────────────────────────
+c_hdr "Resource tier"
+detect_host_ram
+
+# ── Service selection (resolver-driven, dependency-checked) — ADR-0015 ─────────────
+# scripts/profiles.py (SSoT reader of profiles.toml) resolves STACK_PROFILES (fine
+# profiles OR bundle names) + SERVICE_ENABLE − SERVICE_DISABLE into an explicit service
+# list, fail-closed on HARD-dependency / core / unknown violations. run.sh then runs
+# `docker compose up -d <list>` — an explicitly-named service starts regardless of active
+# profiles. COMPOSE_PROFILES is persisted to .env as the resolved services' self-name
+# profiles, so `--remove-orphans` and manual `docker compose` calls stay aligned to this
+# exact set. RBAC categories are a separate concern (set-auth.py), NOT deployment profiles.
+c_hdr "Service selection"
 
 _stack_profiles="$(_env_get STACK_PROFILES "$ENV_FILE")"
-_custom_services="$(_env_get CUSTOM_COMPOSE_PROFILE "$ENV_FILE")"
+_service_enable="$(_env_get SERVICE_ENABLE "$ENV_FILE")"
+_service_disable="$(_env_get SERVICE_DISABLE "$ENV_FILE")"
 
 # CLI --profile args override STACK_PROFILES when given.
 if [[ ${#PROFILES[@]} -gt 0 ]]; then
@@ -601,46 +681,42 @@ fi
 # Default to the full functional set when nothing is configured (preserves the
 # all-services OOTB / one-liner deploy).
 if [[ -z "$_stack_profiles" ]]; then
-    _stack_profiles="$(_as_user python3 "$STACK_DIR/scripts/profiles.py" --list >/dev/null 2>&1; \
-        _as_user python3 -c 'import sys; sys.path.insert(0,"'"$STACK_DIR"'/scripts"); import profiles; print(",".join(p for p in profiles.PROFILES if p!="core"))')"
+    _stack_profiles="$(_as_user python3 -c 'import sys; sys.path.insert(0,"'"$STACK_DIR"'/scripts"); import profiles; print(",".join(p for p in profiles.PROFILES if p!="core"))')"
     c_yel "  STACK_PROFILES unset — defaulting to full stack."
 fi
-# core is always required.
-case ",$_stack_profiles," in *,core,*) : ;; *) _stack_profiles="core${_stack_profiles:+,$_stack_profiles}" ;; esac
 
-# Dependency doctor: HARD violations / unknown names / core omission.
-if ! _as_user python3 "$STACK_DIR/scripts/profiles.py" --check \
-        --profiles "$_stack_profiles" --services "$_custom_services"; then
-    c_red "  Profile dependency check found HARD violations or unknown names (see above)."
-    if $YES_MODE; then
-        die "Refusing to deploy with HARD dependency violations under -y (run interactively to override)."
-    fi
-    prompt_yn "Proceed anyway despite BREAKING dependency issues?" false \
-        || die "Aborted on dependency violations."
-fi
+# Human-readable dependency report (effective set + HARD/SOFT/disable diagnostics).
+_as_user python3 "$STACK_DIR/scripts/profiles.py" \
+    --profiles "$_stack_profiles" --enable "$_service_enable" --disable "$_service_disable" || true
 
-# Merge fine profiles + cherry-picked services into COMPOSE_PROFILES (deduped).
-COMPOSE_PROFILES="$(printf '%s,%s' "$_stack_profiles" "$_custom_services" \
-    | tr ',' '\n' | sed '/^$/d' | sort -u | paste -sd,)"
-export COMPOSE_PROFILES
-c_grn "  COMPOSE_PROFILES=$COMPOSE_PROFILES"
+# Machine-readable resolve → the explicit service list. profiles.py --resolve exits
+# non-zero (printing the offending name/pair to stderr) on HARD / disable-HARD / core /
+# unknown violations — fail-closed: abort BEFORE any compose action (ADR-0015).
+_resolved="$(_as_user python3 "$STACK_DIR/scripts/profiles.py" --resolve \
+    --profiles "$_stack_profiles" --enable "$_service_enable" --disable "$_service_disable")" \
+    || die "Service resolution failed (see above). Fix STACK_PROFILES / SERVICE_ENABLE / SERVICE_DISABLE in $ENV_FILE, then re-run."
 
-# Persist to .env so maintain.py + manual `docker compose` calls use the same
-# active set (otherwise a bare `docker compose up/down` would target nothing now
-# that every service is profile-tagged). Idempotent upsert; .env is deploy-user owned.
+# shellcheck disable=SC2206
+RESOLVED_SVCS=( $_resolved )
+[[ ${#RESOLVED_SVCS[@]} -gt 0 ]] || die "Resolver produced an empty service list — check STACK_PROFILES in $ENV_FILE."
+c_grn "  Resolved ${#RESOLVED_SVCS[@]} services: ${RESOLVED_SVCS[*]}"
+
+# Persist COMPOSE_PROFILES = the resolved services' self-name profiles (every service is
+# tagged `profiles: [<fine-profile>, <self-name>]`). Keeping it equal to the resolved set
+# means a SERVICE_DISABLE'd service (absent here) carries no active profile, so
+# `--remove-orphans` prunes it on the next deploy and manual `docker compose` calls match.
+# Idempotent upsert; .env is deploy-user owned.
+COMPOSE_PROFILES="$(printf '%s\n' "${RESOLVED_SVCS[@]}" | sort -u | paste -sd,)"
 if grep -q '^COMPOSE_PROFILES=' "$ENV_FILE" 2>/dev/null; then
     _as_user sed -i "s|^COMPOSE_PROFILES=.*|COMPOSE_PROFILES=$COMPOSE_PROFILES|" "$ENV_FILE"
 else
     printf 'COMPOSE_PROFILES=%s\n' "$COMPOSE_PROFILES" | _as_user tee -a "$ENV_FILE" >/dev/null
 fi
 
-# ── Build docker compose command ─────────────────────────────────────────────────
-# COMPOSE_PROFILES (exported) is honored by docker compose; pass --profile too so the
-# explicit command is self-contained and visible.
+# ── Build docker compose base command ────────────────────────────────────────────
+# Explicit-service-list driven: no --profile flags. The resolved list is passed to `up`
+# below; explicit names start profiled services and --remove-orphans prunes the rest.
 COMPOSE_CMD=(docker compose -f "$STACK_DIR/docker-compose.yml" --project-directory "$STACK_DIR")
-while IFS= read -r p; do
-    [[ -n "$p" ]] && COMPOSE_CMD+=(--profile "$p")
-done < <(printf '%s\n' "$COMPOSE_PROFILES" | tr ',' '\n')
 
 # ── OpenBao bootstrap (pre-deploy) ──────────────────────────────────────────────
 # Bring OpenBao up first (isolated compose up) so the secrets backend is ready
@@ -648,7 +724,8 @@ done < <(printf '%s\n' "$COMPOSE_PROFILES" | tr ',' '\n')
 #   1. compose up openbao (detached)
 #   2. wait for `bao status` rc 0 (active) or 2 (sealed — expected on fresh start)
 #   3. bao-bootstrap.py — idempotent init + Shamir unseal/escrow + AppRole provision
-#   4. gen-secrets.py --target bao — seed KV write-if-absent
+#   4. gen-secrets.py --target bao — seed KV write-if-absent (generated secrets)
+#   4a. komodo-creds.py seed — seed operator-provided Komodo/OIDC secrets (if KOMODO_PASSKEY set)
 #   5. bao-sync.py — AppRole login → read KV → compile .env (write-if-blank)
 # Idempotent: re-running on a live stack is safe; all scripts check before writing.
 # BAO_ADDR uses openbao's static Docker network IP (security net 192.0.2.10) because
@@ -656,20 +733,16 @@ done < <(printf '%s\n' "$COMPOSE_PROFILES" | tr ',' '\n')
 # readiness poll (inside-container 127.0.0.1:8200) to avoid any network dependency.
 c_hdr "OpenBao secrets backend bootstrap"
 
-_bao_profiles="$COMPOSE_PROFILES"
-# openbao is in the 'security' profile — always force it here so it starts even
-# if the caller limited profiles to a subset that omits security.
-case ",$_bao_profiles," in *,security,*) : ;; *) _bao_profiles="security${_bao_profiles:+,$_bao_profiles}" ;; esac
+# openbao is core (always in the resolved set) — bring it up by explicit name; an
+# explicitly-named service starts regardless of active profiles, so no --profile is needed.
 _bao_up_cmd=(docker compose -f "$STACK_DIR/docker-compose.yml" --project-directory "$STACK_DIR")
-while IFS= read -r _p; do
-    [[ -n "$_p" ]] && _bao_up_cmd+=(--profile "$_p")
-done < <(printf '%s\n' "$_bao_profiles" | tr ',' '\n')
 
 if $DRY_RUN; then
     c_yel "  [dry-run] ${_bao_up_cmd[*]} up -d openbao"
     c_yel "  [dry-run] wait for bao status rc 0|2"
-    c_yel "  [dry-run] python3 $STACK_DIR/scripts/bao-bootstrap.py $ENV_FILE"
+    c_yel "  [dry-run] python3 $STACK_DIR/scripts/bao-bootstrap.py"
     c_yel "  [dry-run] python3 $STACK_DIR/scripts/gen-secrets.py $ENV_FILE --target bao"
+    c_yel "  [dry-run] python3 $STACK_DIR/scripts/komodo-creds.py seed (if KOMODO_PASSKEY set)"
     c_yel "  [dry-run] python3 $STACK_DIR/scripts/bao-sync.py $ENV_FILE"
 else
     c_cyn "  Starting openbao container..."
@@ -691,16 +764,45 @@ else
     c_grn "  OpenBao API ready (bao status rc=$_bao_rc)."
 
     c_cyn "  Running bao-bootstrap.py (init + unseal escrow + AppRole)..."
+    # bao-bootstrap writes the unseal-key + root-token escrow (init.json) into
+    # ${DOCK_CONF}/openbao, which lives under /dock (owner svc-user:media, mode 770).
+    # The deploy user has NO access to /dock by design — init.json is root-only escrow
+    # the openbao container must never see — so this one step runs as ROOT (sudo), unlike
+    # the .env-writing steps below. `sudo` is a no-op when run.sh is already root-elevated.
+    # bao-bootstrap.py takes no positional .env arg — it locates STACK_DIR/.env itself
+    # (its only flag is --store; default 'env' escrows to init.json, correct on Linux
+    # where DPAPI is unavailable). Passing $ENV_FILE made argparse exit 2, so the vault
+    # was never initialized/unsealed and every downstream secret step failed.
     _run_optional_step "bao-bootstrap" \
-        _as_user BAO_ADDR=http://192.0.2.10:8200 python3 "$STACK_DIR/scripts/bao-bootstrap.py" "$ENV_FILE"
+        sudo env BAO_ADDR=http://192.0.2.10:8200 python3 "$STACK_DIR/scripts/bao-bootstrap.py"
+    # bao-bootstrap also appends the least-privilege AppRole creds (BAO_SYNC_ROLE_ID/
+    # SECRET_ID) to .env as root; restore .env to the deploy user so the admin-run
+    # gen-secrets/bao-sync steps below — and the running stack — can read it.
+    if [[ -f "$ENV_FILE" ]]; then sudo chown "$_REAL_UID:$_REAL_UID" "$ENV_FILE" || true; fi
 
     c_cyn "  Running gen-secrets.py --target bao (seed KV write-if-absent)..."
+    # Runs as ROOT (like bao-bootstrap above): seeding the KV needs the OpenBao
+    # root token, which lives in the root-only init.json escrow the deploy user
+    # cannot read. --target bao writes only to the KV (network); it creates no
+    # on-disk artifacts, so running as root leaves no root-owned files behind.
+    # (A least-privilege RW AppRole is the future refinement — the BAO_SYNC_ROLE
+    # used by bao-sync is read-only by policy, so it cannot seed KV.)
     _run_optional_step "gen-secrets-bao" \
-        _as_user BAO_ADDR=http://192.0.2.10:8200 python3 "$STACK_DIR/scripts/gen-secrets.py" "$ENV_FILE" --target bao
+        sudo env BAO_ADDR=http://192.0.2.10:8200 python3 "$STACK_DIR/scripts/gen-secrets.py" "$ENV_FILE" --target bao
 
     c_cyn "  Running bao-sync.py (compile .env from KV)..."
     _run_optional_step "bao-sync" \
-        _as_user BAO_ADDR=http://192.0.2.10:8200 python3 "$STACK_DIR/scripts/bao-sync.py" "$ENV_FILE"
+        _as_user env BAO_ADDR=http://192.0.2.10:8200 python3 "$STACK_DIR/scripts/bao-sync.py" "$ENV_FILE"
+fi
+
+# ── Pre-deploy: preflight validator ─────────────────────────────────────────────
+# Fail fast before touching running containers.
+c_hdr "Preflight checks"
+if $DRY_RUN; then
+    c_yel "  [dry-run] python3 $STACK_DIR/scripts/preflight.py --env $ENV_FILE"
+elif [[ -f "$STACK_DIR/scripts/preflight.py" ]]; then
+    _as_user python3 "$STACK_DIR/scripts/preflight.py" --env "$ENV_FILE" \
+        || die "Preflight failed — fix the issues above before deploying."
 fi
 
 # ── Deploy ───────────────────────────────────────────────────────────────────────
@@ -713,14 +815,62 @@ if $DO_DOWN; then
     $DRY_RUN || "${down_cmd[@]}"
 fi
 
-up_cmd=("${COMPOSE_CMD[@]}" up -d --remove-orphans)
+up_cmd=("${COMPOSE_CMD[@]}" up -d "${RESOLVED_SVCS[@]}" --remove-orphans)
 $DO_BUILD && up_cmd+=(--build)
+
+# --wait: block until every service with a healthcheck reports healthy.
+# Supported in Docker Compose v2.1+. Fall back gracefully on older installs.
+if docker compose up --help 2>/dev/null | grep -q '\-\-wait'; then
+    up_cmd+=(--wait --wait-timeout 300)
+fi
+
+# Snapshot which services are already running before this deploy, so a
+# failed up can roll back only the newly started services.
+_pre_deploy_svcs=()
+if ! $DRY_RUN; then
+    while IFS= read -r _svc; do
+        [[ -n "$_svc" ]] && _pre_deploy_svcs+=("$_svc")
+    done < <(docker compose -f "$STACK_DIR/docker-compose.yml" --project-directory "$STACK_DIR" \
+        ps --services --status running 2>/dev/null || true)
+fi
 
 c_cyn "  $ ${up_cmd[*]}"
 if $DRY_RUN; then
     c_yel "  [dry-run] skipping deploy."
 else
-    "${up_cmd[@]}"
+    if ! "${up_cmd[@]}"; then
+        c_red "  docker compose up failed — rolling back newly started services"
+        # Determine which services are new (running now but were not before).
+        _new_svcs=()
+        while IFS= read -r _svc; do
+            [[ -z "$_svc" ]] && continue
+            _was_running=false
+            for _pre in "${_pre_deploy_svcs[@]}"; do
+                [[ "$_pre" == "$_svc" ]] && { _was_running=true; break; }
+            done
+            $_was_running || _new_svcs+=("$_svc")
+        done < <(docker compose -f "$STACK_DIR/docker-compose.yml" --project-directory "$STACK_DIR" \
+            ps --services --status running 2>/dev/null || true)
+
+        if [[ ${#_new_svcs[@]} -gt 0 ]]; then
+            c_yel "  Stopping newly started services: ${_new_svcs[*]}"
+            docker compose -f "$STACK_DIR/docker-compose.yml" --project-directory "$STACK_DIR" \
+                stop "${_new_svcs[@]}" 2>/dev/null || true
+        fi
+        die "Deploy failed; newly started services rolled back. Check logs: docker compose logs --tail=50"
+    fi
+
+    # Write run-state file on success (used by doctor mode and future rollback).
+    _state_dir="/dock/conf"
+    if [[ -d "$_state_dir" ]]; then
+        _git_sha="$(_as_user git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo "unknown")"
+        printf '{"deployed_at":"%s","branch":"%s","git_sha":"%s","services":[%s]}\n' \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            "${TAG:-$BRANCH}" \
+            "$_git_sha" \
+            "$(printf '"%s",' "${RESOLVED_SVCS[@]}" | sed 's/,$//')" \
+            > "$_state_dir/.run-state.json" 2>/dev/null || true
+    fi
 fi
 
 # ── Post-deploy: status ──────────────────────────────────────────────────────────
@@ -740,7 +890,7 @@ if $DO_FIX_PERMS && ! $DRY_RUN; then
 fi
 
 # ── Post-deploy: set-auth.py oidc ────────────────────────────────────────────────
-if $DO_OIDC || (! $NO_PROMPT && prompt_yn "Run set-auth.py oidc to provision OIDC providers in Authentik?"); then
+if $DO_OIDC || $YES_MODE || (! $NO_PROMPT && prompt_yn "Run set-auth.py oidc to provision OIDC providers in Authentik?"); then
     c_cyn "  Running set-auth.py oidc"
     _run_optional_step "set-auth-oidc" \
         _as_user python3 "$STACK_DIR/scripts/set-auth.py" --env "$ENV_FILE" oidc
@@ -751,6 +901,22 @@ if $DO_SETUP_AUTHENTIK || ($YES_MODE && ! $NO_PROMPT); then
     c_cyn "  Running set-auth.py authentik"
     _run_optional_step "set-auth-authentik" \
         _as_user python3 "$STACK_DIR/scripts/set-auth.py" --env "$ENV_FILE" authentik
+
+    # Revoke the bootstrap token now that authentik provisioning is complete.
+    # Idempotent — no-ops if already revoked. Runs immediately after authentik
+    # setup so the token is never left live longer than necessary (M006).
+    c_cyn "  Revoking Authentik bootstrap token (post-provisioning)"
+    _run_optional_step "revoke-bootstrap-token" \
+        _as_user python3 "$STACK_DIR/scripts/set-auth.py" --env "$ENV_FILE" revoke-bootstrap-token
+fi
+
+# ── Post-deploy: ntfy ACL provisioning (M002) ────────────────────────────────────
+# Grants write-only access to alerting topics; probes for 200 (not 403).
+# No-op when the ntfy container is not in the active profile.
+if [[ -f "$STACK_DIR/scripts/ntfy-setup.py" ]]; then
+    c_cyn "  Provisioning ntfy ACL"
+    _run_optional_step "ntfy-setup" \
+        _as_user python3 "$STACK_DIR/scripts/ntfy-setup.py"
 fi
 
 # ── Post-deploy: set-auth.py nextcloud-oidc ──────────────────────────────────────

@@ -23,41 +23,42 @@ _STACK = Path(__file__).resolve().parent.parent
 # name as returned by parse_caddyfile (e.g. `falco`, `authentik`, not the
 # container names `falcosidekick-ui`, `authentik-server`).
 ENRICHMENT: dict[str, dict] = {
-    # Security
-    "wazuh":            {"title": "Wazuh SIEM", "icon": "hl-wazuh", "category": "Security",
-                         "description": "SIEM · threat detection · log analysis"},
+    # ── Security (netsec / edr — defense · detection · response) ──────────────
     "crowdsec":         {"title": "CrowdSec", "icon": "hl-crowdsec", "category": "Security",
                          "description": "Community IPS · Caddy bouncer"},
     "falco":            {"title": "Falco", "icon": "hl-falco", "category": "Security",
                          "description": "Runtime syscall · container security"},
     "zeek":             {"title": "Zeek", "icon": "hl-zeek", "category": "Security",
                          "description": "Network security monitor · logs"},
-    "redpanda-console": {"title": "Kafka / Redpanda", "icon": "hl-redpanda", "category": "Security",
-                         "description": "Event streaming · security telemetry"},
-    # Monitoring
+    # ── Monitoring (health — observability · metrics · analytics) ─────────────
     "grafana":          {"title": "Grafana", "icon": "hl-grafana", "category": "Monitoring",
                          "description": "Metrics · health dashboards"},
-    "dockhand":         {"title": "Dockhand", "icon": "hl-portainer", "category": "Monitoring",
-                         "description": "Container management · lifecycle"},
-    # Identity
+    "clickhouse":       {"title": "ClickHouse", "icon": "hl-clickhouse", "category": "Monitoring",
+                         "description": "Analytics database · /play SQL"},
+    # ── Identity (who goes there) ─────────────────────────────────────────────
     "authentik":        {"title": "Authentik", "icon": "hl-authentik", "category": "Identity",
                          "description": "SSO · identity provider"},
-    # Apps
+    # ── Admin (container · automation · secrets · launcher) ───────────────────
+    "openbao":          {"title": "OpenBao", "icon": "hl-vault", "category": "Admin",
+                         "description": "Secrets engine · vault"},
+    "n8n":              {"title": "n8n", "icon": "hl-n8n", "category": "Admin",
+                         "description": "Workflow automation · SOAR"},
+    "dashy":            {"title": "Dashy", "icon": "hl-dashy", "category": "Admin",
+                         "description": "This landing page"},   # apex-served; not a tile
+    # ── Apps (life — daily drivers) ───────────────────────────────────────────
     "nextcloud":        {"title": "Nextcloud", "icon": "hl-nextcloud", "category": "Apps",
                          "description": "Files · calendar · contacts · office"},
-    "affine":           {"title": "AFFiNE", "icon": "hl-affine", "category": "Apps",
-                         "description": "Knowledge base · collaborative docs"},
+    "couchdb":          {"title": "Obsidian Sync", "icon": "hl-couchdb", "category": "Apps",
+                         "description": "CouchDB · obsidian-livesync sync server"},
     "vikunja":          {"title": "Vikunja", "icon": "hl-vikunja", "category": "Apps",
                          "description": "Projects · task tracking"},
     "tandoor":          {"title": "Tandoor", "icon": "hl-tandoor", "category": "Apps",
                          "description": "Recipes · meal planning"},
-    "n8n":              {"title": "n8n", "icon": "hl-n8n", "category": "Apps",
-                         "description": "Workflow automation · SOAR"},
     "immich":           {"title": "Immich", "icon": "hl-immich", "category": "Apps",
                          "description": "Photo · video library"},
     "ntfy":             {"title": "ntfy", "icon": "hl-ntfy", "category": "Apps",
                          "description": "Push notifications"},
-    # Media
+    # ── Media (stream · collect · enjoy) ──────────────────────────────────────
     "jellyfin":         {"title": "Jellyfin", "icon": "hl-jellyfin", "category": "Media",
                          "description": "Media server · streaming"},
     "jellyseerr":       {"title": "Jellyseerr", "icon": "hl-jellyseerr", "category": "Media",
@@ -72,19 +73,24 @@ ENRICHMENT: dict[str, dict] = {
                          "description": "Music management"},
     "qbittorrent":      {"title": "qBittorrent", "icon": "hl-qbittorrent", "category": "Media",
                          "description": "Download client"},
-    # Non-UI routes — no tile.
+    # ── Non-UI / internal routes — no tile (hidden) ──────────────────────────
     "spreed-signaling": {"hidden": True},   # Talk HPB WebSocket endpoint
-    "janus":            {"hidden": True},   # WebRTC admin API
+    "janus":            {"hidden": True},   # WebRTC admin API (no human UI)
     "notify-push":      {"hidden": True},   # Nextcloud push daemon
     "flaresolverr":     {"hidden": True},   # internal *arr captcha solver, no UI
-    "authentik-proxy":  {"hidden": True},   # outpost
+    "authentik-proxy":  {"hidden": True},   # outpost / forward-auth endpoint
 }
 
-CATEGORY_ORDER = ["Security", "Monitoring", "Identity", "Apps", "Media", "Services"]
+# Sections, highest-use-first. Every ENRICHMENT `category` MUST appear here AND
+# in CATEGORY_META — a category present in ENRICHMENT but absent here silently
+# drops its tiles (render() iterates CATEGORY_ORDER only); a CATEGORY_ORDER key
+# missing from CATEGORY_META raises KeyError when that section is non-empty.
+CATEGORY_ORDER = ["Security", "Monitoring", "Identity", "Admin", "Apps", "Media", "Services"]
 CATEGORY_META = {
     "Security":   ("fas fa-shield-halved", "Defense · detection · response"),
-    "Monitoring": ("fas fa-chart-line", "Eyes on glass"),
+    "Monitoring": ("fas fa-chart-line", "Observability · metrics · analytics"),
     "Identity":   ("fas fa-key", "Who goes there"),
+    "Admin":      ("fas fa-sliders", "Control · automation · secrets"),
     "Apps":       ("fas fa-grid-2", "Daily drivers"),
     "Media":      ("fas fa-play-circle", "Stream · collect · enjoy"),
     "Services":   ("fas fa-cubes", "Everything else"),
@@ -164,9 +170,11 @@ def render(matchers: dict[str, str], fqdn: str, nav: dict[str, str]) -> str:
             "title": f"{fqdn} // ops",
             "description": "example.com · Operations Center · stay frosty",
             "navLinks": [
-                {"title": "Grafana",   "path": navp("GRAFANA_SUBDOMAIN", "dash")},
-                {"title": "Dockhand",  "path": navp("DOCKHAND_SUBDOMAIN", "dock")},
-                {"title": "Authentik", "path": navp("AUTHENTIK_SUBDOMAIN", "auth")},
+                {"title": "Grafana",         "path": navp("GRAFANA_SUBDOMAIN", "dash")},
+                # WS5 resource-health dashboard lives at the Grafana subdomain;
+                # link to the Grafana home so it survives a dashboard-UID change.
+                {"title": "Resource Health", "path": navp("GRAFANA_SUBDOMAIN", "dash")},
+                {"title": "Authentik",       "path": navp("AUTHENTIK_SUBDOMAIN", "auth")},
             ],
         },
         "appConfig": {

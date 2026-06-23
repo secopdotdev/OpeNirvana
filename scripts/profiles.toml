@@ -1,9 +1,10 @@
 # profiles.toml — data for unified-stack/scripts/profiles.py
 #
 # Single source of truth for the stack's deployment profiles, RBAC categories,
-# and cross-profile dependency map. profiles.py loads this at import time and
-# exposes the Python API; consumers (run.sh, utils_entra.py, tests) import
-# through profiles.py — they never read this file directly.
+# bundles, and the cross-profile + service-level dependency maps. profiles.py
+# loads this at import time and exposes the Python API; consumers (run.sh,
+# utils_entra.py, tests) import through profiles.py — they never read this file
+# directly.
 
 # Coarse RBAC categories. Sub-project B (Entra → Authentik nesting) groups
 # access by these, NOT by fine deployment profile.
@@ -15,47 +16,39 @@ categories = ["netsec", "edr", "health", "admin", "notifications", "life", "medi
 # category.
 [overrides]
 crowdsec = "netsec"
-# torproxy deploys with `core` (always-on outbound-anon proxy) but its
-# UI / control surface belongs to the netsec access category.
-torproxy = "netsec"
 # openbao deploys with `core` (secrets backend — required before stack starts) but its
 # UI / control surface belongs to the admin access category.
 openbao = "admin"
+# (torproxy is no longer a core service — it now has its own opt-in `tor`
+# profile with category = netsec, so no override is needed.)
 
 # ── Profiles ────────────────────────────────────────────────────────────────
 # Each profile: optional `category` (coarse, for RBAC) + required `services`.
-# `core` omits `category` — it is always-on infrastructure (no RBAC category).
+# `core` omits `category` — it is always-on infrastructure (no RBAC category)
+# and is irreducible: SERVICE_DISABLE may not remove a core service.
 
-# core = always-on infrastructure. crowdsec lives here (NOT in a security
-# profile) because caddy hard-depends on it: the static Caddyfile
+# core = always-on, irreducible infrastructure. crowdsec lives here (NOT in a
+# security profile) because caddy hard-depends on it: the static Caddyfile
 # `import crowdsec` bouncer middleware requires the crowdsec LAPI, so caddy
 # (ingress) won't start without it. Its UI access is still governed by the
 # netsec RBAC category via [overrides] above.
 [profiles.core]
 services = [
-  "tailscale-ingress", "caddy", "crowdsec", "torproxy",
+  "tailscale-ingress", "caddy", "crowdsec",
   "authentik-server", "authentik-worker", "authentik-proxy", "authentik-migration",
   "postgres", "redis",
-  "socket-proxy-ro", "socket-proxy-rw", "autoheal",
+  "socket-proxy-ro", "socket-proxy-rw", "autoheal", "socket-proxy-autoheal",
   "openbao",
 ]
 
 # Security — network
+[profiles.tor]
+category = "netsec"
+services = ["torproxy"]   # opt-in outbound Tor anonymizing proxy (was core)
+
 [profiles.netmon]
 category = "netsec"
 services = ["zeek", "zeek-logs"]
-
-[profiles.streaming]
-category = "netsec"
-services = ["redpanda", "redpanda-console", "redpanda-init"]
-
-# Security — endpoint
-[profiles.siem]
-category = "edr"
-services = [
-  "wazuh-manager", "wazuh-indexer-1", "wazuh-indexer-2", "wazuh-indexer-3",
-  "wazuh-dashboard", "wazuh-init", "wazuh-security-init",
-]
 
 [profiles.runtime-sec]
 category = "edr"
@@ -85,7 +78,7 @@ services = ["clickhouse", "vector"]
 # Admin
 [profiles.container-mgmt]
 category = "admin"
-services = ["dockhand"]
+services = ["komodo-core", "komodo-mongo", "komodo-periphery"]
 
 [profiles.home]
 category = "admin"
@@ -115,7 +108,7 @@ services = ["immich-server", "immich-machine-learning"]
 
 [profiles.notes]
 category = "life"
-services = ["affine", "redis-affine"]
+services = ["couchdb"]
 
 [profiles.tasks]
 category = "life"
@@ -125,7 +118,8 @@ services = ["vikunja"]
 category = "life"
 services = ["tandoor"]
 
-# Media
+# Media — split fine so resource-constrained hosts pick exactly what they want.
+# Each *arr is its own profile; all route through the vpn (gluetun) namespace.
 [profiles.vpn]
 category = "media"
 services = ["gluetun"]
@@ -134,9 +128,17 @@ services = ["gluetun"]
 category = "media"
 services = ["qbittorrent"]
 
-[profiles.video]
+[profiles.indexers]
 category = "media"
-services = ["sonarr", "radarr", "prowlarr"]
+services = ["prowlarr"]
+
+[profiles.movies]
+category = "media"
+services = ["radarr"]
+
+[profiles.tv]
+category = "media"
+services = ["sonarr"]
 
 [profiles.audio]
 category = "media"
@@ -154,24 +156,178 @@ services = ["jellyseerr"]
 category = "media"
 services = ["flaresolverr"]
 
+# ── Bundles ─────────────────────────────────────────────────────────────────
+# Meta-groups that expand to fine profiles. STACK_PROFILES may list bundle
+# names OR fine profiles; profiles.py expands bundles before resolving. Bundles
+# are a casual-user convenience; power users list fine profiles + per-service
+# SERVICE_ENABLE / SERVICE_DISABLE.
+[bundles]
+observability = ["metrics", "exporters", "logs", "viz"]
+security      = ["netmon", "runtime-sec", "tor"]
+productivity  = ["files", "talk", "photos", "notes", "tasks", "recipes"]
+media         = ["vpn", "downloads", "indexers", "movies", "tv", "audio", "stream", "requests", "captcha"]
+
 # ── Cross-profile dependencies ──────────────────────────────────────────────
 # HARD = target CANNOT START without the dep (`network_mode: service:` or
 # `depends_on` spanning profiles).
 [hard_deps]
 downloads = ["vpn"]      # qbittorrent  network_mode: service:gluetun
-video     = ["vpn"]      # *arr         network_mode: service:gluetun
-audio     = ["vpn"]      # lidarr       network_mode: service:gluetun
+indexers  = ["vpn"]      # prowlarr     network_mode: service:gluetun
+movies    = ["vpn"]      # radarr       network_mode: service:gluetun
+tv        = ["vpn"]      # sonarr       network_mode: service:gluetun
 captcha   = ["vpn"]      # flaresolverr network_mode: service:gluetun
 talk      = ["files"]    # spreed-signaling depends_on nextcloud
-requests  = ["stream"]   # jellyseerr   depends_on jellyfin
+requests  = ["stream"]   # jellyseerr   useless without jellyfin (logical hard)
 viz       = ["metrics"]  # grafana      depends_on prometheus
 
 # SOFT = starts but degraded / no data.
 [soft_deps]
-viz       = ["logs"]         # grafana has no Loki datasource data
-exporters = ["metrics"]      # nobody scrapes the exporters
-metrics   = ["notify"]       # alertmanager can't reach ntfy
-requests  = ["video"]        # jellyseerr has no *arr to drive
-video     = ["captcha"]      # some indexers need flaresolverr
-siem      = ["streaming"]    # security-telemetry pipeline incomplete
-streaming = ["runtime-sec"]  # nothing feeding the stream
+viz       = ["logs"]            # grafana has no Loki datasource data
+exporters = ["metrics"]         # nobody scrapes the exporters
+metrics   = ["notify"]          # alertmanager can't reach ntfy
+requests  = ["movies", "tv"]    # jellyseerr has no *arr to drive
+indexers  = ["captcha"]         # some indexers need flaresolverr
+
+# ── Service-level HARD dependencies ─────────────────────────────────────────
+# The per-service edges that the profile-level hard_deps summarize: service A
+# CANNOT START without service B (compose `depends_on` / `network_mode:
+# service:`). The resolver refuses a SERVICE_DISABLE that removes a service
+# another ENABLED service hard-needs (fail-closed — Compose treats a missing
+# depends_on target as an invalid project). Core→core edges are omitted: core
+# is irreducible, so disabling a core service is already refused.
+# Kept in sync with docker-compose.yml by test_service_deps_cover_compose_depends_on.
+[service_deps]
+notify-push      = ["nextcloud"]
+spreed-signaling = ["nextcloud", "janus"]
+prowlarr         = ["gluetun"]
+radarr           = ["gluetun"]
+sonarr           = ["gluetun"]
+lidarr           = ["gluetun"]
+flaresolverr     = ["gluetun"]
+qbittorrent      = ["gluetun"]
+grafana          = ["prometheus"]   # depends_on (required); clickhouse dep is required:false
+jellyseerr       = ["jellyfin"]     # depends_on: condition service_healthy
+
+# ── Container↔host ownership (ADR-0014) ──────────────────────────────────────
+# Exceptions layered on the 1010:1010 / mode-770 baseline that
+# docker-host-config.sh:create_dock_tree() establishes via its install loop +
+# guarded bulk chown. Each entry declares the /dock paths a service owns, the
+# numeric UID:GID it runs as (empirically verified by the container reaching
+# healthy on the host — never asserted from image docs), the mode, and whether
+# chown / chmod recurse. `profiles.py --ownership-manifest` emits a tab-separated
+#   path<TAB>uid<TAB>gid<TAB>mode<TAB>chown_recursive<TAB>chmod_recursive
+# table (uid/gid/mode = "-" when absent); create_dock_tree applies it in one
+# idempotent loop. Omit uid/gid for a mode-only entry (keep the 1010 baseline
+# owner); omit mode for a chown-only entry (keep the baseline mode). Recursion
+# defaults false. This is the consolidation target ADR-0014 mandates: a new
+# non-1010 service declares ownership HERE at catalog-edit time, not as another
+# ad-hoc chown discovered at deploy time. Order mirrors the original function
+# for auditability; paths are disjoint so apply-order does not affect the result.
+
+[[ownership]]
+service = "openbao"   # openbao image runs as UID 100 (its `openbao` user; /openbao ships 100:1000)
+paths = ["/dock/conf/openbao/config", "/dock/data/openbao/data", "/dock/data/openbao/audit"]
+uid = 100
+gid = 1000
+mode = "700"            # Shamir/unseal-sensitive: owner-only, no group. chmod top-only (install -d -m 700);
+chown_recursive = true  # chown -R so the file-storage + audit backends are owned by the openbao process
+
+[[ownership]]
+service = "komodo-mongo"  # mongo:8.0 runs as its mongodb user (uid 999); cap_drop:ALL means the
+paths = ["/dock/data/komodo/mongo"]   # entrypoint can't chown, so /data/db must be pre-owned 999:999
+uid = 999
+gid = 999
+mode = "700"            # DB data: owner-only
+chown_recursive = true  # fix the root-owned dir Docker auto-created on the failed first deploys
+
+[[ownership]]
+service = "db"          # postgres/data + redis tighten to 700 over the 770 baseline; owner stays 1010
+paths = ["/dock/db/postgres/data", "/dock/db/redis"]
+mode = "700"            # mode-only (no uid/gid → keep baseline 1010:1010)
+
+[[ownership]]
+service = "authentik"   # runs as uid 1000 via the x-hardened anchor; needs rw on media + custom-templates
+paths = ["/dock/conf/authentik", "/dock/data/authentik"]
+uid = 1000
+gid = 1000
+chown_recursive = true  # no mode → keep baseline 770
+
+[[ownership]]
+service = "nextcloud"   # official image runs as www-data (33:33); data dir AND all files within must be 33:33,
+paths = ["/dock/data/nextcloud"]   # else a re-run leaves Nextcloud-written files (incl .htaccess) at 1010 → Apache denies
+uid = 33
+gid = 33
+chown_recursive = true
+
+[[ownership]]
+service = "tandoor"     # uid 1000 (gunicorn/django); media + static dirs need 1000 ownership
+paths = ["/dock/data/tandoor"]
+uid = 1000
+gid = 1000
+chown_recursive = true
+
+[[ownership]]
+service = "vikunja"     # uid 1000; files dir needs 1000 ownership
+paths = ["/dock/data/vikunja"]
+uid = 1000
+gid = 1000
+chown_recursive = true
+
+[[ownership]]
+service = "prometheus"  # prometheus + alertmanager run as 65534 (nobody) and must WRITE their data dirs
+paths = ["/dock/data/prometheus", "/dock/data/alertmanager"]
+uid = 65534
+gid = 65534
+mode = "750"            # non-recursive create+own (matches _install_owned)
+
+[[ownership]]
+service = "loki"        # uid 10001
+paths = ["/dock/data/loki"]
+uid = 10001
+gid = 10001
+mode = "750"
+
+[[ownership]]
+service = "grafana"     # uid 472
+paths = ["/dock/data/grafana"]
+uid = 472
+gid = 472
+mode = "750"
+
+[[ownership]]
+service = "alloy"       # uid 473
+paths = ["/dock/data/alloy"]
+uid = 473
+gid = 473
+mode = "750"
+
+[[ownership]]
+service = "n8n"         # uid 1000
+paths = ["/dock/data/n8n"]
+uid = 1000
+gid = 1000
+mode = "750"
+
+[[ownership]]
+service = "zeek-logs"   # filebrowser (uid 1010) writes settings.json + filebrowser.db; both auto-create root:root
+paths = ["/dock/conf/zeek-logs", "/dock/data/zeek-logs"]
+uid = 1010
+gid = 1010
+mode = "750"
+
+[[ownership]]
+service = "ntfy"        # runs as root (uid 0) with cap_drop:ALL (no DAC_OVERRIDE) → needs owner-level access
+paths = ["/dock/data/ntfy", "/dock/conf/ntfy"]
+uid = 0
+gid = 0
+mode = "755"
+chown_recursive = true
+chmod_recursive = true
+
+[[ownership]]
+service = "couchdb"    # couchdb:3.x runs as uid 5984; cap_drop:ALL means the
+paths = ["/dock/data/couchdb"]  # entrypoint can't chown, so /data/db must be pre-owned 5984:5984
+uid = 5984
+gid = 5984
+mode = "700"            # DB data: owner-only
+chown_recursive = true

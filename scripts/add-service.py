@@ -659,7 +659,7 @@ def _check_and_provision_unified(cfg: "ServiceConfig", dry_run: bool) -> None:
     env      = utils.EnvFile(env_path)
     domain   = env.get("PUBLIC_FQDN")
     cf_token = env.get("CLOUDFLARE_API_TOKEN")
-    ak_token = env.get("AUTHENTIK_BOOTSTRAP_TOKEN")
+    ak_token = utils.resolve_admin_token(env)
     ak_sub   = env.get("AUTHENTIK_SUBDOMAIN") or "auth"
 
     if not domain:

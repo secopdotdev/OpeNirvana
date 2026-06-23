@@ -31,10 +31,9 @@ below and `docker compose up -d <service>`.
 - **\*arr (prowlarr/radarr/sonarr/lidarr)** — already `AuthenticationMethod=None`
   (no local login form at all); they are gated by Authentik forward-auth +
   gluetun. Nothing to disable.
-- **tandoor / affine** — auth is configured in-app (django-allauth / admin
-  panel). If the pinned image exposes no safe "disable local login" toggle,
-  local login is **kept** (fail-safe) and these remain OIDC-capable; they stay
-  gated at the edge.
+- **tandoor** — auth is configured in-app (django-allauth). If the pinned image
+  exposes no safe "disable local login" toggle, local login is **kept**
+  (fail-safe) and it remains OIDC-capable; it stays gated at the edge.
 
 ## Notes
 

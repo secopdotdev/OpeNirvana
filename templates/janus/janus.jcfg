@@ -12,7 +12,10 @@ general: {
 
 media: {
 	# RTP port range — must match ports published in docker-compose.yml.
-	rtp_port_range = "20000-20100"
+	# Narrowed 20000-20100 -> 20000-20049 to halve forwarded-UDP exposure
+	# (~1 port per concurrent media stream). See README "Minimizing
+	# forwarded-port exposure" (method #6).
+	rtp_port_range = "20000-20049"
 }
 
 nat: {

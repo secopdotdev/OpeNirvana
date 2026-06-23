@@ -1,0 +1,29 @@
+# Cloudflare Authenticated Origin Pulls — origin mTLS (Layer 1 of WS1, ADR-0020).
+#
+# DEFAULT STATE: no-op. This snippet ships EMPTY so that `import cf-origin-mtls`
+# in the public tls{} blocks is always valid and Caddy boots cleanly even before
+# AOP has been provisioned. A non-empty snippet here would crash Caddy on every
+# fresh deploy: an unset {$CLOUDFLARE_MTLS_MODE} fails Caddyfile adaptation, and a missing
+# trust-pool pem_file fails TLS provisioning (both verified with `caddy validate`).
+#
+# The ACTIVE client_auth block is rendered into
+# /dock/conf/caddy/snippets/cf-origin-mtls.caddy by docker-host-config.sh
+# (render_cf_origin_mtls) ONLY once the origin-pull trust anchor is present at
+# /dock/conf/cloudflare/origin-pull/{ca,client}.pem — i.e. after the operator runs
+# `provision_origin_pull`. render_cf_origin_mtls also copies the trust anchor into
+# this (bind-mounted) snippets dir as cf-origin-pull-ca.pem and points pem_file at
+# /etc/caddy/snippets/cf-origin-pull-ca.pem; `import snippets/*.caddy` ignores the
+# .pem so it is never parsed as a Caddyfile.
+#
+# This file is intentionally EXCLUDED from sync_caddy_config's blind template copy
+# so a rendered (active) snippet on a provisioned host is never reverted to no-op.
+#
+# Mode is staged via {$CLOUDFLARE_MTLS_MODE} (compose default = request):
+#   request            -> ask for the cert, log, but DO NOT reject if absent
+#                         (safe first deploy; confirm CF is presenting the cert)
+#   require_and_verify -> reject any TLS handshake without a valid cert (final)
+#
+# Imported ONLY inside public tls{} blocks. Tailnet tls{} blocks never import it.
+# ZERO end-user device impact: the client cert lives only at Cloudflare's edge.
+(cf-origin-mtls) {
+}

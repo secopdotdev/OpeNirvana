@@ -1,9 +1,19 @@
-# Allow traffic only from Cloudflare CIDRs (registered as the "cloudflare"
-# ip_source in the globals block via `trusted_proxies cloudflare`) plus the
-# operator-defined EXTRA_ALLOWED_IP (e.g., office uplink).
+# Cloudflare-origin allowlist (Layer 2 of WS1 defense-in-depth).
+#
+# Only the Cloudflare edge may reach the public origin. `remote_ip` matches the
+# DIRECT TCP PEER — which, for a CF-proxied (orange-cloud) hostname, is always a
+# Cloudflare edge IP. This is UNAFFECTED by `trusted_proxies cloudflare` (that
+# only rewrites `client_ip` to the real end-user). The prior implementation used
+# `client_ip` + a named source `cloudflare` — invalid syntax that crash-looped
+# Caddy at boot (PR #63), and wrong semantics even with literal CIDRs.
+#
+# {$CLOUDFLARE_CIDRS} is a space-separated list rendered into .env by
+# `maintain.py cloudflare-cidrs` (fail-closed; weekly cron). {$EXTRA_ALLOWED_IP}
+# is an operator escape hatch (a trusted admin IP/CIDR) — leave blank to disable.
+#
+# `abort` silently drops the connection (no response) so we never leak that a
+# host exists behind a non-CF probe. Tailnet site blocks do NOT import this.
 (cloudflare-allowlist) {
-    @not_cloudflare not client_ip cloudflare {$EXTRA_ALLOWED_IP}
-    handle @not_cloudflare {
-        respond "Forbidden" 403
-    }
+    @not_cf not remote_ip {$CLOUDFLARE_CIDRS} {$EXTRA_ALLOWED_IP}
+    abort @not_cf
 }

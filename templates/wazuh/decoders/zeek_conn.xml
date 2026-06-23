@@ -1,3 +1,0 @@
-<decoder name="zeek-conn">
-  <prematch>^{"ts":.+"id.orig_h":</prematch>
-</decoder>

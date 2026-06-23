@@ -2,9 +2,9 @@
 #
 # Delivers alerts to ntfy (push notifications) via webhook.
 #
-# SETUP: Before alerts can be delivered, grant ntfy publish access:
-#   docker exec ntfy ntfy access '*' alerts write-only
-#   docker exec ntfy ntfy access '*' falco write-only
+# ntfy ACL is provisioned automatically by scripts/ntfy-setup.py (run.sh post-deploy).
+# No manual docker exec is needed — the script grants write-only access to all alert
+# topics and probes each with a test publish to confirm 200 OK.
 #
 # Install: copy this file to ${DOCK_CONF}/alertmanager/alertmanager.yml
 # then: docker compose exec prometheus kill -HUP 1  (reload Prometheus rules)

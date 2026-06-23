@@ -1,14 +1,13 @@
 # Custom rules layered on top of the Falco stock ruleset.
-# Rule IDs scoped in 100300–100399 (maps to Wazuh rule range).
 
 - rule: Unauthorized Docker API access
   desc: >
     A container talks to the Docker API through an unexpected socket-proxy.
-    Legitimate talkers are: homepage, autoheal, crowdsec, wazuh-manager.
+    Legitimate talkers are: homepage, autoheal, crowdsec.
   condition: >
     evt.type in (connect, socketcall)
     and fd.name in ("/var/run/docker.sock","dockerproxy")
-    and not container.name in (autoheal, crowdsec, wazuh-manager, homepage, socket-proxy-ro, socket-proxy-rw)
+    and not container.name in (autoheal, crowdsec, homepage, socket-proxy-ro, socket-proxy-rw)
   output: >
     Unauthorized container contacted Docker API
     (container=%container.name image=%container.image.repository
@@ -22,7 +21,7 @@
     (evt.type in (open,openat,openat2) and evt.is_open_write=true)
     and container.id != host
     and fd.name startswith /etc
-    and not proc.name in (authentik, postgres, redis-server, wazuh-manager)
+    and not proc.name in (authentik, postgres, redis-server)
   output: >
     Write to /etc by container
     (container=%container.name proc=%proc.cmdline file=%fd.name)

@@ -43,7 +43,7 @@ import json
 import sys
 from pathlib import Path
 
-from utils import EnvFile, AuthentikClient, red, green, yellow, step
+from utils import EnvFile, AuthentikClient, red, green, yellow, step, resolve_admin_token
 
 _STACK_DIR = Path(__file__).resolve().parent.parent
 _DEFAULT_MANIFEST = _STACK_DIR / "scripts" / "output" / "entra-setup-manifest.json"
@@ -64,9 +64,9 @@ def _gate(submit: bool, desc: str) -> bool:
 
 
 def _build_ak(env: EnvFile) -> "AuthentikClient | None":
-    token = env.get("AUTHENTIK_BOOTSTRAP_TOKEN")
+    token = resolve_admin_token(env)
     if not token:
-        red("AUTHENTIK_BOOTSTRAP_TOKEN not set in .env")
+        red("No admin token in .env (AUTHENTIK_API_TOKEN or AUTHENTIK_BOOTSTRAP_TOKEN)")
         return None
     auth_sub = env.get("AUTHENTIK_SUBDOMAIN") or "auth"
     public_fqdn = env.get("PUBLIC_FQDN")

@@ -41,7 +41,7 @@ from typing import Optional
 
 from utils import (
     EnvFile, AuthentikClient, red, green, yellow, step, container_state,
-    discover_app_access_groups,
+    discover_app_access_groups, resolve_admin_token,
 )
 
 
@@ -1221,7 +1221,7 @@ def phase5_enforce_entra_only(ak: AuthentikClient, source_pk: str) -> None:
 
 def connect_authentik(env: EnvFile) -> AuthentikClient:
     """Build AuthentikClient from .env. Verifies connectivity. Exits on failure."""
-    token = env.get("AUTHENTIK_BOOTSTRAP_TOKEN")
+    token = resolve_admin_token(env)
     if not token:
         red("AUTHENTIK_BOOTSTRAP_TOKEN not set in .env")
         sys.exit(1)

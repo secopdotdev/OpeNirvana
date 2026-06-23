@@ -18,13 +18,6 @@
 #   Do NOT recurse — files inside are already owned by www-data and content dirs
 #   (data/) are also www-data-owned.
 #
-# Known exception — AFFiNE:
-#   Runs as UID 0 (root) inside the container with cap_drop:ALL.
-#   Without DAC_OVERRIDE, root cannot traverse directories owned by 1010:1010
-#   with mode 770, causing EACCES on /root/.affine/storage/blobs at startup.
-#   Fix: chown /dock/data/affine to root:root so the container's restricted
-#   root user (UID 0, no DAC_OVERRIDE) has normal owner-level access.
-#
 # Usage:
 #   sudo bash scripts/fix-permissions.sh
 #
@@ -34,17 +27,23 @@
 
 set -euo pipefail
 
-# Source .env from the unified-stack root so path vars come from config, not defaults.
+# Read ONLY the path vars we need from .env — deliberately do NOT `source` it.
+# .env is a runtime interface carrying arbitrary secret values (a UTF-8 BOM, colons,
+# quotes, multi-line content) that are not valid shell; sourcing it aborts the script
+# (e.g. "Access: command not found"). Extract each key directly, BOM-tolerant.
 _ENV_FILE="$(cd "$(dirname "$0")/.." && pwd)/.env"
-if [ -f "$_ENV_FILE" ]; then
-    # shellcheck source=/dev/null
-    set -a; . "$_ENV_FILE"; set +a
-fi
+_env_get() {
+    [ -f "$_ENV_FILE" ] || return 0
+    sed '1s/^\xEF\xBB\xBF//' "$_ENV_FILE" \
+        | grep -E "^$1=" | tail -n1 | cut -d= -f2- | tr -d '\r' \
+        | sed -e 's/ #.*$//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+              -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//" || true
+}
 
-DOCK_CONF="${DOCK_CONF:-/dock/conf}"
-DOCK_DATA="${DOCK_DATA:-/dock/data}"
-MEDIA_PATH="${MEDIA_PATH:-/mnt/media}"
-DOWNLOADS_PATH="${DOWNLOADS_PATH:-/mnt/HDD/downloads}"
+DOCK_CONF="$(_env_get DOCK_CONF)";           DOCK_CONF="${DOCK_CONF:-/dock/conf}"
+DOCK_DATA="$(_env_get DOCK_DATA)";           DOCK_DATA="${DOCK_DATA:-/dock/data}"
+MEDIA_PATH="$(_env_get MEDIA_PATH)";         MEDIA_PATH="${MEDIA_PATH:-/mnt/media}"
+DOWNLOADS_PATH="$(_env_get DOWNLOADS_PATH)"; DOWNLOADS_PATH="${DOWNLOADS_PATH:-/mnt/HDD/downloads}"
 
 DEFAULT_USER="svc-user"
 DEFAULT_GROUP="media"
@@ -98,7 +97,7 @@ for base in "$DOCK_CONF" "$DOCK_DATA"; do
     for svc_dir in "$base"/*/; do
         svc=$(basename "$svc_dir")
         # Skip services with known overrides (handled below)
-        case "$svc" in nextcloud|vikunja|affine|spreed-signaling|janus|redpanda|redpanda-console|grafana|prometheus|cadvisor|node-exporter|dashy|alertmanager|loki|alloy) continue ;; esac
+        case "$svc" in nextcloud|vikunja|spreed-signaling|janus|grafana|prometheus|cadvisor|node-exporter|dashy|alertmanager|loki|alloy) continue ;; esac
         chown "${DEFAULT_USER}:${DEFAULT_GROUP}" "$svc_dir" 2>/dev/null || true
         # Don't recurse here — service-internal dirs may be owned by container UIDs
     done
@@ -129,28 +128,6 @@ if [ -d "${DOCK_DATA}/nextcloud" ]; then
 else
     c_yel "  skip (not found): ${DOCK_DATA}/nextcloud"
 fi
-
-# ── Redpanda: UID/GID 101 ────────────────────────────────────────────────────
-# Runs as UID/GID 101 (redpanda user inside the container). Requires owner-level
-# access to /dock/data/redpanda for WAL and data segments. conf dir uses standard
-# svc-user:media ownership since it holds no container-written files.
-echo ""
-echo "Applying 101:101 to Redpanda data dir..."
-fix_dir "${DOCK_DATA}/redpanda" 101 101
-
-# ── AFFiNE: root:root ─────────────────────────────────────────────────────────
-# Runs as UID 0 with cap_drop:ALL (no DAC_OVERRIDE). Must own its dirs as root.
-echo ""
-echo "Applying root:root to AFFiNE dirs..."
-fix_dir "${DOCK_DATA}/affine"         root root
-fix_dir "${DOCK_DATA}/affine/config"  root root
-fix_dir "${DOCK_DATA}/affine/storage" root root
-# Recurse into storage subdirs (blobs, avatars, copilot created by the container)
-if [ -d "${DOCK_DATA}/affine/storage" ]; then
-    find "${DOCK_DATA}/affine/storage" -mindepth 1 -exec chown root:root {} +
-    c_grn "  chown root:root ${DOCK_DATA}/affine/storage/** (recursive)"
-fi
-fix_dir "${DOCK_CONF}/affine" root root 2>/dev/null || true
 
 # ── spreed-signaling + janus: root:root 644 ─────────────────────────────────────
 # Both run as root with cap_drop:ALL (no DAC_OVERRIDE). spreed-signaling also drops
@@ -193,6 +170,26 @@ if [ -d "${DOCK_DATA}/grafana" ]; then
     c_grn "  chown 472:472 ${DOCK_DATA}/grafana"
 else
     c_yel "  skip (not found): ${DOCK_DATA}/grafana"
+fi
+
+# ── CouchDB: UID/GID 5984 ─────────────────────────────────────────────────────
+# Runs as UID 5984 with cap_drop:ALL (entrypoint can't chown at runtime). The
+# create_dock_tree ownership manifest (profiles.toml) sets this to 5984, but this
+# script's 1010 baseline (_ensure_dirs) re-chowns the data dir back to 1010 on the
+# common deploy path, after which mem3 crashes with eacces creating _nodes.couch.
+# Mirror the manifest here so fix-permissions never clobbers couchdb's ownership.
+echo ""
+echo "Applying 5984:5984 to CouchDB data + config dirs..."
+if [ -d "${DOCK_DATA}/couchdb" ]; then
+    chown -R 5984:5984 "${DOCK_DATA}/couchdb"
+    chmod 700 "${DOCK_DATA}/couchdb"
+    c_grn "  chown -R 5984:5984 ${DOCK_DATA}/couchdb"
+else
+    c_yel "  skip (not found): ${DOCK_DATA}/couchdb"
+fi
+if [ -d "${DOCK_CONF}/couchdb/local.d" ]; then
+    chown -R 5984:5984 "${DOCK_CONF}/couchdb/local.d"
+    c_grn "  chown -R 5984:5984 ${DOCK_CONF}/couchdb/local.d"
 fi
 
 echo "Applying 472:472 to Grafana provisioning dir (recursive)..."
@@ -271,7 +268,18 @@ if [ -f "${DOCK_CONF}/dashy/conf.yml" ]; then
     c_grn "  chown 1000:1000 ${DOCK_CONF}/dashy/conf.yml"
 fi
 
+# ── Komodo Mongo: UID/GID 999 (mongodb user) ─────────────────────────────────
+# mongo:8.0 runs as uid 999 with cap_drop:ALL — the root entrypoint cannot chown
+# /data/db nor setuid to drop privileges, so it must start as 999 with the host
+# data dir pre-owned 999:999 (700, DB data). install -d is idempotent; chown -R
+# repairs the root-owned dir Docker auto-created on a first deploy.
+echo ""
+echo "Applying 999:999 to Komodo Mongo data dir..."
+install -d -o 999 -g 999 -m 700 "${DOCK_DATA}/komodo/mongo"
+chown -R 999:999 "${DOCK_DATA}/komodo/mongo"
+c_grn "  999:999 700 ${DOCK_DATA}/komodo/mongo"
+
 echo ""
 c_grn "fix-permissions.sh complete."
-echo "Restart any affected containers:"
-echo "  docker compose --profile apps up -d --no-deps --force-recreate affine"
+echo "Restart any affected containers, e.g.:"
+echo "  docker compose --profile apps up -d --no-deps --force-recreate nextcloud"

@@ -1,3 +1,0 @@
-<decoder name="zeek-dns">
-  <prematch>^{"ts":.+"query":</prematch>
-</decoder>

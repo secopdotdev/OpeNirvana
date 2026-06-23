@@ -23,7 +23,7 @@ from pathlib import Path
 
 from utils import (
     EnvFile, AuthentikClient, discover_app_access_groups,
-    red, green, yellow, step,
+    red, green, yellow, step, resolve_admin_token,
 )
 import utils_nextcloud
 
@@ -257,7 +257,7 @@ def main() -> int:
 
     username    = env.get("AUTHENTIK_USER_NAME")
     user_token  = env.get("AUTHENTIK_USER_ACCESS_TOKEN")
-    admin_token = env.get("AUTHENTIK_BOOTSTRAP_TOKEN")
+    admin_token = resolve_admin_token(env)
     auth_sub    = env.get("AUTHENTIK_SUBDOMAIN") or "auth"
     public_fqdn = env.get("PUBLIC_FQDN")
     for label, val in [("AUTHENTIK_USER_NAME", username),

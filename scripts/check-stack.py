@@ -99,59 +99,25 @@ def visible_len(s: str) -> int:
 
 # ── Cloudflare DNS ────────────────────────────────────────────────────────────
 
-def _cf_get(token: str, path: str) -> dict:
-    url = f"https://api.cloudflare.com/client/v4{path}"
-    req = urllib.request.Request(
-        url,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            return json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        body = e.read().decode(errors="replace")
-        return {"success": False, "errors": [{"message": body}]}
-    except Exception as e:
-        return {"success": False, "errors": [{"message": str(e)}]}
-
-
 def get_dns_records(token: str, domain: str) -> dict[str, list[str]]:
     """
     Returns {subdomain: [record_types]} for every DNS record in the zone.
     '@' means the apex record.  Returns {} on any error.
-    """
-    zones = _cf_get(token, f"/zones?name={domain}&status=active")
-    if not zones.get("success") or not zones.get("result"):
-        errors = zones.get("errors", [])
-        msg = errors[0].get("message", "unknown") if errors else "unknown"
-        print(warn(f"  Cloudflare zone lookup failed: {msg}"), file=sys.stderr)
-        return {}
-    zone_id = zones["result"][0]["id"]
 
-    records: dict[str, list[str]] = {}
-    page = 1
-    while True:
-        data = _cf_get(token, f"/zones/{zone_id}/dns_records?per_page=100&page={page}")
-        if not data.get("success"):
-            break
-        for r in data.get("result", []):
-            name: str = r["name"]
-            rtype: str = r["type"]
-            if name == domain:
-                sub = "@"
-            elif name.endswith(f".{domain}"):
-                sub = name[: -(len(domain) + 1)]
-            else:
-                sub = name
-            records.setdefault(sub, []).append(rtype)
-        info_page = data.get("result_info", {})
-        if page >= info_page.get("total_pages", 1):
-            break
-        page += 1
-    return records
+    Delegates to the vendored cloudflare-toolkit `dns.CloudflareClient`
+    (canonical: github.com/your-org/cloudflare-toolkit) — the toolkit raises
+    on a missing zone or transient API/network error, which we map back to the
+    fail-soft {} this audit expects so a DNS blip never aborts the stack check.
+    """
+    from dns import CloudflareClient  # vendored sibling module
+
+    try:
+        cf = CloudflareClient(token)
+        zone_id = cf.get_zone_id(domain)
+        return cf.get_dns_records(zone_id, domain)
+    except (RuntimeError, OSError) as exc:
+        print(warn(f"  Cloudflare zone/DNS lookup failed: {exc}"), file=sys.stderr)
+        return {}
 
 
 # ── HTTP probes ───────────────────────────────────────────────────────────────
@@ -595,16 +561,6 @@ def show_logs(service: str, compose_file: Path | None, env_file: Path | None, ta
         sys.exit(1)
 
 
-# ── Wazuh deep health ───────────────────────────────────────────────────────────
-# Container health + the subdomain 302->auth probe both report "OK" even when the
-# SIEM is functionally down (indexer red, analysisd dead, or - most insidious -
-# the alert pipeline silently stopped while every HTTP endpoint still answers).
-# This probes the dimensions that actually matter for a SIEM, so a real outage
-# surfaces as a red row instead of a green one.
-
-_WAZUH_ALERT_FRESH_SECONDS = 3600  # alerts index must have a doc within this window
-
-
 def _wz_exec(container: str, shell_cmd: str, secrets: dict | None = None,
              timeout: int = 15) -> tuple[int, str]:
     """Run `sh -c shell_cmd` inside a container. Secrets are passed via the
@@ -617,203 +573,6 @@ def _wz_exec(container: str, shell_cmd: str, secrets: dict | None = None,
     cmd += [container, "sh", "-c", shell_cmd]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     return r.returncode, (r.stdout or "").strip()
-
-
-def wazuh_deep_health(env: dict[str, str]) -> list[dict]:
-    """Return a list of {check, ok, detail} for the SIEM's real health.
-
-    ok = True / False / None (None = could-not-determine, rendered as warn).
-    Returns [] when the Wazuh containers aren't present (nothing to check).
-    """
-    idx = {"IDX_PW": env.get("WAZUH_INDEXER_ADMIN_PASSWORD", "")}
-    results: list[dict] = []
-
-    rc, _ = _wz_exec("wazuh-indexer-1", "true")
-    if rc != 0:
-        return []  # Wazuh not deployed on this host.
-
-    # 1. Indexer cluster status must not be red.
-    rc, out = _wz_exec(
-        "wazuh-indexer-1",
-        'curl -sk -u "admin:$IDX_PW" --max-time 10 https://localhost:9200/_cluster/health',
-        secrets=idx)
-    status = None
-    try:
-        status = json.loads(out).get("status")
-    except (ValueError, AttributeError):
-        pass
-    results.append({"check": "indexer cluster",
-                    "ok": (status in ("green", "yellow")) if status else None,
-                    "detail": f"status={status or 'unknown'}"})
-
-    # 2. Critical manager daemons running.
-    rc, out = _wz_exec("wazuh-manager", "/var/ossec/bin/wazuh-control status")
-    need = ["wazuh-analysisd", "wazuh-remoted", "wazuh-db", "wazuh-apid"]
-    down = [d for d in need if f"{d} is running" not in out] if out else need
-    results.append({"check": "manager daemons",
-                    "ok": (not down) if out else None,
-                    "detail": "all core daemons up" if not down else f"DOWN: {', '.join(down)}"})
-
-    # 3. Manager API — probed FROM THE DASHBOARD'S network vantage
-    #    (wazuh-dashboard -> wazuh-manager:55000), which is exactly the path that
-    #    surfaces these dashboard UI errors a localhost probe would miss:
-    #      - "Status: Offline" / "connect ECONNREFUSED <ip>:55000"  -> 3a
-    #      - failed login with the API credentials                  -> 3b
-    #      - "Check API version" failure                            -> 3c
-    #      - "Updates status: Error checking updates"               -> 3d
-    #    Uses the API key (WAZUH_API_PASSWORD) from .env, passed via the
-    #    container env (never interpolated into the command text).
-    api = {"API_PW": env.get("WAZUH_API_PASSWORD", ""),
-           "API_USER": env.get("WAZUH_API_USERNAME", "").strip() or "wazuh-wui"}
-
-    # 3a. Reachability — detects ECONNREFUSED / "Offline". 401 = up + auth-gated;
-    #     000 = socket refused or timed out (the manager API is down).
-    rc, code = _wz_exec(
-        "wazuh-dashboard",
-        'curl -sk -o /dev/null -w "%{http_code}" --max-time 10 https://wazuh-manager:55000/',
-        timeout=20)
-    api_up = code in ("200", "401")
-    results.append({
-        "check": "manager API reachable",
-        "ok": api_up,
-        "detail": (f"HTTP {code} (from dashboard)" if api_up
-                   else f"HTTP {code or '000'} — OFFLINE / ECONNREFUSED wazuh-manager:55000"),
-    })
-
-    if not api_up:
-        for c in ("manager API auth (api key)", "manager API version",
-                  "manager updates check"):
-            results.append({"check": c, "ok": None, "detail": "skipped — API unreachable"})
-    else:
-        # 3b/c/d. Authenticate with the env API key, then version + updates check.
-        # Each curl appends HTTPCODE=NNN to its (compact, single-line) JSON body
-        # so one call yields both status and body; parsed in Python (no fragile
-        # shell case/quoting). $(...) strips trailing newlines.
-        probe = (
-            'TOK=$(curl -sk -u "$API_USER:$API_PW" -X POST --max-time 12 '
-            '"https://wazuh-manager:55000/security/user/authenticate?raw=true"); '
-            'echo "AUTHLEN:$(printf %s "$TOK" | wc -c)"; '
-            'echo "VER:$(curl -sk -H "Authorization: Bearer $TOK" --max-time 12 '
-            '-w HTTPCODE=%{http_code} "https://wazuh-manager:55000/")"; '
-            'echo "UPD:$(curl -sk -H "Authorization: Bearer $TOK" --max-time 15 '
-            '-w HTTPCODE=%{http_code} "https://wazuh-manager:55000/manager/version/check")"'
-        )
-        rc, out = _wz_exec("wazuh-dashboard", probe, secrets=api, timeout=70)
-        authlen, ver_line, upd_line = 0, "", ""
-        for line in out.splitlines():
-            if line.startswith("AUTHLEN:"):
-                m = re.search(r"\d+", line)
-                authlen = int(m.group()) if m else 0
-            elif line.startswith("VER:"):
-                ver_line = line
-            elif line.startswith("UPD:"):
-                upd_line = line
-
-        def _code(s):
-            m = re.search(r"HTTPCODE=(\d+)", s)
-            return m.group(1) if m else "000"
-
-        def _err0(s):
-            return bool(re.search(r'"error":\s*0\b', s))
-
-        ver_code, ver_ok = _code(ver_line), ("api_version" in ver_line and _code(ver_line) == "200")
-        upd_code, upd_ok = _code(upd_line), (_code(upd_line) == "200" and _err0(upd_line))
-
-        results.append({
-            "check": "manager API auth (api key)",
-            "ok": authlen > 50,
-            "detail": "token acquired via WAZUH_API_PASSWORD" if authlen > 50
-                      else "AUTH FAILED with env API key (check WAZUH_API_PASSWORD/wazuh-wui)",
-        })
-        results.append({
-            "check": "manager API version",
-            "ok": ver_ok,
-            "detail": f"HTTP {ver_code}" + ("" if ver_ok else " — 'Check API version' would fail"),
-        })
-        results.append({
-            "check": "manager updates check",
-            "ok": upd_ok,
-            "detail": f"HTTP {upd_code}" + ("" if upd_ok
-                      else " — 'Updates status: Error checking updates'"),
-        })
-
-    # 4. Dashboard app responds without a server error.
-    rc, code = _wz_exec(
-        "wazuh-dashboard",
-        "curl -sk -o /dev/null -w '%{http_code}' --max-time 10 https://localhost:5601/api/status")
-    results.append({"check": "dashboard :5601",
-                    "ok": (code.isdigit() and int(code) < 500) if code else None,
-                    "detail": f"HTTP {code or '000'}"})
-
-    # 5. THE CRITICAL ONE - alert pipeline freshness. A SIEM that stopped
-    #    ingesting is "down" even with a green cluster + serving dashboard.
-    rc, out = _wz_exec(
-        "wazuh-indexer-1",
-        'curl -sk -u "admin:$IDX_PW" --max-time 10 '
-        '"https://localhost:9200/wazuh-alerts-*/_search?size=1&sort=@timestamp:desc&_source=@timestamp"',
-        secrets=idx)
-    age_s = None
-    try:
-        hits = json.loads(out)["hits"]["hits"]
-        if hits:
-            import calendar
-            ts = time.strptime(hits[0]["_source"]["@timestamp"][:19], "%Y-%m-%dT%H:%M:%S")
-            age_s = time.time() - calendar.timegm(ts)
-    except (ValueError, KeyError, IndexError, TypeError):
-        pass
-    if age_s is None:
-        fresh_ok, detail = None, "no alerts found / index unreachable"
-    elif age_s <= _WAZUH_ALERT_FRESH_SECONDS:
-        fresh_ok, detail = True, f"last alert {int(age_s // 60)}m ago"
-    else:
-        fresh_ok, detail = False, f"STALE: last alert {int(age_s // 3600)}h ago"
-    results.append({"check": "alert pipeline freshness", "ok": fresh_ok, "detail": detail})
-
-    # 6. Dashboard API latency (the user-facing symptom). The Wazuh app's
-    #    startup health check fires a burst of bcrypt-bound /api authenticate
-    #    calls; under contention they exceed the frontend's 20s timeout
-    #    ("Check API version: timeout of 20000ms exceeded"). Detect it PASSIVELY
-    #    from the dashboard's own request log — no extra bcrypt load on the
-    #    manager (which would worsen the very problem we're measuring).
-    slowest_ms = -1
-    try:
-        lg = subprocess.run(
-            ["docker", "logs", "--since", "1h", "--tail", "4000", "wazuh-dashboard"],
-            capture_output=True, text=True, timeout=20)
-        for m in re.finditer(r"/api/\S+\s+\d+\s+(\d{4,})ms", lg.stdout + lg.stderr):
-            slowest_ms = max(slowest_ms, int(m.group(1)))
-    except (subprocess.SubprocessError, OSError):
-        slowest_ms = -1
-    if slowest_ms < 0:
-        api_ok, detail = None, "could not read dashboard logs (no recent /api calls)"
-    elif slowest_ms >= 15000:
-        api_ok = False
-        detail = f"SLOW: /api call took {slowest_ms // 1000}s in last 1h — breaching 20s UI timeout"
-    elif slowest_ms >= 5000:
-        api_ok = True  # degraded but not failing; surface as a near-miss
-        detail = f"near-miss: slowest /api call {slowest_ms // 1000}s (auth-burst contention)"
-    else:
-        api_ok, detail = True, f"slowest /api call {slowest_ms}ms"
-    results.append({"check": "dashboard API latency", "ok": api_ok, "detail": detail})
-
-    return results
-
-
-def render_wazuh_deep(results: list[dict]) -> int:
-    """Print the deep-health rows; return count of failed (ok is False) checks."""
-    if not results:
-        return 0
-    print(f"\n{bold('Wazuh deep health (SIEM-layer)')}\n")
-    failed = 0
-    for r in results:
-        if r["ok"] is True:
-            cell = ok("PASS")
-        elif r["ok"] is False:
-            cell = bad("FAIL"); failed += 1
-        else:
-            cell = warn("UNKNOWN")
-        print(f"  {cell}  {r['check']:<26} {dim(r['detail'])}")
-    return failed
 
 
 # ── Gluetun VPN tunnel health ─────────────────────────────────────────────────────
@@ -1059,8 +818,8 @@ def main() -> None:
     # ── OIDC callback paths for django-allauth services only ──────────────
     # Probe ?code=x&state=x exercises verify_jti() → cache.add() → Redis.
     # Only meaningful for services using django-allauth (Tandoor).
-    # Nextcloud (user_oidc PHP app) and AFFiNE (Next.js/next-auth) use
-    # different auth stacks — the probe produces false positives for them.
+    # Nextcloud (user_oidc PHP app) uses a different auth stack — the probe
+    # produces false positives for it.
     _oidc_cb_paths: dict[str, str] = {
         env.get("TANDOOR_SUBDOMAIN", "food"): "/accounts/oidc/authentik/login/callback/",
     }
@@ -1250,23 +1009,6 @@ def main() -> None:
             print(dim(f"  Tip: rerun with --logs <service> to inspect a specific container"))
         elif _all_containers:
             print(ok(f"All {len(_all_containers)} containers healthy"))
-
-    # ── Wazuh deep health (SIEM-layer) ────────────────────────────────────
-    # Catches the "every container healthy but the SIEM is functionally down"
-    # scenario that container health + the 302->auth probe both miss.
-    if not args.no_probe:
-        try:
-            _wz = wazuh_deep_health(env)
-        except (subprocess.SubprocessError, OSError) as exc:
-            _wz = []
-            print(warn(f"\nWazuh deep health skipped: {exc}"))
-        _wz_failed = render_wazuh_deep(_wz)
-        if _wz:
-            print()
-            if _wz_failed:
-                print(bad(f"Wazuh deep health: {_wz_failed} check(s) FAILED — SIEM degraded"))
-            else:
-                print(ok("Wazuh deep health: all SIEM-layer checks pass"))
 
     # ── Gluetun VPN tunnel (egress leak check) ────────────────────────────
     # Confirms apps on gluetun's netns egress via WireGuard, not the host WAN.

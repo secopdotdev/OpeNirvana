@@ -178,7 +178,15 @@ def main() -> int:
         if chosen:
             output_lines.append(f"{key}={chosen}{comment}")
         else:
-            output_lines.append(f"{key}={comment}" if comment else f"{key}=")
+            # Blank value: emit a clean `KEY=` and DROP the inline comment. Docker's
+            # env-file parser and compose-go's dotenv reader mis-handle the
+            # blank-value-plus-comment edge case `KEY=   # comment` by taking the
+            # comment text AS the value — which then defeats `${KEY:-default}` and
+            # can inject the comment as e.g. an image reference (n8n: ADR-0009). A
+            # valued line is safe (the parser strips a trailing comment when a value
+            # precedes it); only the empty case poisons. The documentation still
+            # lives in .env.example.
+            output_lines.append(f"{key}=")
 
     # Keys present in .env but absent from .env.example (excluding retired old names)
     extra = {k: v for k, v in env_values.items()

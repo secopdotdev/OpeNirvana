@@ -15,7 +15,7 @@ x-hardened: &hardened
   # unbounded container (query storm, compromised app, crypto-miner) can starve the
   # scheduler -> healthcheck timeouts -> autoheal restart storm -> cascading failure
   # (perf-resource-workstream.md). Services with their own `cpus:` (caddy, postgres)
-  # override via merge; the heavy wazuh indexers use *wazuh-indexer and are unaffected.
+  # override via merge.
   # Generous + env-tunable so it caps runaways without throttling normal workloads.
   cpus: ${DEFAULT_CPU_LIMIT:-2}
   labels:
@@ -26,35 +26,6 @@ x-logging: &default-logging
   options:
     max-size: "10m"
     max-file: "3"
-
-# Indexer cluster anchor — YAML anchor reused by the three indexer nodes.
-# Each node overrides container_name, environment.node.name, volumes, IP.
-x-wazuh-indexer: &wazuh-indexer
-  image: wazuh/wazuh-indexer:${WAZUH_VERSION}
-  depends_on:
-    wazuh-init:
-      condition: service_completed_successfully
-  ulimits:
-    memlock:
-      soft: -1
-      hard: -1
-    nofile:
-      soft: 65536
-      hard: 65536
-  mem_limit: ${WAZUH_INDEXER_MEM_LIMIT:-2g}
-  healthcheck:
-    # Unauthenticated probe — any HTTP response (including 401/503 before the
-    # security index is seeded) proves the REST port is up. Auth-based probes
-    # would deadlock with wazuh-security-init, which depends on this healthcheck.
-    test: ["CMD-SHELL", "curl -sk --max-time 3 -o /dev/null https://localhost:9200/"]
-    interval: 20s
-    timeout: 10s
-    retries: 15
-    start_period: 180s
-  restart: unless-stopped
-  labels:
-    - autoheal=true
-  logging: *default-logging
 
 networks:
   ingress:
@@ -133,7 +104,7 @@ services:
       # false: leave Docker's embedded resolver (127.0.0.11) in resolv.conf.
       # If true, Tailscale overwrites resolv.conf with 100.100.100.100 which
       # has no knowledge of Docker container names — caddy (which shares this
-      # netns) can't resolve authentik-server, wazuh-dashboard, etc.
+      # netns) can't resolve authentik-server, etc.
       TS_ACCEPT_DNS: "false"
       # Tags (tag:ingress, tag:docker) are applied at authkey-generation time.
       # Run `python3 scripts/set-auth.py tailscale` BEFORE `docker compose up`
@@ -196,6 +167,12 @@ services:
       EXTRA_ALLOWED_IP: ${EXTRA_ALLOWED_IP}
       CADDY_LOG_LEVEL: ${CADDY_LOG_LEVEL}
       CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN}
+      # Cloudflare Authenticated Origin Pulls mTLS mode (ADR-0020 Layer 1).
+      # Default `request` = ask for the edge client cert but never reject — safe
+      # while AOP is being staged. Operator sets `require_and_verify` in .env to
+      # enforce once AOP is confirmed. Consumed by the rendered cf-origin-mtls
+      # snippet; defaulted here so a missing .env entry can never crash Caddy.
+      CLOUDFLARE_MTLS_MODE: ${CLOUDFLARE_MTLS_MODE:-request}
       CROWDSEC_BOUNCER_API_KEY: ${CROWDSEC_BOUNCER_API_KEY}
       REDIS_PASSWORD: ${REDIS_PASSWORD}
       REDIS_DB_CADDY_CACHE: ${REDIS_DB_CADDY_CACHE}
@@ -204,7 +181,6 @@ services:
       # Per-service subdomains — configure in .env.
       # These become {sub}.PUBLIC_FQDN and {sub}.TAILNET_FQDN routes.
       AUTHENTIK_SUBDOMAIN: ${AUTHENTIK_SUBDOMAIN}
-      WAZUH_SUBDOMAIN: ${WAZUH_SUBDOMAIN}
       NEXTCLOUD_SUBDOMAIN: ${NEXTCLOUD_SUBDOMAIN}
       # Media stack subdomains — referenced in Caddyfile even when profile is
       # inactive; unresolvable subdomains just never match so no harm done.
@@ -219,18 +195,17 @@ services:
       NTFY_SUBDOMAIN: ${NTFY_SUBDOMAIN:-ntfy}
       TANDOOR_SUBDOMAIN: ${TANDOOR_SUBDOMAIN:-food}
       VIKUNJA_SUBDOMAIN: ${VIKUNJA_SUBDOMAIN:-todo}
-      AFFINE_SUBDOMAIN: ${AFFINE_SUBDOMAIN:-note}
+      COUCHDB_SUBDOMAIN: ${COUCHDB_SUBDOMAIN:-notes}
       FLARESOLVERR_SUBDOMAIN: ${FLARESOLVERR_SUBDOMAIN:-flare}
       CROWDSEC_SUBDOMAIN: ${CROWDSEC_SUBDOMAIN:-crowd}
-      DOCKHAND_SUBDOMAIN: ${DOCKHAND_SUBDOMAIN:-dock}
       IMMICH_SUBDOMAIN: ${IMMICH_SUBDOMAIN:-pic}
       FALCO_SUBDOMAIN: ${FALCO_SUBDOMAIN:-sec}
       ZEEK_SUBDOMAIN: ${ZEEK_SUBDOMAIN:-net}
       N8N_SUBDOMAIN: ${N8N_SUBDOMAIN:-soar}
       TALK_SUBDOMAIN: ${TALK_SUBDOMAIN:-talk}
       JANUS_SUBDOMAIN: ${JANUS_SUBDOMAIN:-gate}
-      KAFKA_SUBDOMAIN: ${KAFKA_SUBDOMAIN:-kafka}
       GRAFANA_SUBDOMAIN: ${GRAFANA_SUBDOMAIN:-dash}
+      KOMODO_SUBDOMAIN: ${KOMODO_SUBDOMAIN:-komodo}
     volumes:
       - ${DOCK_CONF}/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
       - ${DOCK_CONF}/caddy/snippets:/etc/caddy/snippets:ro
@@ -303,7 +278,7 @@ services:
     logging: *default-logging
 
   torproxy:
-    profiles: [core, netsec]
+    profiles: [tor, netsec]
     image: dperson/torproxy:latest
     container_name: torproxy
     restart: unless-stopped
@@ -363,14 +338,10 @@ services:
       - SETGID
     logging: *default-logging
 
-  # RW Docker-API proxy for the management plane (Dockhand) + autoheal.
-  # Scoped to single-host container management: view + lifecycle (start/stop/
-  # restart/delete), console (EXEC), volumes, images (pull via AUTH +
-  # DISTRIBUTION), and SYSTEM (df/prune). Swarm endpoints (NODES/SECRETS/
-  # CONFIGS) stay off — not a swarm. This grants Dockhand effectively full
-  # Docker control, which a management UI requires; the boundary is that
-  # Dockhand is Authentik-gated and this proxy is reachable only on the
-  # internal `security` network.
+  # RW Docker-API proxy for the management plane (komodo-periphery).
+  # Full management scope for komodo-periphery — an Authentik-gated management
+  # UI that needs exec, delete, image ops. Swarm endpoints (NODES/SECRETS/
+  # CONFIGS) stay off — not a swarm.
   socket-proxy-rw:
     profiles: [core, socket-proxy-rw]
     <<: *hardened
@@ -378,6 +349,8 @@ services:
     container_name: socket-proxy-rw
     mem_limit: 64m
     environment:
+      # Full management scope for komodo-periphery — an Authentik-gated
+      # management UI that needs exec, delete, image ops.
       CONTAINERS: "1"
       SERVICES: "1"
       TASKS: "1"
@@ -415,18 +388,53 @@ services:
       - SETGID
     logging: *default-logging
 
+  # Minimal socket proxy for autoheal — only CONTAINERS (read) + restart.
+  # Autoheal watches container health events and restarts unhealthy ones;
+  # it does not exec, delete, or perform image operations. Keeping it on a
+  # separate proxy prevents autoheal from having any write capability beyond
+  # restart, even if the container were compromised.
+  socket-proxy-autoheal:
+    profiles: [core, autoheal]
+    <<: *hardened
+    image: tecnativa/docker-socket-proxy:${SOCKET_PROXY_VERSION:-v0.4.2}
+    container_name: socket-proxy-autoheal
+    mem_limit: 32m
+    environment:
+      CONTAINERS: "1"
+      EVENTS: "1"
+      POST: "1"
+      ALLOW_RESTARTS: "1"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      security:
+        ipv4_address: 192.0.2.10
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:2375/_ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    read_only: false
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+    logging: *default-logging
+
   autoheal:
     profiles: [core, autoheal]
     <<: *hardened
     image: willfarrell/autoheal:latest
     container_name: autoheal
     depends_on:
-      socket-proxy-rw:
+      socket-proxy-autoheal:
         condition: service_healthy
     environment:
       AUTOHEAL_CONTAINER_LABEL: autoheal
       AUTOHEAL_INTERVAL: "30"
-      DOCKER_SOCK: "tcp://socket-proxy-rw:2375"
+      DOCKER_SOCK: "tcp://socket-proxy-autoheal:2375"
       CURL_TIMEOUT: "30"
     networks:
       - security
@@ -456,9 +464,6 @@ services:
       VIKUNJA_DB_NAME: ${VIKUNJA_DB_NAME}
       VIKUNJA_DB_USER: ${VIKUNJA_DB_USER}
       VIKUNJA_DB_PASSWORD: ${VIKUNJA_DB_PASSWORD}
-      AFFINE_DB_NAME: ${AFFINE_DB_NAME}
-      AFFINE_DB_USER: ${AFFINE_DB_USER}
-      AFFINE_DB_PASSWORD: ${AFFINE_DB_PASSWORD}
       IMMICH_DB_NAME: ${IMMICH_DB_NAME}
       IMMICH_DB_USER: ${IMMICH_DB_USER}
       IMMICH_DB_PASSWORD: ${IMMICH_DB_PASSWORD}
@@ -540,348 +545,6 @@ services:
       retries: 5
       start_period: 10s
     read_only: false
-    logging: *default-logging
-
-  wazuh-init:
-    profiles: [siem, wazuh-init]
-    # One-shot: generates internal TLS certs the first time the stack comes up.
-    # Subsequent runs detect admin.pem and exit 0. Generates each cert with both
-    # IP and DNS SANs so clients connecting via docker-compose service names
-    # (e.g. filebeat -> wazuh-indexer) pass hostname verification.
-    # DNs (C=US, L=California, O=Wazuh, OU=Wazuh, CN=<name>) match the admin_dn
-    # and nodes_dn entries in opensearch.yml.
-    image: alpine:3
-    container_name: wazuh-init
-    user: "0:0"
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - |
-        set -eu
-        if [ -f /certs/admin.pem ]; then
-          echo "wazuh certs already present; skipping generation."
-          exit 0
-        fi
-        apk add --no-cache openssl
-        cd /tmp
-
-        SUBJ_BASE="/C=US/L=California/O=Wazuh/OU=Wazuh"
-
-        openssl genrsa -out root-ca.key 4096
-        openssl req -x509 -new -nodes -key root-ca.key -sha256 -days 3650 \
-          -out root-ca.pem -subj "$${SUBJ_BASE}/CN=root-ca"
-
-        gen_server_cert() {
-          n=$$1; dns=$$2; ip=$$3
-          openssl genrsa -out "$${n}-key.pem" 2048
-          cat > "$${n}.cnf" <<EOF
-        [req]
-        distinguished_name=dn
-        prompt=no
-        [dn]
-        C=US
-        L=California
-        O=Wazuh
-        OU=Wazuh
-        CN=$${n}
-        [v3]
-        basicConstraints=CA:FALSE
-        keyUsage=digitalSignature,keyEncipherment
-        extendedKeyUsage=serverAuth,clientAuth
-        subjectAltName=@san
-        [san]
-        DNS.1=$${dns}
-        IP.1=$${ip}
-        EOF
-          openssl req -new -key "$${n}-key.pem" -out "$${n}.csr" -config "$${n}.cnf"
-          openssl x509 -req -in "$${n}.csr" -CA root-ca.pem -CAkey root-ca.key \
-            -CAcreateserial -out "$${n}.pem" -days 3650 -sha256 \
-            -extfile "$${n}.cnf" -extensions v3
-        }
-
-        # Admin client cert (clientAuth only). CN=admin matches opensearch.yml admin_dn.
-        openssl genrsa -out admin-key-rsa.pem 2048
-        openssl req -new -key admin-key-rsa.pem -out admin.csr \
-          -subj "$${SUBJ_BASE}/CN=admin"
-        cat > admin-ext.cnf <<EOF
-        basicConstraints=CA:FALSE
-        keyUsage=digitalSignature,keyEncipherment
-        extendedKeyUsage=clientAuth
-        EOF
-        openssl x509 -req -in admin.csr -CA root-ca.pem -CAkey root-ca.key \
-          -CAcreateserial -out admin.pem -days 3650 -sha256 -extfile admin-ext.cnf
-        # OpenSearch security plugin expects admin key in PKCS#8.
-        openssl pkcs8 -topk8 -inform PEM -outform PEM -nocrypt \
-          -in admin-key-rsa.pem -out admin-key.pem
-
-        # Indexer cert is shared across all three nodes — one CN, three SANs.
-        openssl genrsa -out wazuh-indexer-key.pem 2048
-        cat > wazuh-indexer.cnf <<EOF
-        [req]
-        distinguished_name=dn
-        prompt=no
-        [dn]
-        C=US
-        L=California
-        O=Wazuh
-        OU=Wazuh
-        CN=wazuh-indexer
-        [v3]
-        basicConstraints=CA:FALSE
-        keyUsage=digitalSignature,keyEncipherment
-        extendedKeyUsage=serverAuth,clientAuth
-        subjectAltName=@san
-        [san]
-        DNS.1=wazuh-indexer-1
-        DNS.2=wazuh-indexer-2
-        DNS.3=wazuh-indexer-3
-        IP.1=192.0.2.10
-        IP.2=192.0.2.10
-        IP.3=192.0.2.10
-        EOF
-        openssl req -new -key wazuh-indexer-key.pem -out wazuh-indexer.csr -config wazuh-indexer.cnf
-        openssl x509 -req -in wazuh-indexer.csr -CA root-ca.pem -CAkey root-ca.key \
-          -CAcreateserial -out wazuh-indexer.pem -days 3650 -sha256 \
-          -extfile wazuh-indexer.cnf -extensions v3
-
-        gen_server_cert wazuh-manager   wazuh-manager   192.0.2.10
-        gen_server_cert wazuh-dashboard wazuh-dashboard 192.0.2.10
-
-        install -o 1000 -g 1000 -m 640 root-ca.pem        /certs/
-        install -o 1000 -g 1000 -m 640 admin.pem          /certs/
-        install -o 1000 -g 1000 -m 640 admin-key.pem      /certs/
-        install -o 1000 -g 1000 -m 640 wazuh-indexer.pem      /certs/indexer.pem
-        install -o 1000 -g 1000 -m 640 wazuh-indexer-key.pem  /certs/indexer-key.pem
-        install -o 1000 -g 1000 -m 640 wazuh-manager.pem      /certs/manager.pem
-        install -o 1000 -g 1000 -m 640 wazuh-manager-key.pem  /certs/manager-key.pem
-        install -o 1000 -g 1000 -m 640 wazuh-dashboard.pem    /certs/dashboard.pem
-        install -o 1000 -g 1000 -m 640 wazuh-dashboard-key.pem /certs/dashboard-key.pem
-        echo "wazuh certs generated."
-    volumes:
-      - ${DOCK_CONF}/wazuh/certs:/certs
-    networks:
-      security:
-        ipv4_address: 192.0.2.10
-    restart: "no"
-    logging: *default-logging
-
-  wazuh-indexer-1:
-    profiles: [siem, wazuh-indexer-1]
-    <<: *wazuh-indexer
-    container_name: wazuh-indexer-1
-    environment:
-      - NODE_NAME=wazuh-indexer-1
-      - bootstrap.memory_lock=true
-      - OPENSEARCH_JAVA_OPTS=-Xms${WAZUH_INDEXER_JVM_HEAP:-1g} -Xmx${WAZUH_INDEXER_JVM_HEAP:-1g}
-      - INDEXER_PASSWORD=${WAZUH_INDEXER_ADMIN_PASSWORD}
-    volumes:
-      - ${DOCK_DATA}/wazuh/indexer-1:/var/lib/wazuh-indexer
-      - ${DOCK_CONF}/wazuh/indexer/opensearch.yml:/usr/share/wazuh-indexer/opensearch.yml:ro
-      - ${DOCK_CONF}/wazuh/certs:/usr/share/wazuh-indexer/certs:ro
-    networks:
-      security:
-        ipv4_address: 192.0.2.10
-
-  wazuh-indexer-2:
-    profiles: [siem, wazuh-indexer-2]
-    <<: *wazuh-indexer
-    container_name: wazuh-indexer-2
-    environment:
-      - NODE_NAME=wazuh-indexer-2
-      - bootstrap.memory_lock=true
-      - OPENSEARCH_JAVA_OPTS=-Xms${WAZUH_INDEXER_JVM_HEAP:-1g} -Xmx${WAZUH_INDEXER_JVM_HEAP:-1g}
-      - INDEXER_PASSWORD=${WAZUH_INDEXER_ADMIN_PASSWORD}
-    volumes:
-      - ${DOCK_DATA}/wazuh/indexer-2:/var/lib/wazuh-indexer
-      - ${DOCK_CONF}/wazuh/indexer/opensearch.yml:/usr/share/wazuh-indexer/opensearch.yml:ro
-      - ${DOCK_CONF}/wazuh/certs:/usr/share/wazuh-indexer/certs:ro
-    networks:
-      security:
-        ipv4_address: 192.0.2.10
-
-  wazuh-indexer-3:
-    profiles: [siem, wazuh-indexer-3]
-    <<: *wazuh-indexer
-    container_name: wazuh-indexer-3
-    environment:
-      - NODE_NAME=wazuh-indexer-3
-      - bootstrap.memory_lock=true
-      - OPENSEARCH_JAVA_OPTS=-Xms${WAZUH_INDEXER_JVM_HEAP:-1g} -Xmx${WAZUH_INDEXER_JVM_HEAP:-1g}
-      - INDEXER_PASSWORD=${WAZUH_INDEXER_ADMIN_PASSWORD}
-    volumes:
-      - ${DOCK_DATA}/wazuh/indexer-3:/var/lib/wazuh-indexer
-      - ${DOCK_CONF}/wazuh/indexer/opensearch.yml:/usr/share/wazuh-indexer/opensearch.yml:ro
-      - ${DOCK_CONF}/wazuh/certs:/usr/share/wazuh-indexer/certs:ro
-    networks:
-      security:
-        ipv4_address: 192.0.2.10
-
-  wazuh-security-init:
-    profiles: [siem, wazuh-security-init]
-    # One-shot: seeds the OpenSearch security index with bcrypt hashes of the
-    # admin and kibanaserver passwords from the environment. Idempotent — a
-    # flag file on the shared certs volume records success.
-    image: wazuh/wazuh-indexer:${WAZUH_VERSION}
-    container_name: wazuh-security-init
-    depends_on:
-      wazuh-indexer-1:
-        condition: service_healthy
-      wazuh-indexer-2:
-        condition: service_healthy
-      wazuh-indexer-3:
-        condition: service_healthy
-    environment:
-      ADMIN_PASSWORD: ${WAZUH_INDEXER_ADMIN_PASSWORD}
-      KIBANASERVER_PASSWORD: ${WAZUH_INDEXER_KIBANASERVER_PASSWORD}
-      OPENSEARCH_JAVA_HOME: /usr/share/wazuh-indexer/jdk
-    user: "1000:1000"
-    entrypoint: ["/bin/bash", "-c"]
-    command:
-      - |
-        set -eu
-        FLAG=/certs/.security-initialized
-        if [ -f "$${FLAG}" ]; then
-          echo "security already initialized; skipping."
-          exit 0
-        fi
-        HASH_TOOL=/usr/share/wazuh-indexer/plugins/opensearch-security/tools/hash.sh
-        SEC_TOOL=/usr/share/wazuh-indexer/plugins/opensearch-security/tools/securityadmin.sh
-        # Wait until the cluster has formed and the default .opendistro_security
-        # index is writable (securityadmin will otherwise 503 on first try).
-        until curl -sk --max-time 3 https://wazuh-indexer-1:9200/_cluster/health \
-            --cacert /certs/root-ca.pem \
-            --cert /certs/admin.pem --key /certs/admin-key.pem \
-            2>&1 | grep -qE 'green|yellow|Security not initialized'; do
-          echo "waiting for indexer cluster..."
-          sleep 5
-        done
-        ADMIN_HASH=$$(bash "$${HASH_TOOL}" -p "$${ADMIN_PASSWORD}" | tail -1)
-        KIB_HASH=$$(bash "$${HASH_TOOL}" -p "$${KIBANASERVER_PASSWORD}" | tail -1)
-        WORK=$$(mktemp -d)
-        cp /usr/share/wazuh-indexer/opensearch-security/*.yml "$${WORK}/"
-        sed -i "/^admin:/,/^[a-z]/ { s|hash: .*|hash: \"$${ADMIN_HASH}\"| }" "$${WORK}/internal_users.yml"
-        sed -i "/^kibanaserver:/,/^[a-z]/ { s|hash: .*|hash: \"$${KIB_HASH}\"| }" "$${WORK}/internal_users.yml"
-        bash "$${SEC_TOOL}" -cd "$${WORK}" -nhnv \
-          -cacert /certs/root-ca.pem \
-          -cert /certs/admin.pem \
-          -key /certs/admin-key.pem \
-          -p 9200 -icl -h wazuh-indexer-1
-        touch "$${FLAG}"
-        echo "wazuh security initialized."
-    volumes:
-      - ${DOCK_CONF}/wazuh/certs:/certs
-    networks:
-      security:
-        ipv4_address: 192.0.2.10
-    restart: "no"
-    logging: *default-logging
-
-  wazuh-manager:
-    profiles: [siem, wazuh-manager]
-    image: wazuh/wazuh-manager:${WAZUH_VERSION}
-    container_name: wazuh-manager
-    depends_on:
-      wazuh-security-init:
-        condition: service_completed_successfully
-      wazuh-indexer-1:
-        condition: service_healthy
-      wazuh-indexer-2:
-        condition: service_healthy
-      wazuh-indexer-3:
-        condition: service_healthy
-    environment:
-      # The filebeat cont-init uses the raw INDEXER_URL value as a single string
-      # inside a YAML flow list: hosts: ['$INDEXER_URL']. Embedding the closing
-      # quote + comma + next entry extends it into a valid three-host array.
-      INDEXER_URL: https://wazuh-indexer-1:9200','https://wazuh-indexer-2:9200','https://wazuh-indexer-3:9200
-      INDEXER_USERNAME: admin
-      INDEXER_PASSWORD: ${WAZUH_INDEXER_ADMIN_PASSWORD}
-      API_USERNAME: wazuh-wui
-      API_PASSWORD: ${WAZUH_API_PASSWORD}
-      # Filebeat trusts the internal root CA generated by wazuh-init.
-      SSL_CERTIFICATE_AUTHORITIES: /etc/ssl/wazuh/root-ca.pem
-      FILEBEAT_SSL_VERIFICATION_MODE: full
-    volumes:
-      - ${DOCK_DATA}/wazuh/manager:/var/ossec/data
-      - ${DOCK_CONF}/wazuh/certs:/etc/ssl/wazuh:ro
-      # Log sources tailed by the localfile block added by maintain.py wazuh.
-      # Bind-mounted at the same host path so ossec.conf paths match exactly.
-      - ${DOCK_CONF}/caddy/logs:${DOCK_CONF}/caddy/logs:ro
-      - ${DOCK_CONF}/crowdsec/notifications:${DOCK_CONF}/crowdsec/notifications:ro
-      - ${DOCK_CONF}/falco:${DOCK_CONF}/falco:ro
-      # Zeek live logs: shared spool/logger dir exposed at the path agent-host.conf
-      # references as /dock/conf/zeek/logs/current/ (bypasses dangling symlink on host).
-      - ${DOCK_DATA}/zeek/spool/logger:${DOCK_CONF}/zeek/logs/current:ro
-      # Cloudflare security event log tailed by Wazuh.
-      - ${DOCK_CONF}/cloudflare:${DOCK_CONF}/cloudflare:ro
-    networks:
-      security:
-        ipv4_address: 192.0.2.10
-    ulimits:
-      nofile:
-        soft: 65536
-        hard: 65536
-    mem_limit: ${WAZUH_MANAGER_MEM_LIMIT:-2g}
-    cap_add:
-      - SYS_RESOURCE
-      - SYS_PTRACE
-    healthcheck:
-      # wazuh-control status exits non-zero when *any* optional daemon isn't
-      # running, so gate on the essential ones individually.
-      test: ["CMD-SHELL", "/var/ossec/bin/wazuh-control status | grep -E 'wazuh-(analysisd|remoted|modulesd|apid) is running' | wc -l | grep -q '^4$'"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 120s
-    restart: unless-stopped
-    labels:
-      - autoheal=true
-    logging: *default-logging
-
-  wazuh-dashboard:
-    profiles: [siem, wazuh-dashboard]
-    image: wazuh/wazuh-dashboard:${WAZUH_VERSION}
-    container_name: wazuh-dashboard
-    depends_on:
-      wazuh-security-init:
-        condition: service_completed_successfully
-      wazuh-indexer-1:
-        condition: service_healthy
-      wazuh-indexer-2:
-        condition: service_healthy
-      wazuh-indexer-3:
-        condition: service_healthy
-      wazuh-manager:
-        condition: service_healthy
-    environment:
-      INDEXER_URL: https://wazuh-indexer-1:9200
-      INDEXER_USERNAME: kibanaserver
-      INDEXER_PASSWORD: ${WAZUH_INDEXER_KIBANASERVER_PASSWORD}
-      WAZUH_API_URL: https://wazuh-manager
-      DASHBOARD_USERNAME: kibanaserver
-      DASHBOARD_PASSWORD: ${WAZUH_INDEXER_KIBANASERVER_PASSWORD}
-    volumes:
-      # Mount only the single file — the image's /config dir also holds
-      # node.options + keystore; shadowing the whole dir breaks the keystore
-      # keystore init done by the entrypoint.
-      - ${DOCK_CONF}/wazuh/dashboard/opensearch_dashboards.yml:/usr/share/wazuh-dashboard/config/opensearch_dashboards.yml:ro
-      # wazuh.yml holds the Wazuh API connection (host, port, username, password).
-      # Persisted here so container recreation doesn't revert to default credentials.
-      - ${DOCK_CONF}/wazuh/dashboard/wazuh.yml:/usr/share/wazuh-dashboard/data/wazuh/config/wazuh.yml
-      - ${DOCK_CONF}/wazuh/certs:/usr/share/wazuh-dashboard/certs:ro
-    networks:
-      security:
-        ipv4_address: 192.0.2.10
-    mem_limit: ${WAZUH_DASHBOARD_MEM_LIMIT:-1g}
-    healthcheck:
-      # 401 from /status means the server is up — Wazuh requires auth to read it.
-      test: ["CMD-SHELL", "curl -kso /dev/null -w '%{http_code}' https://localhost:5601/status | grep -qE '^(200|302|401)$'"]
-      interval: 20s
-      timeout: 10s
-      retries: 10
-      start_period: 90s
-    restart: unless-stopped
-    labels:
-      - autoheal=true
     logging: *default-logging
 
   falco:
@@ -1090,6 +753,10 @@ services:
       AUTHENTIK_REDIS__HOST: redis
       AUTHENTIK_REDIS__PASSWORD: ${REDIS_PASSWORD}
       AUTHENTIK_REDIS__DB: ${REDIS_DB_AUTHENTIK}
+      AUTHENTIK_POSTGRESQL__HOST: postgres
+      AUTHENTIK_POSTGRESQL__USER: ${AUTHENTIK_DB_USER}
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${AUTHENTIK_DB_PASSWORD}
+      AUTHENTIK_POSTGRESQL__NAME: ${AUTHENTIK_DB_NAME}
     extra_hosts:
       # Route example.com to Caddy on the ingress network (avoids Cloudflare
       # round-trip) so OIDC discovery returns public URLs, not internal hostnames.
@@ -1146,6 +813,7 @@ services:
     networks:
       security:
         ipv4_address: 192.0.2.10
+    mem_limit: ${BAO_MEM_LIMIT:-512m}
     healthcheck:
       # /v1/sys/health: 200 = unsealed+active, 503 = sealed, 501 = uninit. Accept 200/429/472/473/501/503
       # as "process up" so a sealed-but-running vault is not flapped as unhealthy.
@@ -1369,21 +1037,26 @@ services:
   # ==========================================================
   # janus — WebRTC media server for Nextcloud Talk HPB.
   # Service name "janus" must match the URL in server.conf [janus].
-  # RTP media ports 20000-20100/udp published to host so WebRTC
+  # RTP media ports 20000-20049/udp published to host so WebRTC
   # peers can reach them directly (Cloudflare does not proxy UDP).
+  # Range narrowed from 20000-20100 to 20000-20049 (~1 UDP port per
+  # concurrent media stream) to halve forwarded-port exposure — these
+  # ports DNAT past UFW. Must match rtp_port_range in janus.jcfg. See
+  # README "Minimizing forwarded-port exposure" (method #6).
   # Admin API on 8188 is routed via Caddy at example.com,
   # gated by Authentik. Internal API on 8088 is talk-network only.
   # nat_1_1_mapping in janus.jcfg must be set to the host public IP.
   # ==========================================================
   janus:
     profiles: [talk, janus]
-    image: ${JANUS_IMAGE:-meetecho/janus-gateway:latest}
+    # digest pinned (verified on first pull): canyan/janus-gateway latest @ 2026-06-08
+    image: ${JANUS_IMAGE:-canyan/janus-gateway@sha256:80970d0b1c407222e2f88d7a6d31a16686fb9a5145a491b4b4d843ee40ee4ce1}
     container_name: janus-gateway
     volumes:
       - ${DOCK_CONF}/janus/janus.jcfg:/usr/local/etc/janus/janus.jcfg:ro
       - ${DOCK_CONF}/janus/janus.transport.http.jcfg:/usr/local/etc/janus/janus.transport.http.jcfg:ro
     ports:
-      - "20000-20100:20000-20100/udp"
+      - "20000-20049:20000-20049/udp"
     networks:
       cloud:
         ipv4_address: 192.0.2.10
@@ -1464,7 +1137,7 @@ services:
     logging: *default-logging
 
   prowlarr:
-    profiles: [video, prowlarr]
+    profiles: [indexers, prowlarr]
     image: lscr.io/linuxserver/prowlarr:${PROWLARR_VERSION:-2.3.5.5327-ls144}
     container_name: prowlarr
     network_mode: "service:gluetun"
@@ -1492,7 +1165,7 @@ services:
     logging: *default-logging
 
   radarr:
-    profiles: [video, radarr]
+    profiles: [movies, radarr]
     image: lscr.io/linuxserver/radarr:${RADARR_VERSION:-6.1.1.10360-ls300}
     container_name: radarr
     network_mode: "service:gluetun"
@@ -1522,7 +1195,7 @@ services:
     logging: *default-logging
 
   sonarr:
-    profiles: [video, sonarr]
+    profiles: [tv, sonarr]
     image: lscr.io/linuxserver/sonarr:${SONARR_VERSION:-4.0.17.2952-ls309}
     container_name: sonarr
     network_mode: "service:gluetun"
@@ -1610,7 +1283,7 @@ services:
 
   qbittorrent:
     profiles: [downloads, qbittorrent]
-    image: lscr.io/linuxserver/qbittorrent:${QBITTORRENT_VERSION:-5.1.4-r3-ls452}
+    image: lscr.io/linuxserver/qbittorrent:${QBIT_VERSION:-5.1.4-r3-ls452}
     container_name: qbittorrent
     network_mode: "service:gluetun"
     depends_on:
@@ -1889,127 +1562,49 @@ services:
     logging: *default-logging
 
   # ==========================================================
-  # AFFiNE — collaborative workspace (Notion alternative).
-  # Auth: OIDC via Authentik configured in the AFFiNE admin panel
-  # (Admin Panel → Settings → OAuth). No Caddy forward-auth.
-  # AFFINE_SERVER_EXTERNAL_URL must match the public URL or
-  # CORS/WebSocket connections will fail (editor won't load).
+  # CouchDB - sync server for the native Obsidian app (obsidian-livesync).
+  # Replaces AFFiNE (ADR-0021). Single-node n=1. Native CouchDB account auth
+  # (livesync clients are native apps, not browsers -> cannot do Authentik SSO).
+  # Sync API is reverse-proxied WITHOUT forward-auth; /_utils Fauxton IS behind
+  # Authentik (Caddy). 5984 is never published to the host.
+  #
+  # Pre-boot host-prep required (docker-host-config.sh, out of scope here):
+  #   mkdir -p ${DOCK_DATA}/couchdb ${DOCK_CONF}/couchdb/local.d
+  #   chown -R 5984:5984 ${DOCK_DATA}/couchdb ${DOCK_CONF}/couchdb/local.d
+  # (cap_drop:ALL + no-new-privileges means the entrypoint cannot chown at boot.)
+  #
+  # ⚠ BOOT CAVEAT — local.d mount is read-write (NOT :ro):
+  # The official couchdb entrypoint writes ${COUCHDB_USER}/${PASSWORD}/${SECRET}
+  # into /opt/couchdb/etc/local.d/docker.ini at every boot under set -e. Mounting
+  # that dir :ro causes the write to fail → container exits → autoheal loop.
+  # The data volume is already writable; this is no meaningful hardening loss.
+  #
+  # read_only rootfs: evaluate during Task 7 boot-test (CouchDB writes
+  # etc/local.ini at boot — left OFF until boot-tested).
   # ==========================================================
-  affine:
-    profiles: [notes, affine]
-    image: ghcr.io/toeverything/affine:${AFFINE_VERSION:-stable}
-    container_name: affine
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis-affine:
-        condition: service_healthy
+  couchdb:
+    profiles: [notes, couchdb]
+    image: couchdb:3.4.3@sha256:af9d39a66d53cbf1cfe53ff20fb093e426f7c09a90d15585e13b028d490a7f08
+    container_name: couchdb
+    user: "5984:5984"
     environment:
-      DATABASE_URL: postgresql://${AFFINE_DB_USER}:${AFFINE_DB_PASSWORD}@postgres:5432/${AFFINE_DB_NAME}
-      REDIS_SERVER_HOST: redis-affine
-      REDIS_SERVER_PORT: "6379"
-      AFFINE_SERVER_EXTERNAL_URL: https://${AFFINE_SUBDOMAIN:-affine}.${PUBLIC_FQDN}
-      AFFINE_SERVER_HOST: "0.0.0.0"
-      AFFINE_SERVER_PORT: "3010"
-      NODE_ENV: production
-      # OIDC — not consumed natively by AFFiNE; available as reference for the
-      # JSON config entered in Admin Panel → Settings → OAuth → OIDC provider.
-      AFFINE_OIDC_ISSUER: ${AFFINE_OIDC_ISSUER:-}
-      AFFINE_OIDC_CLIENT_ID: ${AFFINE_OIDC_CLIENT_ID:-}
-      AFFINE_OIDC_CLIENT_SECRET: ${AFFINE_OIDC_CLIENT_SECRET:-}
+      COUCHDB_USER: ${COUCHDB_USER:-couchadmin}
+      COUCHDB_PASSWORD: ${COUCHDB_PASSWORD}
+      COUCHDB_SECRET: ${COUCHDB_SECRET}
+      ERL_FLAGS: "-setcookie ${COUCHDB_SECRET}"
     volumes:
-      - ${DOCK_DATA}/affine/config:/root/.affine/config
-      - ${DOCK_DATA}/affine/storage:/root/.affine/storage
+      - ${DOCK_DATA}/couchdb:/opt/couchdb/data
+      - ${DOCK_CONF}/couchdb/local.d:/opt/couchdb/etc/local.d
     networks:
       apps:
         ipv4_address: 192.0.2.10
-      data:
-      oidc-clients:
-        ipv4_address: 192.0.2.10
-    mem_limit: ${AFFINE_MEM_LIMIT:-2g}
+    mem_limit: ${COUCHDB_MEM_LIMIT:-512m}
     security_opt:
       - no-new-privileges:true
     cap_drop:
       - ALL
     healthcheck:
-      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3010',r=>{process.exit(r.statusCode<500?0:1)}).on('error',()=>process.exit(1))"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 60s
-    restart: unless-stopped
-    labels:
-      - autoheal=true
-    logging: *default-logging
-
-  # ==========================================================
-  # redis-affine — Dedicated Redis for AFFiNE.
-  # AFFiNE requires noeviction policy (it uses Redis as a primary
-  # key-value store, not a cache). The shared redis uses allkeys-lru
-  # which causes AFFiNE to warn and potentially lose data under memory
-  # pressure. Isolated to the apps network; no password needed.
-  # ==========================================================
-  redis-affine:
-    profiles: [notes, redis-affine]
-    image: redis:7-alpine
-    container_name: redis-affine
-    labels:
-      - autoheal=true
-    command:
-      - redis-server
-      - --maxmemory-policy
-      - noeviction
-      - --protected-mode
-      - "no"
-    networks:
-      apps:
-        ipv4_address: 192.0.2.10
-    mem_limit: ${REDIS_AFFINE_MEM_LIMIT:-512m}
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 3s
-      retries: 5
-      start_period: 5s
-    restart: unless-stopped
-    cap_drop:
-      - ALL
-    cap_add:
-      - SETUID
-      - SETGID
-    security_opt:
-      - no-new-privileges:true
-    read_only: true
-    tmpfs:
-      - /tmp
-    logging: *default-logging
-
-  # ==========================================================
-  # Dockhand — container monitoring + management dashboard.
-  # Gated by Authentik forward-auth.
-  # Uses socket-proxy-rw for full container management.
-  # ==========================================================
-  dockhand:
-    profiles: [container-mgmt, dockhand]
-    image: fnsys/dockhand:latest
-    container_name: dockhand
-    depends_on:
-      socket-proxy-rw:
-        condition: service_healthy
-    environment:
-      DOCKER_HOST: tcp://socket-proxy-rw:2375
-      DATA_DIR: /app/data
-      ENCRYPTION_KEY: ${DOCKHAND_ENCRYPTION_KEY}
-    volumes:
-      - ${DOCK_DATA}/dockhand:/app/data
-    networks:
-      security:
-        ipv4_address: 192.0.2.10
-    mem_limit: ${DOCKHAND_MEM_LIMIT:-256m}
-    security_opt:
-      - no-new-privileges:true
-    healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:3000/"]
+      test: ["CMD", "curl", "-sf", "http://localhost:5984/_up"]
       interval: 30s
       timeout: 10s
       retries: 5
@@ -2018,6 +1613,7 @@ services:
     labels:
       - autoheal=true
     logging: *default-logging
+
 
   # ==========================================================
   # Falco Sidekick — receives Falco security events via HTTP and
@@ -2033,8 +1629,6 @@ services:
       - falco
     environment:
       WEBUI_URL: https://${FALCO_SUBDOMAIN:-sec}.${PUBLIC_FQDN}
-      KAFKA_HOSTPORT: redpanda:9092
-      KAFKA_TOPIC: falco.alerts
       NTFY_HOSTPORT: "ntfy:80"
       NTFY_TOPIC: "falco"
       NTFY_CHECKCERT: "false"
@@ -2093,7 +1687,8 @@ services:
     environment:
       SIDEKICK_URL: http://falcosidekick:2801
       FALCOSIDEKICK_UI_REDIS_URL: redis-falco:6379
-      FALCOSIDEKICK_UI_DISABLEAUTH: "true"
+      FALCOSIDEKICK_UI_USER: ${FALCOSIDEKICK_UI_USER}
+      FALCOSIDEKICK_UI_PASSWORD: ${FALCOSIDEKICK_UI_PASSWORD}
     networks:
       security:
         ipv4_address: 192.0.2.10
@@ -2126,6 +1721,11 @@ services:
     volumes:
       - ${DOCK_CONF}/zeek/logs:/srv:ro
       - ${DOCK_DATA}/zeek-logs:/database
+      # filebrowser writes settings.json to /config. Bind it to /dock (owned 1010
+      # by docker-host-config) instead of letting the image's VOLUME /config
+      # become an anonymous root:root volume — which breaks the 1010 process on
+      # first write and would not survive `docker compose down -v`.
+      - ${DOCK_CONF}/zeek-logs:/config
     networks:
       security:
         ipv4_address: 192.0.2.10
@@ -2138,97 +1738,6 @@ services:
       timeout: 10s
       retries: 5
       start_period: 15s
-    restart: unless-stopped
-    labels:
-      - autoheal=true
-    logging: *default-logging
-
-  # ==========================================================
-  # Redpanda — Kafka-protocol message broker for security events.
-  # Falcosidekick publishes to falco.alerts; n8n consumes from it.
-  # redpanda-init (one-shot) creates topics with retention settings.
-  # redpanda-console exposes a read-only topic inspector at
-  # kafka-console.{PUBLIC_FQDN}, gated by Authentik forward-auth.
-  # Prometheus metrics: http://redpanda:9644/public_metrics
-  # ==========================================================
-  redpanda:
-    profiles: [streaming, redpanda]
-    image: docker.redpanda.com/redpandadata/redpanda:latest
-    container_name: redpanda
-    command:
-      - redpanda
-      - start
-      - --mode dev-container
-      - --smp 1
-      - --memory 400M
-      - --reserve-memory 0M
-      - --default-log-level=info
-      - --kafka-addr internal://0.0.0.0:9092
-      - --advertise-kafka-addr internal://redpanda:9092
-      - --rpc-addr redpanda:33145
-      - --advertise-rpc-addr redpanda:33145
-    volumes:
-      - ${DOCK_DATA}/redpanda:/var/lib/redpanda/data
-    networks:
-      security:
-        ipv4_address: 192.0.2.10
-    mem_limit: 512m
-    cpus: 1
-    security_opt:
-      - no-new-privileges:true
-    healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:9644/v1/cluster/health_overview"]
-      interval: 15s
-      timeout: 10s
-      retries: 5
-      start_period: 30s
-    restart: unless-stopped
-    labels:
-      - autoheal=true
-    logging: *default-logging
-
-  redpanda-init:
-    profiles: [streaming, redpanda-init]
-    image: docker.redpanda.com/redpandadata/redpanda:latest
-    container_name: redpanda-init
-    depends_on:
-      redpanda:
-        condition: service_healthy
-    entrypoint: ["/bin/bash", "-c"]
-    command:
-      - >-
-        rpk topic create falco.alerts falco.alerts.dlq
-        --brokers redpanda:9092
-        --topic-config retention.ms=604800000
-        --topic-config retention.bytes=1073741824
-        --if-not-exists
-    networks:
-      security:
-    restart: "no"
-    logging: *default-logging
-
-  redpanda-console:
-    profiles: [streaming, redpanda-console]
-    image: docker.redpanda.com/redpandadata/console:latest
-    container_name: redpanda-console
-    depends_on:
-      redpanda:
-        condition: service_healthy
-    environment:
-      KAFKA_BROKERS: redpanda:9092
-      KAFKA_SCHEMAREGISTRY_ENABLED: "false"
-    networks:
-      security:
-        ipv4_address: 192.0.2.10
-    mem_limit: 256m
-    security_opt:
-      - no-new-privileges:true
-    healthcheck:
-      test: ["CMD-SHELL", "wget -q --spider http://localhost:8080/"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-      start_period: 30s
     restart: unless-stopped
     labels:
       - autoheal=true
@@ -2314,11 +1823,13 @@ services:
   # ==========================================================
   n8n:
     profiles: [automation, n8n]
-    # Pinned (was :latest): an unpinned latest shipped a node binary with a
-    # libstdc++ ABI mismatch ("Error relocating /usr/local/bin/node: symbol
-    # not found", exit 127) that crash-looped 2000+ times. Pin a known-good
-    # version; bump N8N_VERSION in .env after testing a new release.
-    image: docker.n8n.io/n8nio/n8n:${N8N_VERSION:-2.21.7}
+    # Digest-pinned (ADR-0009). An unpinned :latest once shipped a node binary
+    # with a libstdc++ ABI mismatch ("Error relocating /usr/local/bin/node:
+    # symbol not found", exit 127) that crash-looped 2000+ times. The digest
+    # below is the multi-arch index for n8nio/n8n:2.21.7; to bump, resolve the
+    # new tag's digest and update N8N_IMAGE. N8N_VERSION is now reference-only
+    # (see .env.example) — the digest is authoritative.
+    image: ${N8N_IMAGE:-n8nio/n8n@sha256:9f1f8e4c093c9924338bd168e3f813f746041d13b337753af0dbdd329e7b50f7}
     container_name: n8n
     depends_on:
       postgres:
@@ -2445,6 +1956,7 @@ services:
     depends_on:
       clickhouse:
         condition: service_healthy
+        required: false
     environment:
       CLICKHOUSE_VECTOR_PASSWORD: ${CLICKHOUSE_VECTOR_PASSWORD}
     volumes:
@@ -2472,11 +1984,14 @@ services:
     profiles: [viz, grafana]
     image: grafana/grafana-oss:${GRAFANA_VERSION:-latest}
     container_name: grafana
+    group_add:
+      - "${PGID:-1010}"   # media group: read 0640 /dock/conf/grafana provisioning (runs as 472)
     depends_on:
       prometheus:
         condition: service_healthy
       clickhouse:
         condition: service_healthy
+        required: false
     environment:
       GF_INSTALL_PLUGINS: "grafana-clickhouse-datasource"
       GF_SERVER_ROOT_URL: https://${GRAFANA_SUBDOMAIN:-dash}.${PUBLIC_FQDN}
@@ -2527,6 +2042,12 @@ services:
     profiles: [metrics, prometheus]
     image: prom/prometheus:${PROMETHEUS_VERSION:-latest}
     container_name: prometheus
+    # media group (1010): /dock/conf configs are 0640 owned 1010:1010 but this
+    # container runs as nobody(65534); without the supplementary group it cannot
+    # read /etc/prometheus/prometheus.yml (permission denied -> CrashLoop). Conf
+    # is non-secret (ADR-0004), so group-read is the correct perm-preserving fix.
+    group_add:
+      - "${PGID:-1010}"
     labels:
       - autoheal=true
     command:
@@ -2578,8 +2099,15 @@ services:
     # docker-*.scope first and emits only the opaque cgroup `id`, breaking
     # per-container dashboards. (Appended to the image entrypoint; containerd
     # stays at its default socket — the docker factory depends on it.)
+    # --store_container_labels=false: do NOT explode every Docker label into a
+    # container_label_* Prometheus series. With the full stack this label
+    # cardinality is cadvisor's dominant memory cost and drove a chronic
+    # OOM-kill loop at the 256m cap (113 restarts). No dashboard groups by
+    # container_label_* (verified), so dropping them is free. mem_limit raised
+    # to 512m as headroom, not as the primary lever.
     command:
       - --docker_only=true
+      - --store_container_labels=false
     devices:
       - /dev/kmsg:/dev/kmsg
     volumes:
@@ -2591,7 +2119,7 @@ services:
     networks:
       monitoring:
         ipv4_address: 192.0.2.10
-    mem_limit: ${CADVISOR_MEM_LIMIT:-256m}
+    mem_limit: ${CADVISOR_MEM_LIMIT:-512m}
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:8080/healthz | grep -q ok"]
       interval: 30s
@@ -2710,14 +2238,15 @@ services:
   # Alertmanager — routes Prometheus alerts to ntfy (push).
   # Receives alerts from Prometheus on port 9093 and forwards
   # them as webhooks to ntfy for push notification delivery.
-  # SETUP: after first deploy, run:
-  #   docker exec ntfy ntfy access '*' alerts write-only
+  # ntfy ACL is provisioned automatically by scripts/ntfy-setup.py (run.sh post-deploy).
   # Docs: https://prometheus.io/docs/alerting/latest/alertmanager/
   # ==========================================================
   alertmanager:
     profiles: [metrics, alertmanager]
     image: prom/alertmanager:${ALERTMANAGER_VERSION:-v0.28.0}
     container_name: alertmanager
+    group_add:
+      - "${PGID:-1010}"   # media group: read 0640 /dock/conf/alertmanager config (runs as nobody)
     depends_on:
       prometheus:
         condition: service_healthy
@@ -2762,6 +2291,8 @@ services:
     container_name: loki
     command: -config.file=/etc/loki/loki.yml
     user: "10001:10001"
+    group_add:
+      - "${PGID:-1010}"   # media group: read 0640 /dock/conf/loki/loki.yml (runs as 10001)
     volumes:
       - ${DOCK_CONF}/loki/loki.yml:/etc/loki/loki.yml:ro
       - ${DOCK_DATA}/loki:/loki
@@ -2805,6 +2336,7 @@ services:
     user: "473:473"
     group_add:
       - "${DOCKER_GID:-983}"
+      - "${PGID:-1010}"   # media group: read 0640 /dock/conf/alloy/config.alloy (runs as 473)
     volumes:
       - ${DOCK_CONF}/alloy/config.alloy:/etc/alloy/config.alloy:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
@@ -2831,3 +2363,125 @@ services:
     labels:
       - autoheal=true
     logging: *default-logging
+
+  # ==========================================================
+  # Komodo — Docker Compose management UI (ADR-0002).
+  # Gated by Authentik forward-auth. Uses socket-proxy-rw for
+  # compose operations. OIDC via Authentik native provider.
+  # GPL-3.0 — internal use only (SaaS loophole; legal sign-off
+  # required before startup milestone). See ADR-0002.
+  # ==========================================================
+  komodo-mongo:
+    profiles: [container-mgmt, komodo]
+    image: mongo:8.0
+    container_name: komodo-mongo
+    # Run as mongo's native mongodb uid (999). With cap_drop:ALL +
+    # no-new-privileges the root entrypoint cannot chown /data/db nor setuid to
+    # drop privileges, so it must start as the target user with a pre-owned data
+    # dir (see the komodo-mongo [[ownership]] entry in profiles.toml).
+    user: "999:999"
+    command: ["--quiet"]
+    volumes:
+      - ${DOCK_DATA}/komodo/mongo:/data/db
+    networks:
+      security:
+        ipv4_address: 192.0.2.10
+    mem_limit: ${KOMODO_MONGO_MEM_LIMIT:-256m}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      # mongosh 2.8.x is a Node app with a ~2-5s cold start, so a 5s timeout flakily
+      # times out and the deploy's `--wait` rolls Komodo back. Give it headroom.
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 15s
+      timeout: 15s
+      retries: 5
+      start_period: 40s
+    restart: unless-stopped
+    labels:
+      - autoheal=true
+    logging: *default-logging
+
+  komodo-core:
+    profiles: [container-mgmt, komodo]
+    image: ghcr.io/moghtech/komodo-core:${KOMODO_VERSION:-2.2.0}
+    container_name: komodo-core
+    depends_on:
+      komodo-mongo:
+        condition: service_healthy
+      socket-proxy-rw:
+        condition: service_healthy
+    environment:
+      KOMODO_DATABASE_ADDRESS: komodo-mongo:27017
+      KOMODO_HOST: https://${KOMODO_SUBDOMAIN:-komodo}.${PUBLIC_FQDN}
+      KOMODO_PASSKEY: ${KOMODO_PASSKEY}
+      # Native OIDC (supported since v1.15).
+      KOMODO_OIDC_ENABLED: "true"
+      KOMODO_OIDC_PROVIDER: https://${AUTHENTIK_SUBDOMAIN}.${PUBLIC_FQDN}/application/o/komodo/
+      KOMODO_OIDC_CLIENT_ID: ${KOMODO_OIDC_CLIENT_ID}
+      KOMODO_OIDC_CLIENT_SECRET: ${KOMODO_OIDC_CLIENT_SECRET}
+      KOMODO_OIDC_USE_FULL_EMAIL: "true"
+    networks:
+      security:
+        ipv4_address: 192.0.2.10
+    mem_limit: ${KOMODO_MEM_LIMIT:-512m}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9120"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    labels:
+      - autoheal=true
+    logging: *default-logging
+
+  komodo-periphery:
+    profiles: [container-mgmt, komodo]
+    image: ghcr.io/moghtech/komodo-periphery:${KOMODO_VERSION:-2.2.0}
+    container_name: komodo-periphery
+    depends_on:
+      komodo-core:
+        condition: service_healthy
+      socket-proxy-rw:
+        condition: service_healthy
+    environment:
+      PERIPHERY_PASSKEYS: ${KOMODO_PASSKEY}
+      # Route all Docker API calls through the existing socket-proxy-rw.
+      # Komodo Periphery runs root by default (issues #87/#894/#974).
+      # TODO: switch to user: "UID:GID" once rootless periphery lands upstream.
+      DOCKER_HOST: tcp://socket-proxy-rw:2375
+      # Disable container exec terminals — Periphery is a deploy agent, not a shell.
+      # socket-proxy-rw has EXEC:1; this adds app-layer defense.
+      PERIPHERY_DISABLE_CONTAINER_TERMINALS: "true"
+    networks:
+      security:
+        ipv4_address: 192.0.2.10
+    mem_limit: ${KOMODO_PERIPHERY_MEM_LIMIT:-256m}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      # Periphery (v2.2.0) serves HTTPS-only on :8120 with a self-signed cert and
+      # exposes NO /health route (it's a passkey-signed agent API, not a web app):
+      # http://:8120 → connection refused, https://:8120/health → 404, https://:8120/ → 400.
+      # A response-agnostic liveness probe (drop -f, accept any HTTP status incl. 400)
+      # over https with -k is the correct signal: TLS port answering == process alive.
+      # The prior `curl -sf http://.../health` could never pass → autoheal restart loop.
+      test: ["CMD-SHELL", "curl -sk -o /dev/null https://localhost:8120/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    labels:
+      - autoheal=true
+    logging: *default-logging
+

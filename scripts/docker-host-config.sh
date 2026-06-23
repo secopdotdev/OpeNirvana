@@ -171,6 +171,72 @@ create_user_and_groups() {
         useradd -m -u 1010 -g 1010 -s /bin/bash svc-user
     fi
     usermod -aG docker svc-user || true
+
+    # The operator who runs run.sh (this script's sudo invoker) must ALSO reach
+    # the docker socket: run.sh invokes `docker compose` as that user, not as the
+    # svc-user service account. Adding only svc-user (above) left the real
+    # deploy user (e.g. admin on prod-host) unable to talk to
+    # /var/run/docker.sock. Derive the operator from $SUDO_USER so this is
+    # host-agnostic and idempotent (usermod -aG is additive, safe to re-run).
+    local _operator="${SUDO_USER:-}"
+    if [[ -n "$_operator" && "$_operator" != "root" && "$_operator" != "svc-user" ]]; then
+        usermod -aG docker "$_operator" || true
+        c_grn "  added operator '$_operator' to docker group"
+    fi
+}
+
+# Returns 0 if <user> already has a Docker Hub (index.docker.io) credential.
+_docker_hub_authed() {
+    local u="$1" home
+    home=$(getent passwd "$u" | cut -d: -f6)
+    [[ -n "$home" && -f "$home/.docker/config.json" ]] || return 1
+    grep -q 'index\.docker\.io' "$home/.docker/config.json" 2>/dev/null
+}
+
+configure_docker_registry_auth() {
+    step "Authenticating to Docker Hub (docker.io)..."
+    # WHY: the stack pulls ~50 images from Docker Hub; anonymous pulls hit the
+    # 100-per-6h rate limit and abort `compose up`. An authenticated login draws
+    # on the operator's account budget instead. `docker login` is PER-USER and
+    # PER-registry-hostname, so we authenticate every user that runs docker compose:
+    #   svc-user — the compose-stack.service account (systemd User=svc-user)
+    #   $SUDO_USER — the operator who runs run.sh's `docker compose` directly
+    # BOOTSTRAP-CLEARTEXT (deliberate): the token comes from .env, not OpenBao —
+    # OpenBao's own image must be pulled before it can serve secrets (chicken/egg).
+    # Use a PULL-SCOPED Docker Hub access token, never the account password.
+    local hub_user hub_token
+    hub_user=$(env_get DOCKERHUB_USERNAME)
+    hub_token=$(env_get DOCKERHUB_TOKEN)
+
+    # No creds supplied: preserve any existing interactive login (e.g. a host that
+    # was logged in by hand) rather than failing or clobbering it.
+    if [[ -z "$hub_user" || -z "$hub_token" ]]; then
+        if _docker_hub_authed svc-user; then
+            c_grn "  no DOCKERHUB_TOKEN in .env; svc-user already authenticated — preserved"
+        else
+            c_yel "  no DOCKERHUB_USERNAME/DOCKERHUB_TOKEN in .env and no existing login;"
+            c_yel "  Docker Hub pulls will be anonymous and may hit the rate limit."
+        fi
+        return 0
+    fi
+
+    # Build the unique user set (svc-user + operator, deduped, never root).
+    local users=("svc-user") u home
+    if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" && "$SUDO_USER" != "svc-user" ]]; then
+        users+=("$SUDO_USER")
+    fi
+    for u in "${users[@]}"; do
+        id "$u" >/dev/null 2>&1 || { c_yel "  user $u missing; skipping"; continue; }
+        home=$(getent passwd "$u" | cut -d: -f6)
+        # runuser drops privileges; `env HOME=` forces the credential into the
+        # target user's ~/.docker/config.json (runuser does not set HOME without -l).
+        if printf '%s' "$hub_token" \
+            | runuser -u "$u" -- env HOME="$home" docker login -u "$hub_user" --password-stdin >/dev/null 2>&1; then
+            c_grn "  $u authenticated to docker.io"
+        else
+            c_red "  docker login failed for $u — check DOCKERHUB_USERNAME/DOCKERHUB_TOKEN"
+        fi
+    done
 }
 
 create_dock_tree() {
@@ -181,7 +247,6 @@ create_dock_tree() {
         /dock/conf/socket-proxy-ro
         /dock/conf/socket-proxy-rw
         /dock/conf/authentik/{media,custom-templates,certs}
-        /dock/conf/wazuh/{manager,indexer,dashboard,certs,decoders,rules}
         /dock/conf/falco/rules.d
         /dock/conf/zeek/{intel,logs}
         /dock/conf/cloudflare
@@ -196,14 +261,12 @@ create_dock_tree() {
         /dock/conf/janus
         /dock/data/authentik
         /dock/data/nextcloud
-        /dock/data/wazuh/{indexer-1,indexer-2,indexer-3,manager}
         # Media stack data
         /dock/data/jellyfin
         # Productivity stack data
         /dock/data/ntfy/{cache,data}
         /dock/data/tandoor/{media,static}
         /dock/data/vikunja
-        /dock/data/affine/{config,storage}
         /dock/db/postgres/{data,init.d}
         /dock/db/redis
         /dock/tail/ingress
@@ -217,53 +280,51 @@ create_dock_tree() {
     # as root:root 755. Fix the whole tree once — but only when postgres/data is
     # empty, meaning the stack has never run. On re-runs this is skipped to avoid
     # resetting ownership on live container-managed files (Postgres data, Redis
-    # appendonly, Wazuh indices).
+    # appendonly).
     if [ -z "$(ls -A /dock/db/postgres/data 2>/dev/null)" ]; then
         chown -R 1010:1010 /dock
         find /dock -type d -exec chmod 770 {} +
     fi
-    # OpenBao secrets backend — tighter perms (700) because these paths hold
-    # Shamir key material (init.json escrow) and audit logs. No group write.
-    # /dock/conf/openbao/config  — mounted :ro into the container for openbao.hcl
-    # /dock/data/openbao/data    — file storage backend (KV, leases, tokens)
-    # /dock/data/openbao/audit   — file audit sink
-    install -d -m 700 /dock/conf/openbao/config
-    install -d -m 700 /dock/data/openbao/data
-    install -d -m 700 /dock/data/openbao/audit
-    # Tighter perms on DB dirs
-    chmod 700 /dock/db/postgres/data /dock/db/redis
-    # Wazuh images ship uid 1000 (wazuh-indexer/wazuh-dashboard). Manager runs as root
-    # so it can read everything; indexer + dashboard need ownership of their own trees
-    # and the shared certs dir. Perms stay 750 — group (media/1001) retains read.
-    chown -R 1000:1000 \
-        /dock/conf/wazuh/indexer \
-        /dock/conf/wazuh/dashboard \
-        /dock/conf/wazuh/certs \
-        /dock/data/wazuh/indexer-1 \
-        /dock/data/wazuh/indexer-2 \
-        /dock/data/wazuh/indexer-3
-    chmod 750 /dock/conf/wazuh/indexer /dock/conf/wazuh/dashboard /dock/conf/wazuh/certs
-    # Authentik runs as uid 1000 via the x-hardened anchor and needs rw access
-    # to its media + custom-templates dirs.
-    chown -R 1000:1000 /dock/conf/authentik /dock/data/authentik
-    # Nextcloud official image runs as www-data (uid 33:gid 33). The data dir
-    # and ALL files within it must be owned by 33:33. A non-recursive chown here
-    # leaves Nextcloud-written files (including .htaccess) at 1010:1010 if this
-    # script is re-run after the first start, causing Apache to deny all requests
-    # with "unable to read htaccess file".
-    chown -R 33:33 /dock/data/nextcloud
-    # Tandoor runs as uid 1000 (gunicorn/django). Media + static dirs need 1000 ownership.
-    chown -R 1000:1000 /dock/data/tandoor
-    # Vikunja runs as uid 1000. Files dir needs 1000 ownership.
-    chown -R 1000:1000 /dock/data/vikunja
-    # ntfy and AFFiNE run as root (uid 0) with cap_drop:ALL (no DAC_OVERRIDE).
-    # Without DAC_OVERRIDE, the containerised root cannot access dirs owned by
-    # 1010:1010 with mode 770. Own them by root so the process has normal
-    # owner-level access without elevated capabilities.
-    chown -R root:root /dock/data/ntfy /dock/conf/ntfy
-    chmod -R 755 /dock/data/ntfy /dock/conf/ntfy
-    chown -R root:root /dock/data/affine
-    chmod -R 755 /dock/data/affine
+    # ── Per-service ownership (ADR-0014) ──────────────────────────────────────
+    # Everything above leaves the tree at the 1010:1010 / mode-770 baseline. The
+    # exceptions below — services that run as other UIDs (openbao=100, nextcloud=33,
+    # authentik/tandoor/vikunja/n8n=1000, prometheus/alertmanager=65534, loki=10001,
+    # grafana=472, alloy=473, zeek-logs=1010, ntfy=root, couchdb=5984) or need tighter
+    # modes (openbao/db=700) — are now DATA in profiles.toml [[ownership]], emitted
+    # by `profiles.py --ownership-manifest` and applied here in one idempotent loop.
+    # This ends the whack-a-mole: a non-1010 service declares its ownership at
+    # catalog-edit time instead of CrashLooping on first deploy until someone
+    # appends another chown. The numeric `chown` below (not `install -d -o <uid>`)
+    # is deliberate — fixed container UIDs like loki=10001 have no host passwd
+    # entry, and GNU `install -o` calls getpwnam and would abort on them.
+    #
+    # Fail loud (ADR-0014): a missing profiles.py or malformed TOML aborts host
+    # prep — never a silent fall-back to partial/old ownership.
+    local _ownership
+    if ! _ownership="$(python3 "$REPO_DIR/scripts/profiles.py" --ownership-manifest)"; then
+        c_red "FATAL: profiles.py --ownership-manifest failed — aborting host prep (ADR-0014 fail-loud)"
+        exit 1
+    fi
+    if [ -z "$_ownership" ]; then
+        c_red "FATAL: ownership manifest is empty — aborting host prep (ADR-0014 fail-loud)"
+        exit 1
+    fi
+    # Columns: path<TAB>uid<TAB>gid<TAB>mode<TAB>chown_recursive<TAB>chmod_recursive
+    # uid/gid/mode == "-" leaves that dimension at the baseline (a mode-only entry
+    # keeps the 1010 owner; a chown-only entry keeps mode 770). The recursion flags
+    # preserve the exact -R vs top-only behaviour of the original lines (openbao
+    # chowns -R but chmods top-only; ntfy does both -R; observability neither).
+    local _path _uid _gid _mode _crec _mrec
+    while IFS=$'\t' read -r _path _uid _gid _mode _crec _mrec; do
+        [ -n "$_path" ] || continue
+        mkdir -p "$_path"
+        if [ "$_uid" != "-" ]; then
+            if [ "$_crec" = "1" ]; then chown -R "$_uid:$_gid" "$_path"; else chown "$_uid:$_gid" "$_path"; fi
+        fi
+        if [ "$_mode" != "-" ]; then
+            if [ "$_mrec" = "1" ]; then chmod -R "$_mode" "$_path"; else chmod "$_mode" "$_path"; fi
+        fi
+    done <<< "$_ownership"
 }
 
 copy_templates() {
@@ -282,11 +343,16 @@ copy_templates() {
             install -D -o 1010 -g 1010 -m 640 "$f" "$dst"
         fi
     done
-    # Postgres init scripts go under /dock/db/postgres/init.d/
-    if [ -f "$src/postgres/init.d/00-create-app-dbs.sh" ]; then
-        install -D -o 1010 -g 1010 -m 750 \
-            "$src/postgres/init.d/00-create-app-dbs.sh" \
-            /dock/db/postgres/init.d/00-create-app-dbs.sh
+    # Postgres init scripts go under /dock/db/postgres/init.d/ — copy ALL of them
+    # (00-create-app-dbs.sh provisions roles/DBs; 01-immich-extensions.sh creates
+    # the superuser-only extensions immich needs). Always refresh so script fixes
+    # propagate to the host copy that postgres mounts.
+    if [ -d "$src/postgres/init.d" ]; then
+        for initf in "$src"/postgres/init.d/*.sh; do
+            [ -e "$initf" ] || continue
+            install -D -o 1010 -g 1010 -m 750 \
+                "$initf" "/dock/db/postgres/init.d/$(basename "$initf")"
+        done
     fi
     # Render interpolated configs that can't be envsubst'd at container runtime.
     # Zeek reads /etc/zeek/node.cfg at startup and needs lb_procs as a bare integer
@@ -356,7 +422,13 @@ sync_caddy_config() {
     while IFS= read -r f; do
         local rel="${f#"$src"/}"
         # Skip the build context — it's baked into the image, not bind-mounted.
-        case "$rel" in build/*) continue ;; esac
+        # Skip cf-origin-mtls.caddy — render_cf_origin_mtls owns it (active vs
+        # no-op depends on host AOP state); a blind copy of the no-op template
+        # would revert a provisioned snippet and drop mTLS.
+        case "$rel" in
+            build/*) continue ;;
+            snippets/cf-origin-mtls.caddy) continue ;;
+        esac
         local dst="/dock/conf/caddy/${rel}"
         install -d -o 1010 -g 1010 -m 750 "$(dirname "$dst")"
         if [ ! -f "$dst" ] || ! cmp -s "$f" "$dst"; then
@@ -385,6 +457,105 @@ sync_caddy_config() {
         fi
     else
         c_grn "Caddy config already up to date."
+    fi
+}
+
+# Sync CouchDB local.d config from templates/ into /dock/conf/couchdb/local.d.
+# The dir AND files must be owned by uid 5984 (the container runs as 5984:5984
+# with cap_drop:ALL, so it cannot chown at runtime) and the dir must be WRITABLE
+# by 5984 — the official entrypoint writes its own docker.ini (admin creds) into
+# this same dir at every boot. Idempotent: only re-installs files that changed.
+sync_couchdb_config() {
+    step "Syncing CouchDB config from templates/..."
+    local src="$REPO_DIR/templates/couchdb/local.d"
+    [ -d "$src" ] || { c_yel "No $src; skipping CouchDB config sync"; return 0; }
+    # 5984 owns the dir (rwx) so the entrypoint can write docker.ini alongside ours.
+    install -d -o 5984 -g 5984 -m 700 /dock/conf/couchdb/local.d
+    while IFS= read -r f; do
+        local rel="${f#"$src"/}"
+        local dst="/dock/conf/couchdb/local.d/${rel}"
+        install -d -o 5984 -g 5984 -m 700 "$(dirname "$dst")"
+        if [ ! -f "$dst" ] || ! cmp -s "$f" "$dst"; then
+            install -o 5984 -g 5984 -m 640 "$f" "$dst"
+            c_grn "  updated /dock/conf/couchdb/local.d/${rel}"
+        else
+            # copy_templates runs first and lays every template down as 1010:1010
+            # (640). The couchdb container runs as 5984 and reads its config as owner,
+            # so enforce 5984:5984 + 640 even when the content is byte-identical —
+            # otherwise the gate above skips the install and couchdb crashes on a
+            # config-read eacces. Ownership must not be gated on content change.
+            chown 5984:5984 "$dst"
+            chmod 640 "$dst"
+        fi
+    done < <(find "$src" -type f)
+}
+
+# ADR-0020 Layer 1: render the Cloudflare origin-pull mTLS snippet from host AOP
+# state. The template snippet ships EMPTY (no-op) so Caddy always boots; this
+# function activates client_auth ONLY when an origin-pull trust anchor exists,
+# and reverts to the no-op when it does not. Idempotent (byte-compare + validate
+# before restart). Standalone-dispatchable; called from main() (after
+# sync_caddy_config) and from provision_origin_pull on success.
+render_cf_origin_mtls() {
+    step "Rendering Cloudflare origin-pull mTLS snippet (ADR-0020 Layer 1)..."
+    local snip=/dock/conf/caddy/snippets/cf-origin-mtls.caddy
+    local ca_dst=/dock/conf/caddy/snippets/cf-origin-pull-ca.pem
+    local op_dir=/dock/conf/cloudflare/origin-pull
+    # Trust anchor: an explicit CA (CA-signed client cert) wins; otherwise the
+    # self-signed client cert is its own anchor.
+    local anchor=""
+    if [ -s "$op_dir/ca.pem" ]; then
+        anchor="$op_dir/ca.pem"
+    elif [ -s "$op_dir/client.pem" ]; then
+        anchor="$op_dir/client.pem"
+    fi
+    install -d -o 1010 -g 1010 -m 750 /dock/conf/caddy/snippets
+    local tmp; tmp="$(mktemp)"
+    if [ -n "$anchor" ]; then
+        # Deliver the trust anchor into the (bind-mounted) snippets dir;
+        # `import snippets/*.caddy` ignores the .pem so it is never parsed.
+        install -o 1010 -g 1010 -m 640 "$anchor" "$ca_dst"
+        printf '%s\n' \
+            '# RENDERED by docker-host-config.sh:render_cf_origin_mtls — do not edit by hand.' \
+            '# Active: an origin-pull trust anchor was found. Reverts to no-op when removed.' \
+            '# Mode staged via {$CLOUDFLARE_MTLS_MODE} (compose default = request).' \
+            '(cf-origin-mtls) {' \
+            $'\tclient_auth {' \
+            $'\t\tmode {$CLOUDFLARE_MTLS_MODE:request}' \
+            $'\t\ttrust_pool file {' \
+            $'\t\t\tpem_file /etc/caddy/snippets/cf-origin-pull-ca.pem' \
+            $'\t\t}' \
+            $'\t}' \
+            '}' > "$tmp"
+    else
+        rm -f "$ca_dst"
+        printf '%s\n' \
+            '# RENDERED by docker-host-config.sh:render_cf_origin_mtls — do not edit by hand.' \
+            '# No-op: no origin-pull trust anchor at /dock/conf/cloudflare/origin-pull/.' \
+            '# Provide ca.pem (or self-signed client.pem) + run provision_origin_pull.' \
+            '(cf-origin-mtls) {' \
+            '}' > "$tmp"
+    fi
+    local state; state="$([ -n "$anchor" ] && echo "active — mTLS on" || echo "no-op — mTLS off")"
+    if [ -f "$snip" ] && cmp -s "$tmp" "$snip"; then
+        rm -f "$tmp"
+        c_grn "  cf-origin-mtls snippet already current (${state})."
+        return 0
+    fi
+    install -o 1010 -g 1010 -m 640 "$tmp" "$snip"
+    rm -f "$tmp"
+    c_grn "  cf-origin-mtls snippet rendered (${state})."
+    # Apply to a running caddy: validate then restart (reload does not cleanly
+    # re-apply tls/middleware changes — same caveat as sync_caddy_config).
+    if docker ps --format '{{.Names}}' | grep -qx caddy; then
+        if ! docker exec caddy caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1; then
+            c_red "Caddy config failed validation after rendering cf-origin-mtls; not restarting."
+            c_red "  docker exec caddy caddy validate --config /etc/caddy/Caddyfile"
+            return 1
+        fi
+        docker restart caddy >/dev/null 2>&1 \
+            && c_grn "Caddy restarted (cf-origin-mtls applied)" \
+            || c_yel "Caddy restart failed"
     fi
 }
 
@@ -537,21 +708,6 @@ configure_hpb() {
     fi
 }
 
-fetch_wazuh_certs_tool() {
-    step "Fetching wazuh-certs-tool.sh..."
-    local target=/dock/conf/wazuh/cert-tool/wazuh-certs-tool.sh
-    if [ -f "$target" ]; then
-        c_grn "wazuh-certs-tool.sh already present."
-        return
-    fi
-    install -d -o 1010 -g 1010 -m 770 /dock/conf/wazuh/cert-tool
-    curl -fsSL https://packages.wazuh.com/4.9/wazuh-certs-tool.sh \
-        -o "$target"
-    chown 1010:1010 "$target"
-    chmod 750 "$target"
-    c_grn "wazuh-certs-tool.sh installed."
-}
-
 seed_crowdsec_defaults() {
     step "Seeding crowdsec image defaults into /dock/conf/crowdsec/..."
     local target=/dock/conf/crowdsec
@@ -638,22 +794,6 @@ generate_missing_secrets() {
     chown "${repo_owner}:${repo_owner}" "$ENV_FILE"
 }
 
-install_wazuh_agent() {
-    step "Installing Wazuh Agent..."
-    if dpkg -s wazuh-agent >/dev/null 2>&1; then
-        c_grn "Wazuh agent already installed."
-    else
-        curl -fsSL https://packages.wazuh.com/key/GPG-KEY-WAZUH | gpg --dearmor -o /usr/share/keyrings/wazuh.gpg
-        echo "deb [signed-by=/usr/share/keyrings/wazuh.gpg] https://packages.wazuh.com/4.x/apt/ stable main" \
-            > /etc/apt/sources.list.d/wazuh.list
-        apt-get update -qq
-        WAZUH_MANAGER="127.0.0.1" apt-get install -y -qq wazuh-agent
-        systemctl enable wazuh-agent
-    fi
-    # Install our custom decoders/rules and localfile config.
-    python3 "$REPO_DIR/scripts/maintain.py" wazuh
-}
-
 install_cron_jobs() {
     step "Installing cron jobs..."
     cat > /etc/cron.d/unified-stack <<EOF
@@ -664,13 +804,18 @@ PATH=/usr/local/bin:/usr/bin:/bin
 
 0 2 * * *    root python3 ${REPO_DIR}/scripts/maintain.py all >> /var/log/maintain.log 2>&1
 */15 * * * * root python3 ${REPO_DIR}/scripts/maintain.py cloudflare >> /dock/conf/cloudflare/maintain-cloudflare.log 2>&1
+# ADR-0020 Layer 3: weekly refresh of the Cloudflare CIDR allowlist. refresh_cf_ufw
+# re-runs maintain.py cloudflare-cidrs (updates cf-cidrs.txt + .env CLOUDFLARE_CIDRS,
+# fail-closed) then re-applies the 80/443 allows WITHOUT a ufw reset (no fail-open
+# window); the caddy restart reloads Layer 2's CLOUDFLARE_CIDRS env. Sun 03:30.
+30 3 * * 0   root bash ${REPO_DIR}/scripts/docker-host-config.sh refresh_cf_ufw >> /dock/conf/cloudflare/maintain-cloudflare.log 2>&1 && docker restart caddy >> /dock/conf/cloudflare/maintain-cloudflare.log 2>&1
 EOF
     chmod 644 /etc/cron.d/unified-stack
 }
 
 install_logrotate_cloudflare() {
     step "Installing cloudflare logrotate config..."
-    cat > /etc/logrotate.d/cloudflare-wazuh <<'EOF'
+    cat > /etc/logrotate.d/cloudflare <<'EOF'
 /dock/conf/cloudflare/firewall-events.log
 /dock/conf/cloudflare/maintain-cloudflare.log {
     weekly
@@ -681,7 +826,7 @@ install_logrotate_cloudflare() {
     compress
 }
 EOF
-    chmod 644 /etc/logrotate.d/cloudflare-wazuh
+    chmod 644 /etc/logrotate.d/cloudflare
     c_grn "cloudflare logrotate config installed."
 }
 
@@ -744,15 +889,139 @@ harden_sshd() {
     c_grn "sshd hardened and restarted"
 }
 
+# Add the CF-origin 80/443 allow rules (one set per Cloudflare CIDR) plus the
+# optional EXTRA_ALLOWED_IP escape-hatch. Tolerant of a single malformed line so
+# a bad CIDR cannot abort the caller mid-rebuild (which under `set -e` would
+# leave ufw disabled, i.e. fail-OPEN). Returns non-zero only if NOT ONE valid
+# CIDR produced a rule (total failure) — the caller then keeps 80/443 closed.
+_ufw_allow_cf_origin() {
+    local cidr_file="$1" extra="$2" cidr n=0
+    while IFS= read -r cidr; do
+        cidr="${cidr%%#*}"; cidr="${cidr//[[:space:]]/}"
+        [ -z "$cidr" ] && continue
+        if ufw allow from "$cidr" to any port 80 proto tcp >/dev/null \
+        && ufw allow from "$cidr" to any port 443 proto tcp >/dev/null \
+        && ufw allow from "$cidr" to any port 443 proto udp >/dev/null; then
+            n=$((n + 1))
+        else
+            c_yel "  WARN: skipped invalid CF CIDR '$cidr'"
+        fi
+    done < "$cidr_file"
+    if [ -n "$extra" ]; then
+        if ufw allow from "$extra" to any port 80 proto tcp  >/dev/null \
+        && ufw allow from "$extra" to any port 443 proto tcp >/dev/null \
+        && ufw allow from "$extra" to any port 443 proto udp >/dev/null; then
+            c_grn "  EXTRA_ALLOWED_IP '$extra' allowed on 80/443"
+        else
+            c_yel "  WARN: EXTRA_ALLOWED_IP '$extra' rejected by ufw — ignored"
+        fi
+    fi
+    [ "$n" -gt 0 ] || { c_red "  FATAL: no valid CF CIDR yielded a ufw rule."; return 1; }
+}
+
+# ADR-0020 Layer 3 (corrected mechanism): the ufw INPUT allowlist above CANNOT
+# filter Docker's DNAT-published 80/443 — those packets traverse
+# PREROUTING->FORWARD->DOCKER-USER->DOCKER-FORWARD and are ACCEPTed there, never
+# entering INPUT where `ufw allow` rules live. This programs the DOCKER-USER chain
+# (FORWARD rule #1, Docker's user hook) so non-Cloudflare traffic to the public web
+# ingress is dropped at the kernel before any TLS compute — fulfilling L3's intent
+# for the containerized ingress. ufw INPUT still governs host-mode services (coturn,
+# Zeek). Keys on the WAN interface (not the container IP): IP-agnostic across
+# redeploys, and Tailnet/inter-container traffic is excluded by construction (it
+# never arrives `-i <WAN>` — Tailnet is delivered into the ingress netns over
+# WireGuard). Idempotent (delete-by-comment, then append). FAIL-OPEN: a missing CIDR
+# list SKIPS the DROP rather than locking out the origin — a coarse pre-filter must
+# never be the layer that severs ingress; L1 mTLS is the real control.
+_docker_user_lock_cf_origin() {
+    local cidr_file="$1" extra="$2" dry="${3:-}" tag="cf-origin-l3" cidr n=0
+    local wan; wan="$(ip route show default 2>/dev/null | awk '{print $5; exit}')"
+    [ -n "$wan" ] || { c_red "  FATAL: cannot determine WAN interface (default route)."; return 1; }
+    if [ ! -s "$cidr_file" ]; then
+        c_yel "  WARN: $cidr_file empty/missing — skipping DOCKER-USER origin lock (fail-open; L1 mTLS unaffected)."
+        return 1
+    fi
+    local ipt="iptables"
+    if [ "$dry" = "--dry-run" ]; then
+        ipt="echo   iptables"
+        c_grn "  DRY-RUN — DOCKER-USER rules for WAN=$wan (no mutation):"
+    else
+        # Idempotent: strip any rules a prior run added (matched by our comment).
+        while iptables -L DOCKER-USER -n 2>/dev/null | grep -q "$tag"; do
+            local ln; ln="$(iptables -L DOCKER-USER --line-numbers -n 2>/dev/null | awk -v t="$tag" '$0 ~ t {print $1; exit}')"
+            [ -n "$ln" ] && iptables -D DOCKER-USER "$ln" || break
+        done
+    fi
+    # 1. Established/related flows continue (cheap safety net).
+    $ipt -A DOCKER-USER -i "$wan" -p tcp -m multiport --dports 80,443 -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment "$tag" -j RETURN
+    $ipt -A DOCKER-USER -i "$wan" -p udp --dport 443 -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment "$tag" -j RETURN
+    # 2. Allow each Cloudflare CIDR (the only legitimate public-origin source).
+    #    IPv6 CIDRs are skipped: this is the IPv4 chain, the origin is IPv4-only
+    #    (no global v6 on the WAN iface, no v6 DNAT) so there is no v6 ingress path.
+    #    A public AAAA / v6 origin would require an ip6tables variant (re-eval trigger).
+    while IFS= read -r cidr; do
+        cidr="${cidr%%#*}"; cidr="${cidr//[[:space:]]/}"; [ -z "$cidr" ] && continue
+        case "$cidr" in *:*) continue ;; esac
+        if $ipt -A DOCKER-USER -i "$wan" -s "$cidr" -p tcp -m multiport --dports 80,443 -m comment --comment "$tag" -j RETURN \
+        && $ipt -A DOCKER-USER -i "$wan" -s "$cidr" -p udp --dport 443 -m comment --comment "$tag" -j RETURN; then
+            n=$((n + 1))
+        else
+            c_yel "  WARN: skipped invalid CF CIDR '$cidr'"
+        fi
+    done < "$cidr_file"
+    # 3. EXTRA_ALLOWED_IP escape hatch (operator/LAN vantage that must reach origin direct).
+    if [ -n "$extra" ]; then
+        $ipt -A DOCKER-USER -i "$wan" -s "$extra" -p tcp -m multiport --dports 80,443 -m comment --comment "$tag" -j RETURN
+        $ipt -A DOCKER-USER -i "$wan" -s "$extra" -p udp --dport 443 -m comment --comment "$tag" -j RETURN
+    fi
+    # 4. Tailnet CGNAT (belt-and-suspenders; Tailnet does not normally arrive -i WAN).
+    $ipt -A DOCKER-USER -i "$wan" -s 100.64.0.0/10 -p tcp -m multiport --dports 80,443 -m comment --comment "$tag" -j RETURN
+    # 5. Drop all other (non-CF) traffic to the public web ingress; DROP not REJECT
+    #    so the port does not advertise itself to scanners.
+    $ipt -A DOCKER-USER -i "$wan" -p tcp -m multiport --dports 80,443 -m comment --comment "$tag" -j DROP
+    $ipt -A DOCKER-USER -i "$wan" -p udp --dport 443 -m comment --comment "$tag" -j DROP
+    [ "$n" -gt 0 ] || { c_red "  FATAL: no valid CF CIDR yielded a DOCKER-USER rule."; return 1; }
+    [ "$dry" = "--dry-run" ] || c_grn "  DOCKER-USER: 80/443 on $wan locked to $n CF CIDRs${extra:+ + $extra} (ADR-0020 L3)"
+}
+
+# Standalone-dispatchable wrapper for the DOCKER-USER origin lock
+# (`docker-host-config.sh lock_cf_origin_forward`). Set CF_L3_DRYRUN=1 to preview
+# the iptables rules without mutating (skips the CIDR refresh and prints only).
+lock_cf_origin_forward() {
+    step "Locking DNAT'd public 80/443 to Cloudflare in DOCKER-USER (ADR-0020 Layer 3)..."
+    local extra cidr_file="/dock/conf/cloudflare/cf-cidrs.txt"
+    [ -n "${CF_L3_DRYRUN:-}" ] || python3 "${REPO_DIR}/scripts/maintain.py" cloudflare-cidrs || true
+    extra="$(env_get EXTRA_ALLOWED_IP)"
+    _docker_user_lock_cf_origin "$cidr_file" "$extra" "${CF_L3_DRYRUN:+--dry-run}"
+}
+
+# ADR-0020 Layer 3: the kernel firewall only admits 80/443 from Cloudflare edge
+# CIDRs (+ optional EXTRA_ALLOWED_IP). Recovery rules (22, tailscale0) and the
+# WebRTC ports are added BEFORE the CF loop and `ufw --force enable` runs
+# unconditionally, so a partial CF-rule failure still ends with a default-deny
+# firewall UP and the recovery path intact — never disabled/open.
+# Re-runnable standalone (`docker-host-config.sh harden_ufw`); the weekly cron
+# uses it to re-apply the refreshed CF allowlist.
 harden_ufw() {
-    step "Configuring UFW..."
+    step "Configuring UFW (Cloudflare-only 80/443, ADR-0020 Layer 3)..."
+    local extra rc=0 cidr_file="/dock/conf/cloudflare/cf-cidrs.txt"
+    # Ensure the CF CIDR allowlist exists before locking down 80/443. `|| true`:
+    # a transient fetch failure must not abort — maintain.py is fail-closed and
+    # leaves the last-good cf-cidrs.txt in place, which the check below honours.
+    python3 "${REPO_DIR}/scripts/maintain.py" cloudflare-cidrs || true
+    if [ ! -s "$cidr_file" ]; then
+        c_red "FATAL: $cidr_file empty/missing after refresh; refusing to open 80/443 to all (fail-closed)."
+        c_red "  Run: python3 ${REPO_DIR}/scripts/maintain.py cloudflare-cidrs  then retry."
+        return 1
+    fi
+    extra="$(env_get EXTRA_ALLOWED_IP)"
+
     ufw --force reset
     ufw default deny incoming
     ufw default allow outgoing
+    # Recovery + management FIRST so any later error still leaves these in place.
     ufw allow 22/tcp
-    # ufw allow from 198.51.100.20/24 to any port 22 proto tcp # For added security if you SSH from a fixed LAN, but can lock you out if you move around.
-    ufw allow 80/tcp
-    ufw allow 443/tcp
+    # ufw allow from 198.51.100.20/24 to any port 22 proto tcp # Lock SSH to a fixed LAN if you never roam — can lock you out otherwise.
+    ufw allow in on tailscale0
     # coturn TURN/STUN — required for Nextcloud Talk WebRTC relay.
     # 3478 is the signalling port; 49152:49200 is the relay port range.
     ufw allow 3478/tcp
@@ -760,8 +1029,87 @@ harden_ufw() {
     ufw allow 49152:49200/udp
     # Janus Gateway — WebRTC media ports for Nextcloud Talk HPB.
     ufw allow 20000:20100/udp
-    ufw allow in on tailscale0
+    # Public origin: 80/443 reachable ONLY from Cloudflare edge CIDRs.
+    _ufw_allow_cf_origin "$cidr_file" "$extra" || rc=1
+    # Bring the firewall UP unconditionally — even on a partial CF-rule failure
+    # the host ends default-deny + recovery, never disabled/open.
     ufw --force enable
+    if [ "$rc" -ne 0 ]; then
+        c_red "UFW is up with recovery rules, but the Cloudflare origin allowlist is incomplete — 80/443 stay closed. Investigate $cidr_file."
+        return 1
+    fi
+    c_grn "UFW: 80/443 restricted to $(grep -c '[^[:space:]]' "$cidr_file") Cloudflare CIDRs${extra:+ + $extra}"
+    # L3 for the DNAT'd containerized ingress: ufw INPUT (above) cannot see
+    # Docker-published 80/443; the DOCKER-USER chain (FORWARD) can. Fail-open.
+    _docker_user_lock_cf_origin "$cidr_file" "$extra" \
+        || c_yel "  DOCKER-USER origin lock not applied (see WARN) — L1 mTLS remains the control."
+}
+
+# ADR-0020 Layer 3 weekly refresh — re-apply the Cloudflare 80/443 allowlist
+# WITHOUT a `ufw --force reset`, so there is NO fail-open window on the live
+# host (reset disables ufw for the whole rule-add loop — seconds of default-
+# ACCEPT every week). `ufw allow` is idempotent: existing rules are a no-op, so
+# this only ADDS rules for newly-published CF CIDRs. A CIDR that Cloudflare
+# *removed* leaves a stale allow until the next full harden_ufw (host-prep /
+# deploy) — a bounded, known risk backstopped by Layers 1 (AOP mTLS) + 2 (Caddy
+# remote_ip), unlike a recurring open window over unknown published ports.
+# Used by the weekly cron; safe to run repeatedly against a live firewall.
+refresh_cf_ufw() {
+    step "Refreshing Cloudflare UFW allowlist (no reset, ADR-0020 Layer 3)..."
+    local extra cidr_file="/dock/conf/cloudflare/cf-cidrs.txt"
+    python3 "${REPO_DIR}/scripts/maintain.py" cloudflare-cidrs || true
+    if [ ! -s "$cidr_file" ]; then
+        c_red "FATAL: $cidr_file empty/missing after refresh; leaving existing ufw rules untouched (fail-closed)."
+        return 1
+    fi
+    extra="$(env_get EXTRA_ALLOWED_IP)"
+    _ufw_allow_cf_origin "$cidr_file" "$extra"
+    # Re-apply the DOCKER-USER lock too (idempotent) so the weekly refresh keeps
+    # the FORWARD-path allowlist in sync with newly-published CF CIDRs.
+    _docker_user_lock_cf_origin "$cidr_file" "$extra" \
+        || c_yel "  DOCKER-USER origin lock not refreshed (see WARN) — L1 mTLS remains the control."
+}
+
+# ADR-0020 Layer 1: provision Cloudflare Authenticated Origin Pulls (AOP) from the
+# host .env using the vendored cf-origin-pull tool. Reads the token via the
+# fall-through model (CLOUDFLARE_ORIGIN_TLS_RW_TOKEN -> CLOUDFLARE_API_TOKEN) from .env —
+# no Windows/kms dependency. Standalone-dispatchable
+# (`docker-host-config.sh provision_origin_pull`); NOT auto-run in main() because
+# enabling AOP is an externally-visible, lockout-capable CF mutation that must
+# follow the staged request->require rollout (STAGE -> PAUSE -> SUBMIT). Guarded +
+# fail-safe: a missing cert/key/token or an API failure logs and returns 0 so it
+# never aborts the bootstrap.
+provision_origin_pull() {
+    step "Provisioning Cloudflare Authenticated Origin Pulls (AOP, ADR-0020 Layer 1)..."
+    local op_dir="/dock/conf/cloudflare/origin-pull"
+    local cert="${op_dir}/client.pem" key="${op_dir}/client.key"
+    # Create the drop location (root-owned, 700) so the operator knows where the
+    # openssl-generated client cert/key go — the key is sensitive.
+    mkdir -p "$op_dir" && chmod 700 "$op_dir"
+    local fqdn; fqdn="$(env_get PUBLIC_FQDN)"
+    if [ -z "$fqdn" ]; then
+        c_yel "  skipped — PUBLIC_FQDN not set in ${ENV_FILE}"
+        return 0
+    fi
+    if [ ! -s "$cert" ] || [ ! -s "$key" ]; then
+        c_yel "  skipped — origin-pull client cert/key not found at ${op_dir}/client.{pem,key}"
+        c_yel "  Generate them (openssl), set CLOUDFLARE_ORIGIN_TLS_RW_TOKEN (or CLOUDFLARE_API_TOKEN) in"
+        c_yel "  ${ENV_FILE}, then re-run: sudo bash scripts/docker-host-config.sh provision_origin_pull"
+        return 0
+    fi
+    # cf-origin-pull resolves the token from .env (fall-through, never logged) and
+    # is idempotent (ensure_origin_pull dedupes by normalized cert).
+    if python3 "${REPO_DIR}/scripts/cf-origin-pull.py" \
+            --store env --env-path "${ENV_FILE}" \
+            --fqdn "$fqdn" --cert-file "$cert" --key-file "$key" --enable; then
+        c_grn "  AOP provisioned + enabled for the zone of ${fqdn}"
+        # Activate the Caddy origin-mTLS snippet now that the trust anchor exists.
+        render_cf_origin_mtls
+    else
+        c_yel "  AOP provisioning did not complete (token scope needs Zone:SSL and Certificates:Edit?)."
+        c_yel "  Deploy continues; re-run after fixing. Caddy must stay in CLOUDFLARE_MTLS_MODE=request until AOP is confirmed."
+    fi
+    return 0
 }
 
 kernel_tuning() {
@@ -772,6 +1120,11 @@ vm.max_map_count = 262144
 net.core.rmem_max = 67108864
 net.core.wmem_max = 67108864
 net.core.netdev_max_backlog = 5000
+# cadvisor + the many watch-heavy containers (loki, alloy, prometheus, autoheal)
+# exhaust the default inotify limits on a dense host: cadvisor dies with
+# "inotify_init: too many open files" (exit 255). Raise instances + watches.
+fs.inotify.max_user_instances = 1024
+fs.inotify.max_user_watches = 1048576
 EOF
     sysctl -p /etc/sysctl.d/99-unified-stack.conf >/dev/null
 }
@@ -1057,7 +1410,6 @@ IMPORTANT: Before starting the stack, complete these steps:
 
 After ~2-3 min for healthchecks:
   Core:         https://auth.${pub_fqdn}    (Authentik SSO)
-                https://wazuh.${pub_fqdn}   (Wazuh SIEM, gated by Authentik)
                 https://cloud.${pub_fqdn}   (Nextcloud, OIDC login via Authentik)
   Tailnet:      https://auth.${tailnet_fqdn}
 
@@ -1067,7 +1419,8 @@ After Authentik first-run (set MFA, create users), retrieve the outpost token:
   >>> print(Token.objects.get(identifier__startswith='ak-outpost').key)
   Set AUTHENTIK_OUTPOST_TOKEN in ${ENV_FILE}, then restart authentik-proxy.
 
-OIDC setup — Nextcloud, Tandoor, and AFFiNE (run after Authentik is healthy):
+OIDC setup — Nextcloud, Tandoor, Jellyfin, Immich, Vikunja, Komodo
+(run after Authentik is healthy):
   python3 scripts/set-auth.py --env ${ENV_FILE} oidc
 
   The script:
@@ -1084,8 +1437,6 @@ OIDC setup — Nextcloud, Tandoor, and AFFiNE (run after Authentik is healthy):
           --clientsecret="\$NEXTCLOUD_OIDC_CLIENT_SECRET" \\
           --discoveryuri="\$NEXTCLOUD_OIDC_DISCOVERY_URL" \\
           --check-bearer'
-    AFFiNE — go to Admin Panel → Settings → OAuth → OIDC provider config and
-      paste the JSON from oidc-setup-output.txt (contains live client credentials)
 
 HPB (Nextcloud Talk High-Performance Backend):
   talk.${pub_fqdn}   — nextcloud-spreed-signaling (WebSocket, no Authentik)
@@ -1115,17 +1466,18 @@ main() {
     create_user_and_groups
     create_dock_tree
     ensure_env_file
+    configure_docker_registry_auth
     resolve_public_ip
     copy_templates
     sync_caddy_config
+    render_cf_origin_mtls
+    sync_couchdb_config
     render_dashy
     render_grafana
-    fetch_wazuh_certs_tool
     seed_crowdsec_defaults
     fetch_owasp_crs
     generate_missing_secrets
     configure_hpb
-    install_wazuh_agent
     install_cron_jobs
     install_logrotate_cloudflare
     install_systemd_units

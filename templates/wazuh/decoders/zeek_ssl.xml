@@ -1,3 +1,0 @@
-<decoder name="zeek-ssl">
-  <prematch>^{"ts":.+"ja3":</prematch>
-</decoder>

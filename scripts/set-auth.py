@@ -43,6 +43,7 @@ _SUBCOMMANDS = [
     ("entra-policies",  "Patch Authentik expression policies (service-group-only, no OR-logic)"),
     ("tailscale",       "Provision Tailscale ACL policy + tagged auth key (RBAC-aligned)"),
     ("all",             "Run authentik -> oidc -> nextcloud-oidc -> entra-nesting -> entra-sync -> tailscale"),
+    ("revoke-bootstrap-token", "Clear AUTHENTIK_BOOTSTRAP_TOKEN and mark it revoked (idempotent)"),
 ]
 
 
@@ -86,6 +87,8 @@ def _build_parser() -> argparse.ArgumentParser:
     sp_all.add_argument("--authentik-url", default="http://localhost:9000")
     sp_all.add_argument("--output-dir", default=str(_STACK_DIR / "scripts" / "output"))
     sp_all.add_argument("--dry-run", action="store_true")
+
+    sub.add_parser("revoke-bootstrap-token", help=_SUBCOMMANDS[10][1])
     return p
 
 
@@ -152,6 +155,8 @@ def _dispatch(cmd: str, args: argparse.Namespace, env: EnvFile) -> int:
             if rc != 0:
                 return rc
         return 0
+    if cmd == "revoke-bootstrap-token":
+        return _revoke_bootstrap_token(env)
     red(f"unknown subcommand: {cmd}")
     return 2
 
@@ -177,6 +182,37 @@ def _dispatch_all_step(name: str, args: argparse.Namespace, env: EnvFile) -> int
         step("set-auth: tailscale")
         return utils_tailscale.run(env, sync_entra=True)
     raise ValueError(f"unknown dispatch step: {name!r}")
+
+
+def _revoke_bootstrap_token(env: EnvFile) -> int:
+    """Atomically revoke the Authentik bootstrap token.
+
+    Sets AUTHENTIK_BOOTSTRAP_TOKEN_REVOKED=true FIRST (marker-first order), then
+    clears AUTHENTIK_BOOTSTRAP_TOKEN= to empty. This ordering is deliberate: if the
+    process dies between the two writes, the marker is already set so gen-secrets will
+    not re-generate the token on the next run — the safe intermediate state.
+    Reverse order (clear token first) would leave a blank token + no marker, which
+    causes gen-secrets to re-mint a new token on the next run, re-opening the desync
+    hole that motivated this subcommand.
+
+    Idempotent: safe to run multiple times.
+    """
+    revoked = env.get("AUTHENTIK_BOOTSTRAP_TOKEN_REVOKED")
+    token = env.get("AUTHENTIK_BOOTSTRAP_TOKEN")
+
+    if revoked.lower() == "true" and not token:
+        green("  revoke-bootstrap-token: already revoked and token already cleared — no-op")
+        return 0
+
+    # Marker first: next gen-secrets run is now a no-op for this key even if we crash here.
+    env.force_set("AUTHENTIK_BOOTSTRAP_TOKEN_REVOKED", "true")
+    # Clear the token: removes the live credential from .env (token is now DB-side only).
+    env.force_set("AUTHENTIK_BOOTSTRAP_TOKEN", "")
+
+    green("  revoke-bootstrap-token: AUTHENTIK_BOOTSTRAP_TOKEN cleared")
+    green("  revoke-bootstrap-token: AUTHENTIK_BOOTSTRAP_TOKEN_REVOKED=true")
+    green("  revoke-bootstrap-token: subsequent gen-secrets runs will skip this token")
+    return 0
 
 
 def main() -> int:

@@ -10,8 +10,6 @@ Usage:
 
     --apply   After generating secrets, apply them to the running stack:
                 - Updates Postgres user passwords (ALTER ROLE)
-                - Deletes the wazuh-security-init flag so it re-seeds OpenSearch
-                - Restarts wazuh-dashboard to rebuild its keystore
               Requires the stack to already be running.
 
     --target env  (default) Write generated secrets into .env (existing behaviour).
@@ -51,6 +49,13 @@ if TYPE_CHECKING:
 
 from secrets_provider import BaoProvider, EnvFileProvider, SecretsProvider
 
+# ── Immutability guard ─────────────────────────────────────────────────────────
+# Ensure the sibling module is importable when gen-secrets.py is run directly
+# (scripts/ may not be on sys.path in all invocation contexts).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from immutable_keys import assert_immutable  # noqa: E402
+from utils import _replace_with_retry  # noqa: E402
+
 # ── Secret generation ──────────────────────────────────────────────────────────
 
 _ALPHABET = string.ascii_letters + string.digits + "-_"
@@ -63,12 +68,6 @@ def gen_secret(n: int = 30) -> str:
 
 def gen_hex(n: int = 64) -> str:
     return "".join(secrets.choice(_HEX) for _ in range(n))
-
-
-def wazuh_secret(n: int = 28) -> str:
-    # Wazuh requires upper + lower + digit + special (>=8 chars total).
-    # Our alphabet satisfies upper/lower/digit; _W suffix guarantees a special char.
-    return gen_secret(n) + "_W"
 
 
 def docker_gid() -> str:
@@ -102,7 +101,7 @@ def _atomic_write(path: Path, text: str) -> None:
             fh.write(text)
             fh.flush()
             os.fsync(fh.fileno())
-        os.replace(tmp, path)
+        _replace_with_retry(tmp, path)
     except BaseException:
         try:
             os.unlink(tmp)
@@ -381,63 +380,6 @@ def apply_secrets(env_path: Path) -> None:
     else:
         print("  SKIP     Postgres not running — start stack first, then re-run with --apply")
 
-    # Wazuh: delete the security-init flag so the next bring-up re-seeds OpenSearch.
-    # The flag file is created and owned by the wazuh-security-init container (root
-    # inside the container, restricted perms on the host). When this script runs as
-    # an unprivileged user (typical for run.sh -y), os.stat() on the file raises
-    # PermissionError. Treat that as "we cannot manage the flag here" and fall back
-    # to a container-side removal via docker exec; if that also fails, skip gracefully.
-    dock_conf = val("DOCK_CONF")
-    if dock_conf:
-        flag = Path(dock_conf) / "wazuh/certs/.security-initialized"
-        try:
-            if flag.exists():
-                flag.unlink()
-                print(f"  REMOVED  {flag} (wazuh-security-init will re-seed on next up)")
-            else:
-                print("  SKIP     wazuh-security-init flag not present (already clean)")
-        except PermissionError:
-            # Fall back to container-side rm — the wazuh-manager container has the
-            # volume mounted and runs as root inside.
-            r = subprocess.run(
-                ["docker", "exec", "wazuh-manager", "rm", "-f",
-                 "/etc/wazuh-indexer/certs/.security-initialized"],
-                capture_output=True, text=True,
-            )
-            if r.returncode == 0:
-                print(f"  REMOVED  {flag} via docker exec wazuh-manager (host perms denied)")
-            else:
-                print(f"  SKIP     cannot manage {flag} (host: PermissionError; container: rc={r.returncode}) — wazuh-security-init may not re-seed")
-
-    # Re-run wazuh-security-init, then restart wazuh-dashboard to rebuild its keystore.
-    compose_file = env_path.parent / "docker-compose.yml"
-    print("  RUNNING  wazuh-security-init ...")
-    subprocess.run(
-        ["docker", "compose", "-f", str(compose_file), "--env-file", str(env_path),
-         "up", "-d", "wazuh-security-init"],
-        capture_output=True,
-    )
-    for _ in range(300):  # wait up to 15 minutes
-        time.sleep(3)
-        if _container_state("wazuh-security-init") in ("exited", "dead"):
-            break
-
-    r = subprocess.run(
-        ["docker", "inspect", "wazuh-security-init", "--format", "{{.State.ExitCode}}"],
-        capture_output=True, text=True,
-    )
-    exit_code = r.stdout.strip()
-    if exit_code == "0":
-        print("  DONE     wazuh-security-init exited 0")
-        subprocess.run(
-            ["docker", "compose", "-f", str(compose_file), "--env-file", str(env_path),
-             "up", "-d", "wazuh-dashboard"],
-            capture_output=True,
-        )
-        print("  RESTARTED wazuh-dashboard (rebuilding keystore)")
-    else:
-        print(f"  ERROR    wazuh-security-init exited {exit_code} — check: docker logs wazuh-security-init")
-
     print()
     print("Apply complete. Run 'docker compose ps' to verify stack health.")
 
@@ -484,14 +426,35 @@ def main() -> None:
 
     if args.set:
         key, _, value = args.set.partition("=")
-        set_if_empty(env_path, key.strip(), value)
+        key = key.strip()
+        # --set is the only path where a caller could supply a NEW value for an
+        # already-populated immutable key. Guard it via the shared registry so
+        # rotation procedures must go through the documented runbook.
+        current = _get_value(_read(env_path), key)
+        try:
+            assert_immutable(key, current, value)
+        except ValueError as exc:
+            sys.exit(f"ERROR: {exc}")
+        set_if_empty(env_path, key, value)
         return
 
     target: str = args.target
 
     # Build the provider eagerly so we fail fast before generating any secrets
     # (avoids generating values we can't store if the backend is unreachable).
-    provider = _make_provider(target, env_path)
+    try:
+        provider = _make_provider(target, env_path)
+    except RuntimeError as exc:
+        # KV seeding is never boot-critical: the generated secrets are already
+        # written to .env by the earlier `--target env` pass and the running
+        # stack reads them from .env. A token/auth failure here must degrade to
+        # a clean one-line warning, never a Python traceback in the deploy log.
+        if target == "bao":
+            print(f"WARNING: OpenBao KV seeding skipped — {exc}", file=sys.stderr)
+            print("  (non-fatal: generated secrets remain in .env via --target env)",
+                  file=sys.stderr)
+            return
+        raise
 
     print(f"Generating secrets for: {env_path}  [target={target}]")
     print()
@@ -506,10 +469,12 @@ def main() -> None:
         # Redis
         ("REDIS_PASSWORD", gen_secret(30)),
 
-        # Wazuh — requires upper + lower + digit + special; _W suffix covers special.
-        ("WAZUH_API_PASSWORD",                  wazuh_secret(28)),
-        ("WAZUH_INDEXER_ADMIN_PASSWORD",        wazuh_secret(28)),
-        ("WAZUH_INDEXER_KIBANASERVER_PASSWORD", wazuh_secret(28)),
+        # Caddy — m2m JWT shared secret for the security app's crypto key
+        # (`crypto key verify from env CADDY_JWT_SHARED_SECRET` in the Caddyfile).
+        # Required at boot: an empty value makes caddy fail provisioning and
+        # crashloop, taking the whole ingress down. Was wired into compose +
+        # Caddyfile but never added here, so it was perpetually empty.
+        ("CADDY_JWT_SHARED_SECRET", gen_secret(50)),
 
         # Authentik — 50-char secret key is the Authentik recommendation.
         ("AUTHENTIK_SECRET_KEY",         gen_secret(50)),
@@ -541,8 +506,12 @@ def main() -> None:
         ("VIKUNJA_DB_PASSWORD", gen_secret(30)),
         ("VIKUNJA_JWT_SECRET",  gen_secret(50)),
 
-        # AFFiNE
-        ("AFFINE_DB_PASSWORD", gen_secret(30)),
+        # CouchDB — Obsidian livesync sync server (replaces AFFiNE).
+        # COUCHDB_SECRET is the single-node erlang cookie + session secret; it
+        # must not change after first run (immutable_keys), so livesync sessions
+        # and stored docs stay valid.
+        ("COUCHDB_PASSWORD", gen_secret(30)),
+        ("COUCHDB_SECRET",   gen_hex(32)),
 
         # Grafana — admin password is break-glass only; all logins go through Authentik SSO.
         ("GRAFANA_ADMIN_PASSWORD", gen_secret(24)),
@@ -551,19 +520,35 @@ def main() -> None:
         # docker-compose.yml can reference ${DOCKER_GID} without hard-coding a GID.
         ("DOCKER_GID", docker_gid()),
 
-        # Dockhand
-        ("DOCKHAND_ENCRYPTION_KEY", gen_secret(32)),
-
         # Immich
         ("IMMICH_DB_PASSWORD", gen_secret(30)),
 
         # n8n — ENCRYPTION_KEY must not change after first run (encrypts stored credentials).
         ("N8N_DB_PASSWORD",    gen_secret(30)),
         ("N8N_ENCRYPTION_KEY", gen_secret(32)),
+
+        # Falco Sidekick UI — credentials enforced at the application level.
+        # DISABLEAUTH was removed (M006); these are generated once and stored.
+        ("FALCOSIDEKICK_UI_USER",     "falcoadmin"),
+        ("FALCOSIDEKICK_UI_PASSWORD", gen_secret(24)),
+
+        # Komodo — passkey shared between komodo-core and komodo-periphery.
+        # OIDC client ID/secret are provisioned by set-auth.py oidc, not here.
+        ("KOMODO_PASSKEY", gen_secret(40)),
     ]
+
+    # Read the revocation marker directly from the .env file rather than from
+    # the provider — the marker is machine-written state, not a vault secret,
+    # and must be authoritative regardless of --target (env or bao).
+    _bootstrap_revoked = (
+        _get_value(_read(env_path), "AUTHENTIK_BOOTSTRAP_TOKEN_REVOKED").lower() == "true"
+    )
 
     # Dispatch the spec through the provider (write-if-blank semantics).
     for key, value in secrets_spec:
+        if key == "AUTHENTIK_BOOTSTRAP_TOKEN" and _bootstrap_revoked:
+            print("  SKIP AUTHENTIK_BOOTSTRAP_TOKEN (revoked; first-run-and-revoke is permanent)")
+            continue
         provider.set_if_blank(key, value)
 
     # Container-issued keys — require the running stack; always .env-only.

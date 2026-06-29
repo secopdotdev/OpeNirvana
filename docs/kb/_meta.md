@@ -5,8 +5,6 @@ aliases: ["Unified Stack","openirvana-public"]
 tags:
   - type/project
   - "tier/1.0-dev"
-  - "type/project"
-  - "tier/1.0-dev"
   - "tool/openirvana"
   - "capability/self-hosted-platform"
   - "capability/docker-stack"

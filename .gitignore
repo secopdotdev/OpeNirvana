@@ -32,7 +32,18 @@ oidc-setup-output.txt
 # OpenBao init material — unseal keys + root token. NEVER commit.
 **/openbao/init.json
 **/openbao/init.json.age
+graphify-out/cost.json
 
 # GSD-side graph/intel artifacts — publish-class, never committed (ADR-0001 2026-07-09)
 .planning/graphs/
 .planning/intel/
+# graphify build artifacts — publish-class, never committed (OR2-3, doc-standards.md)
+graphify-out/cache/
+graphify-out/.graphify_root
+graphify-out/.graphify_labels.json
+graphify-out/.graphify_analysis.json
+graphify-out/graph.html
+graphify-out/manifest.json
+graphify-out/[0-9]*/
+graphify-out/graph.json
+graphify-out/.vocab.txt

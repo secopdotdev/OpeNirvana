@@ -32,3 +32,7 @@ oidc-setup-output.txt
 # OpenBao init material — unseal keys + root token. NEVER commit.
 **/openbao/init.json
 **/openbao/init.json.age
+
+# GSD-side graph/intel artifacts — publish-class, never committed (ADR-0001 2026-07-09)
+.planning/graphs/
+.planning/intel/
